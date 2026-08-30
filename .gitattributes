@@ -1,0 +1,15 @@
+# Batch launchers MUST arrive CRLF. An LF-only .cmd runs NOTHING under cmd.exe -
+# no output, no error, exit 0 - so a clone made with core.autocrlf=false, or on a
+# non-Windows machine, would produce a launcher that silently does nothing. Pinned
+# here rather than left to whoever cloned it; test/sqlexpress-backup.test.ps1
+# asserts the working tree matches.
+*.cmd text eol=crlf
+
+# PowerShell and the C# source run on Windows. Keeping them CRLF in the working
+# tree avoids a diff storm the first time someone edits one in a Windows editor.
+*.ps1 text eol=crlf
+*.cs  text eol=crlf
+
+# Vendored, byte-for-byte. The console serves this out of the exe and a test
+# compares the served bytes against this file, so it must not be rewritten.
+assets/gsap.min.js -text

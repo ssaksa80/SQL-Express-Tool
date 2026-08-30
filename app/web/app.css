@@ -1,0 +1,185 @@
+/* SQL Express Backup - operator console.
+ *
+ * Follows the same rule as docs/assets/doc-glow.css: glow marks STATE, never
+ * text someone has to read carefully. Health pips, status cards and the schedule
+ * marker glow. The log pane, the settings inputs and every path string do NOT, and
+ * are reset below so a future rule cannot leak onto them. This gets read during a
+ * change window; a glowing log line is a line you squint at.
+ *
+ * Tokens are defined once on :root for light, redefined for dark under both
+ * prefers-color-scheme and an explicit [data-theme], so the toggle wins either way
+ * and nothing has its only definition inside a media query.
+ */
+
+:root {
+  --bg: #f4f6f8;
+  --panel: #ffffff;
+  --ink: #16232b;
+  --ink-2: #405260;
+  --ink-3: #6b7f8d;
+  --line: #d8e0e6;
+  --steel: #2c4a5c;
+  --ok: #1c7a52;
+  --warn: #9a6212;
+  --bad: #a32a2a;
+  --glow-ok: rgba(28, 122, 82, .30);
+  --glow-warn: rgba(154, 98, 18, .30);
+  --glow-bad: rgba(163, 42, 42, .30);
+  --glow-key: rgba(44, 74, 92, .22);
+  --radius: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1418;
+    --panel: #151d23;
+    --ink: #e6edf2;
+    --ink-2: #a9bcc8;
+    --ink-3: #7d919e;
+    --line: #24313a;
+    --steel: #8fc4e0;
+    --ok: #4fd1a0;
+    --warn: #e8b44f;
+    --bad: #ff8080;
+    --glow-ok: rgba(79, 209, 160, .40);
+    --glow-warn: rgba(232, 180, 79, .40);
+    --glow-bad: rgba(255, 128, 128, .40);
+    --glow-key: rgba(143, 196, 224, .30);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0e1418;
+  --panel: #151d23;
+  --ink: #e6edf2;
+  --ink-2: #a9bcc8;
+  --ink-3: #7d919e;
+  --line: #24313a;
+  --steel: #8fc4e0;
+  --ok: #4fd1a0;
+  --warn: #e8b44f;
+  --bad: #ff8080;
+  --glow-ok: rgba(79, 209, 160, .40);
+  --glow-warn: rgba(232, 180, 79, .40);
+  --glow-bad: rgba(255, 128, 128, .40);
+  --glow-key: rgba(143, 196, 224, .30);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+.bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; padding: 14px 22px;
+  background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+.brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.brand h1 { font-size: 17px; margin: 0; letter-spacing: .2px; white-space: nowrap; }
+.host { color: var(--ink-3); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-right { display: flex; gap: 8px; flex-shrink: 0; }
+
+/* The one element that is purely a state signal, so it carries the strongest glow. */
+.pip {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--ink-3); flex-shrink: 0;
+  transition: background .25s ease, box-shadow .25s ease;
+}
+.pip[data-state="ok"]      { background: var(--ok);   box-shadow: 0 0 0 3px var(--glow-ok),   0 0 14px var(--glow-ok); }
+.pip[data-state="partial"] { background: var(--warn); box-shadow: 0 0 0 3px var(--glow-warn), 0 0 14px var(--glow-warn); }
+.pip[data-state="failed"]  { background: var(--bad);  box-shadow: 0 0 0 3px var(--glow-bad),  0 0 14px var(--glow-bad); }
+.pip[data-state="unknown"] { background: var(--ink-3); box-shadow: none; }
+
+main { max-width: 1080px; margin: 0 auto; padding: 22px; display: grid; gap: 18px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+.card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 14px 16px; transition: box-shadow .25s ease, border-color .25s ease;
+}
+.card[data-tone="ok"]      { border-color: var(--ok);   box-shadow: 0 0 18px var(--glow-ok); }
+.card[data-tone="partial"] { border-color: var(--warn); box-shadow: 0 0 18px var(--glow-warn); }
+.card[data-tone="failed"]  { border-color: var(--bad);  box-shadow: 0 0 18px var(--glow-bad); }
+
+.eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: .10em; color: var(--ink-3); }
+.big { font-size: 26px; font-weight: 600; margin-top: 4px; line-height: 1.15; }
+.big.small { font-size: 16px; word-break: break-all; }
+.sub { color: var(--ink-3); font-size: 13px; margin-top: 2px; word-break: break-all; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; }
+.panel h2 { font-size: 14px; margin: 0 0 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-2); }
+
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--ink-3); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+td.stale { color: var(--bad); font-weight: 600; }
+.muted { color: var(--ink-3); }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+label { display: grid; gap: 5px; font-size: 12px; color: var(--ink-2); text-transform: uppercase; letter-spacing: .05em; }
+input, select {
+  font: 14px/1.4 "Segoe UI", system-ui, sans-serif; text-transform: none; letter-spacing: 0;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg); color: var(--ink);
+}
+input:focus, select:focus { outline: 2px solid var(--steel); outline-offset: 1px; }
+
+button { font: 14px "Segoe UI", system-ui, sans-serif; border-radius: 8px; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+.primary { margin-top: 14px; padding: 9px 18px; border: 1px solid var(--steel); background: var(--steel); color: #fff; }
+.ghost { padding: 6px 12px; border: 1px solid var(--line); background: transparent; color: var(--ink-2); }
+.ghost.danger:hover { border-color: var(--bad); color: var(--bad); }
+
+.actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.act {
+  text-align: left; padding: 12px 14px; background: var(--bg);
+  border: 1px solid var(--line); color: var(--ink); display: grid; gap: 4px;
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+.act:hover:not(:disabled) { border-color: var(--steel); box-shadow: 0 0 14px var(--glow-key); }
+.act.warn:hover:not(:disabled) { border-color: var(--bad); box-shadow: 0 0 14px var(--glow-bad); }
+.act-name { font-weight: 600; }
+.act-why { font-size: 12px; color: var(--ink-3); white-space: normal; }
+
+/* The most consequential action, so it is marked as such rather than sitting in the
+   row looking like the others. Glow is state, and "about to change this server
+   permanently" is a state. */
+.act.full { border-color: var(--steel); }
+.act.full:hover:not(:disabled) { box-shadow: 0 0 16px var(--glow-key); }
+
+.confirm {
+  margin-top: 14px; padding: 14px 16px; border-radius: var(--radius);
+  border: 1px solid var(--warn); background: var(--bg);
+  box-shadow: 0 0 18px var(--glow-warn);
+}
+.confirm h3 { margin: 0 0 8px; font-size: 14px; letter-spacing: .03em; text-transform: uppercase; color: var(--warn); }
+.steps { margin: 0 0 10px; padding-left: 20px; font-size: 13.5px; color: var(--ink-2); }
+.steps li { margin: 3px 0; }
+.warnline { font-size: 13px; color: var(--ink); margin: 0 0 12px; }
+.confirm-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; }
+.primary.danger { background: var(--bad); border-color: var(--bad); }
+.primary.danger:disabled { background: var(--ink-3); border-color: var(--ink-3); }
+
+.note { color: var(--ink-3); font-size: 12.5px; margin: 10px 0 0; }
+
+/* NOTHING below glows, on purpose. This is the pane an operator reads a real error
+   out of, and the inputs hold paths that get typed into a production server. */
+.log {
+  margin: 0; padding: 12px 14px; max-height: 340px; overflow: auto;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  font: 12.5px/1.55 Consolas, "Cascadia Mono", monospace;
+  color: var(--ink-2); white-space: pre-wrap; word-break: break-word;
+  text-shadow: none; box-shadow: none;
+}
+.log, .log *, input, select, td, th { text-shadow: none !important; }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}

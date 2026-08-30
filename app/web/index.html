@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Locked down deliberately. This page is served by a local process that can run
+     elevated PowerShell, so it must never be able to fetch or execute anything from
+     off this machine. Everything it needs is embedded in the exe. -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<title>SQL Express Backup</title>
+<link rel="stylesheet" href="/assets/app.css?t=__TOKEN__">
+</head>
+<body data-token="__TOKEN__">
+
+<header class="bar">
+  <div class="brand">
+    <span class="pip" id="pip" data-state="unknown"></span>
+    <h1>SQL Express Backup</h1>
+    <span class="host" id="hostName">&hellip;</span>
+  </div>
+  <div class="bar-right">
+    <button class="ghost" id="themeBtn" type="button" title="Light / dark">Theme</button>
+    <button class="ghost danger" id="quitBtn" type="button">Quit</button>
+  </div>
+</header>
+
+<main>
+  <section class="cards" aria-label="Status">
+    <div class="card" id="cardState">
+      <div class="eyebrow">Last run</div>
+      <div class="big" id="lastResult">&mdash;</div>
+      <div class="sub" id="lastRunAt">never</div>
+    </div>
+    <div class="card" id="cardSchedule">
+      <div class="eyebrow">Schedule</div>
+      <div class="big" id="scheduleState">&mdash;</div>
+      <div class="sub" id="scheduleNext">not installed</div>
+    </div>
+    <div class="card" id="cardPending">
+      <div class="eyebrow">Waiting for share</div>
+      <div class="big" id="pendingCount">&mdash;</div>
+      <div class="sub">copies still to go up</div>
+    </div>
+    <div class="card" id="cardInstance">
+      <div class="eyebrow">Instance</div>
+      <div class="big small" id="instance">&mdash;</div>
+      <div class="sub" id="sharePath">no share configured</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Databases on the share</h2>
+    <div class="scroll">
+      <table id="dbTable">
+        <thead><tr><th>Database</th><th>Hourly</th><th>Daily</th><th>Newest backup</th><th>Age</th></tr></thead>
+        <tbody><tr><td colspan="5" class="muted">Nothing read yet.</td></tr></tbody>
+      </table>
+    </div>
+    <p class="note" id="shareNote"></p>
+  </section>
+
+  <section class="panel">
+    <h2>Settings</h2>
+    <form id="settingsForm" autocomplete="off">
+      <div class="grid">
+        <label>Share path
+          <input type="text" id="setShare" name="share" placeholder="\\fileserver\sqlbackups" spellcheck="false">
+        </label>
+        <label>Staging folder
+          <input type="text" id="setStaging" name="staging" placeholder="C:\SqlBackupStaging" spellcheck="false">
+        </label>
+        <label>Every (hours)
+          <input type="number" id="setInterval" name="interval" min="1" max="168" value="6">
+        </label>
+        <label>Keep hourly
+          <input type="number" id="setHourly" name="hourly" min="1" max="99" value="3">
+        </label>
+        <label>Keep daily (days)
+          <input type="number" id="setDaily" name="daily" min="1" max="365" value="7">
+        </label>
+        <label>Authentication
+          <select id="setAuth" name="auth">
+            <option value="windows">Windows (task runs as SYSTEM, no password stored)</option>
+            <option value="sql">SQL login (sealed to this machine)</option>
+          </select>
+        </label>
+      </div>
+      <p class="note">
+        Saving runs Setup, which proves the connection, the staging permissions and the
+        share before it writes anything. It needs an administrator.
+        A SQL login is prompted for in the elevated console, never in this page.
+      </p>
+      <button class="primary" id="saveBtn" type="submit">Save settings</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>Actions</h2>
+    <div class="actions">
+      <button class="act" data-action="selftest" type="button">
+        <span class="act-name">Self test</span>
+        <span class="act-why">Proves backup, retention and restore on a scratch database. No prompt.</span>
+      </button>
+      <button class="act" data-action="run" type="button">
+        <span class="act-name">Run backup now</span>
+        <span class="act-why">One pass, immediately. Needs an administrator.</span>
+      </button>
+      <button class="act" data-action="install" type="button">
+        <span class="act-name">Install schedule</span>
+        <span class="act-why">Every database, on the interval above, as SYSTEM.</span>
+      </button>
+      <button class="act warn" data-action="uninstall" type="button">
+        <span class="act-name">Uninstall schedule</span>
+        <span class="act-why">Stops the schedule. Backups already taken are not touched.</span>
+      </button>
+      <button class="act full" id="fullBtn" type="button">
+        <span class="act-name">Full install</span>
+        <span class="act-why">Make a local share, set up against it, schedule it, and back up now &mdash; in one go.</span>
+      </button>
+    </div>
+
+    <!-- Deliberately behind a typed confirmation rather than a click. This is the one
+         action that creates a share, schedules a permanent job, and starts backing up
+         every database on the instance. The same phrase is required by the server, so
+         the guard does not live only in this page. -->
+    <div class="confirm" id="fullPanel" hidden>
+      <h3>Full install &mdash; read this first</h3>
+      <ol class="steps">
+        <li>Create the folder below and share it from <strong>this host</strong>.</li>
+        <li>Set up against that share using Windows authentication.</li>
+        <li>Schedule <strong>every database</strong> on the instance, on the interval in Settings, as SYSTEM.</li>
+        <li>Run one backup immediately, as SYSTEM, and report what it returned.</li>
+      </ol>
+      <p class="warnline">
+        Every database is included, production ones too. And a share on this host is
+        <strong>not an offsite copy</strong> &mdash; if this disk dies the backups die with it.
+        Point Settings at a real file server when you have one.
+      </p>
+      <div class="grid">
+        <label>Folder to create and share
+          <input type="text" id="fullFolder" value="C:\SqlBackups" spellcheck="false">
+        </label>
+        <label>Share name
+          <input type="text" id="fullShare" value="SqlBackups" spellcheck="false">
+        </label>
+        <label>Type FULL INSTALL to confirm
+          <input type="text" id="fullConfirm" placeholder="FULL INSTALL" spellcheck="false" autocomplete="off">
+        </label>
+      </div>
+      <p class="note" id="fullTarget"></p>
+      <div class="confirm-actions">
+        <button class="primary danger" id="fullGo" type="button" disabled>Run full install</button>
+        <button class="ghost" id="fullCancel" type="button">Cancel</button>
+      </div>
+    </div>
+    <p class="note" id="actionNote">
+      Actions other than the self test raise a Windows administrator prompt. Their output
+      appears below as it happens.
+    </p>
+  </section>
+
+  <section class="panel">
+    <h2>Log</h2>
+    <pre id="log" class="log" aria-live="polite">Waiting.</pre>
+  </section>
+</main>
+
+<script src="/assets/gsap.min.js?t=__TOKEN__"></script>
+<script src="/assets/app.js?t=__TOKEN__"></script>
+</body>
+</html>
