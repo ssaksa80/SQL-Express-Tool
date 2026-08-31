@@ -147,5 +147,11 @@ the guard is removed, and the suite is confirmed to fail.
 
 ## Licence
 
-None yet — deliberately. Add one before this goes anywhere beyond your own estate;
-picking it is an owner's decision, not something to inherit from a scaffold.
+Proprietary - all rights reserved. See `LICENSE`. No licence is granted to anyone;
+this is internal operational tooling, and that is deliberate rather than an
+oversight.
+
+Note that `assets/gsap.min.js` is GSAP by Webflow, redistributed unmodified under
+its own licence, not the terms above. If this is ever distributed beyond its
+owner's estate, check https://gsap.com/licensing/ covers that use - or drop the
+animation layer, which the console degrades gracefully without.

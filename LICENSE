@@ -1,0 +1,38 @@
+Copyright (c) 2026. All rights reserved.
+
+This software and its accompanying documentation are proprietary and confidential.
+
+No licence, express or implied, is granted to any person or organisation. You may
+not use, copy, modify, merge, publish, distribute, sublicense, or sell any part of
+this software without prior written permission from the copyright holder.
+
+This is internal operational tooling. It is published here for the copyright
+holder's own use and for the use of those they have authorised directly; the
+absence of an open-source licence is deliberate, not an oversight.
+
+NOTE ON OWNERSHIP
+This tool was written for use on employer-managed systems. Where that work is owned
+by the employer under contract or local law, the rights above rest with the
+employer rather than the individual author, and any decision to relicense or to
+publish is theirs to make. Nothing here asserts otherwise.
+
+THIRD-PARTY COMPONENTS
+assets/gsap.min.js is GSAP by Webflow (formerly GreenSock), redistributed here
+unmodified. GSAP is not covered by the terms above and is used under its own
+licence; the standard "no charge" licence permits use in most cases but not all -
+see https://gsap.com/licensing/ for the terms that apply to your use. If this tool
+is ever distributed beyond the copyright holder's own estate, confirm that the GSAP
+licence covers that use, or remove the animation layer, which the console degrades
+gracefully without.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+THIS IS BACKUP SOFTWARE. Verify your backups restore. The tool takes considerable
+trouble to prove each file with RESTORE VERIFYONLY and ships a self test that
+restores one end to end, but no warranty above is altered by that, and a backup you
+have never restored is a backup you do not have.
