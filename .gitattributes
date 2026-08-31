@@ -12,4 +12,3 @@
 
 # Vendored, byte-for-byte. The console serves this out of the exe and a test
 # compares the served bytes against this file, so it must not be rewritten.
-assets/gsap.min.js -text
