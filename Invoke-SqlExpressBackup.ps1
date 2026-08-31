@@ -10,8 +10,8 @@
   service - and does the parts a naive BACKUP DATABASE loop gets wrong.
 
   DELIBERATELY STANDALONE: it dot-sources nothing and needs no bundle, so an
-  operator can copy this one file to a server and run it. Same reasoning as
-  the standalone probe, and like the probe it is NOT staged into the bundle.
+  operator can copy this one file to a server and run it, on a box that may never
+  receive an application deployment at all.
 
   WHAT IT ACTUALLY GUARANTEES
     * SQL writes every .bak to a LOCAL staging folder first, and it is proved with

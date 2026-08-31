@@ -6,8 +6,8 @@ Status: approved
 ## Problem
 
 SQL Server Express has no SQL Agent, so it has no native scheduled backup. Sites
-running APPDB beside other applications on a single Express instance therefore
-have no backups at all unless someone builds the schedule outside the engine.
+running several applications against a single Express instance therefore have no
+backups at all unless someone builds the schedule outside the engine.
 
 We need one operator-runnable artifact that:
 
@@ -31,9 +31,9 @@ We need one operator-runnable artifact that:
 `deploy/Invoke-SqlExpressBackup.ps1` - one file, `#requires -version 5.1`,
 dot-sources nothing, pure ASCII.
 
-It follows the `the standalone probe` precedent rather than the bundle-tool
-precedent, for the same reason: an operator must be able to copy one file to a
-server and run it. It is therefore NOT staged by `build-bundle.ps1`, and its test
+It follows the standalone-probe precedent rather than the packaged-tool precedent,
+for the same reason: an operator must be able to copy one file to a server and run
+it. It is therefore not staged into any deployment artifact, and its test
 asserts that, exactly as `probe-prereqs.test.ps1` does for the probe.
 
 ## Modes
@@ -42,7 +42,7 @@ asserts that, exactly as `probe-prereqs.test.ps1` does for the probe.
 | --- | --- |
 | `-Setup` | Interactive, run once. Detect instances, choose one, capture the credential, seal it, write config, prove a connection and a share write. |
 | `-Install -As Task` | Register a Scheduled Task running as SYSTEM: at-boot trigger + repetition every `-IntervalHours` for an indefinite duration, `RunLevel Highest`. |
-| `-Install -As Service` | Register an NSSM service running a supervised loop, matching how APPDB itself is hosted. |
+| `-Install -As Service` | Register an NSSM service running a supervised loop, the way a long-lived Windows service is normally hosted. |
 | `-Run` | One backup pass. What the scheduler invokes; also runnable by hand. |
 | `-Status` | Instances, last run result, per-database last good backup, share reachability, retention counts. Prints no secret. |
 | `-Uninstall` | Remove the task or service. `-Purge` additionally removes config and key material. Never touches backup files. |
@@ -157,8 +157,8 @@ one of those conditions.
   half-written `.bak`.
 * A named mutex guards the pass. A task and a service, or an overrun pass
   overlapping its successor, can never run concurrently.
-* Logging to a rotating file plus a Windows Event Log source, both redacted on
-  the `the standalone probe` allow-list principle.
+* Logging to a rotating file plus a Windows Event Log source, both redacted on an
+  allow-list principle: named keys are reported, every other value is withheld.
 
 ## Found by running it against a live instance
 
