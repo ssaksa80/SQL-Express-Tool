@@ -408,6 +408,36 @@ $bare = Get-SebShareDenialMessage -Share '\\fs\s' -Account 'me' -MachineAccount 
 Assert ($bare -match [regex]::Escape('\\fs\s')) 'it still names the share with no machine account and no inner error'
 Assert (-not ($bare -match 'reach it as')) 'and does not dangle a sentence about an account it does not know'
 
+# ---- 8f000. the SYSTEM share probe generates a script - so parse it --------------
+# The share check runs as SYSTEM, because that is who the scheduled backup is; the
+# operator's own access proves nothing. It does that by writing a small script for a
+# short-lived task, and generated code that is never parsed is a guess.
+#
+# The specific trap: in PowerShell the comma binds TIGHTER than +, so inside @( ... )
+# an unparenthesised 'text ' + $x + ' more' becomes THREE array elements rather than
+# one string. The file then holds "Set-Content -LiteralPath" on one line and the path
+# on the next. That still parses - it just runs Set-Content with no path and then
+# tries to run "-Value" as a command, so the probe would report that SYSTEM cannot
+# write whatever the permissions actually were, and block every setup.
+foreach ($p in @('C:\plain\p.tmp', "\srv\share\o'brien\p.tmp", "two 'quotes' here")) {
+  $lit = Get-SebPsLiteral $p
+  Assert (((& ([scriptblock]::Create($lit)))) -eq $p) "a path round-trips through its PowerShell literal: $p"
+}
+
+$probeBody = @(Get-SebShareProbeBody -ProbeFile "\srv\share\o'brien\p.tmp" -ResultFile 'C:\pd\r.txt')
+Assert ($probeBody.Count -eq 9) "the probe body is 9 lines, not split by comma precedence (got $($probeBody.Count))"
+Assert (@($probeBody | Where-Object { $_ -match "`n|`r" }).Count -eq 0) 'no line contains an embedded newline'
+Assert (@($probeBody | Where-Object { $_ -match '^\s*-' }).Count -eq 0) 'no line begins with a parameter, which is what a split concatenation looks like'
+
+$probeText = $probeBody -join "`r`n"
+$probeErrs = $null
+$probeAst = [System.Management.Automation.Language.Parser]::ParseInput($probeText, [ref]$null, [ref]$probeErrs)
+Assert (@($probeErrs).Count -eq 0) "the generated probe script parses ($(@($probeErrs).Count) error(s))"
+$probeCmds = @($probeAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+    ForEach-Object { $_.GetCommandName() })
+Assert (($probeCmds -join ',') -eq 'Set-Content,Remove-Item,Set-Content,Set-Content') "it runs exactly the four intended commands (got '$($probeCmds -join ',')')"
+Assert (@($probeBody | Where-Object { $_ -match "o''brien" }).Count -ge 2) 'the apostrophe in the path is escaped, not left to break the script'
+
 # ---- 8f0. the account that will actually run the backups -------------------------
 # Setup proves the OPERATOR can connect. Under Windows authentication the scheduled
 # task connects as SYSTEM instead, so the operator's success says nothing about the

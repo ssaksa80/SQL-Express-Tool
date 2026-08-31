@@ -1548,18 +1548,39 @@ function Invoke-SebSetup {
     if ($null -ne $connection) { $connection.Dispose() }
   }
 
+  # Two probes, because the difference between them is the whole diagnosis. The
+  # caller's access is only ever informational: the backups do not run as the caller.
+  $callerOk = $true
+  $callerWhy = ''
   $probe = Join-Path $Share ('.seb-write-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp')
   try {
     Set-Content -LiteralPath $probe -Value 'probe' -Encoding ASCII -ErrorAction Stop
     Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
   }
-  catch {
-    throw (Get-SebShareDenialMessage -Share $Share `
-        -Account ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-        -MachineAccount (Get-SebMachineAccount) `
-        -Original $_.Exception.Message)
+  catch { $callerOk = $false; $callerWhy = $_.Exception.Message }
+
+  $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  Write-Host ('  share as you ({0}): {1}' -f $me, $(if ($callerOk) { 'writable' } else { 'NOT writable - ' + $callerWhy }))
+
+  Write-Host '  checking the share as SYSTEM, which is what the scheduled backup uses...'
+  $sysProbe = Test-SebShareWritableAsSystem -Share $Share
+  if ($sysProbe.Ok) {
+    Write-Host ('  share is writable by SYSTEM: {0}' -f $Share)
   }
-  Write-Host ('  share is writable: {0}' -f $Share)
+  elseif ($sysProbe.Inconclusive) {
+    Write-Host ('  WARNING: could not confirm SYSTEM can write to the share ({0}).' -f $sysProbe.Detail)
+    Write-Host '           Setup continues; the first scheduled run will show the truth.'
+  }
+  else {
+    $extra = ''
+    if ($callerOk) {
+      $extra = " You CAN write to it yourself, which is exactly why this check exists: " +
+      "the backup does not run as you. Grant the machine account (or Domain Computers) " +
+      "write access on the share and on the folder behind it, then run setup again."
+    }
+    throw ((Get-SebShareDenialMessage -Share $Share -Account (Get-SebMachineAccount) `
+          -MachineAccount (Get-SebMachineAccount) -Original $sysProbe.Detail) + $extra)
+  }
 
   if (-not $WindowsAuth) {
     $master = Get-SebMasterKey -Create
@@ -1602,6 +1623,91 @@ function Invoke-SebSetup {
 # touches was refused - and this is the tool whose entire premise is being
 # debuggable during a change window. Built as a pure function so the wording is
 # tested rather than only seen when it is already 2am.
+# Quote a string for a PowerShell single-quoted literal.
+function Get-SebPsLiteral {
+  param([string]$Text)
+  return "'" + ($Text -replace "'", "''") + "'"
+}
+
+# Can the account that will ACTUALLY run the backups write to the share?
+#
+# This used to probe as whoever ran -Setup, which is nobody in the real picture: the
+# scheduled task runs as SYSTEM and reaches a network share as the MACHINE account.
+# Testing the elevated operator is wrong in both directions - it fails when the
+# machine account is fine, and passes when it is not, which is the worse half. Seen
+# on a share granting BUILTIN\Users: the operator could write, the machine account
+# could not, and a caller-side probe would have greenlit an install whose every
+# backup then failed to copy.
+#
+# So run the probe where the work happens. Setup is already elevated, so it can
+# register a short-lived task as SYSTEM, have that try the write, and read back what
+# happened. Slower than a local file write, and the only version that answers the
+# question that matters.
+# The script the SYSTEM probe task runs, as lines. Pulled out as its own function
+# because it is generated code, and generated code that is never parsed is a guess.
+#
+# EVERY concatenation is parenthesised, and that is not style. In PowerShell the
+# comma binds TIGHTER than +, so inside @( ... ) an unparenthesised
+# 'text ' + $x + ' more' splits into three array elements instead of one string. The
+# file then has "Set-Content -LiteralPath" on one line and the path on the next,
+# which still parses - it just runs Set-Content with no path and then tries to run
+# "-Value" as a command. The probe would have reported that SYSTEM cannot write no
+# matter what the permissions actually were, and blocked every setup.
+function Get-SebShareProbeBody {
+  param([string]$ProbeFile, [string]$ResultFile)
+  $p = Get-SebPsLiteral $ProbeFile
+  $r = Get-SebPsLiteral $ResultFile
+  return @(
+    '$ErrorActionPreference = ''Stop''',
+    'try {',
+    ('  Set-Content -LiteralPath ' + $p + ' -Value ''probe'' -Encoding ASCII'),
+    ('  Remove-Item -LiteralPath ' + $p + ' -Force -ErrorAction SilentlyContinue'),
+    ('  Set-Content -LiteralPath ' + $r + ' -Value ''OK'' -Encoding ASCII'),
+    '}',
+    'catch {',
+    ('  Set-Content -LiteralPath ' + $r + ' -Value ("FAIL " + $_.Exception.Message) -Encoding ASCII'),
+    '}'
+  )
+}
+
+function Test-SebShareWritableAsSystem {
+  param([string]$Share, [int]$TimeoutSec = 120)
+
+  $taskName = 'SqlExpressBackup-ShareProbe'
+  $id = [Guid]::NewGuid().ToString('N')
+  $resultFile = Join-Path $script:SebConfigDir ('shareprobe-' + $id + '.txt')
+  $scriptFile = Join-Path $script:SebConfigDir ('shareprobe-' + $id + '.ps1')
+  $probeFile = Join-Path $Share ('.seb-systemprobe-' + $id + '.tmp')
+
+  $body = Get-SebShareProbeBody -ProbeFile $probeFile -ResultFile $resultFile
+  Set-Content -LiteralPath $scriptFile -Value $body -Encoding ASCII
+
+  try {
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+      -Argument ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $scriptFile + '"')
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 5) -StartWhenAvailable
+    [void](Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force)
+    Start-ScheduledTask -TaskName $taskName
+    $probeRun = Wait-SebScheduledRun -TaskName $taskName -TimeoutSec $TimeoutSec
+
+    if (-not $probeRun.Completed) {
+      return [pscustomobject]@{ Ok = $false; Inconclusive = $true; Detail = 'the probe task did not finish in time' }
+    }
+    if (-not (Test-Path -LiteralPath $resultFile)) {
+      return [pscustomobject]@{ Ok = $false; Inconclusive = $true; Detail = 'the probe task ran but wrote no result' }
+    }
+    $text = (Get-Content -LiteralPath $resultFile -Raw).Trim()
+    if ($text -eq 'OK') { return [pscustomobject]@{ Ok = $true; Inconclusive = $false; Detail = 'SYSTEM wrote to the share' } }
+    return [pscustomobject]@{ Ok = $false; Inconclusive = $false; Detail = ($text -replace '^FAIL\s*', '') }
+  }
+  finally {
+    try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+    Remove-Item -LiteralPath $scriptFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $resultFile -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Get-SebShareDenialMessage {
   param([string]$Share, [string]$Account, [string]$MachineAccount, [string]$Original)
   $msg = "cannot write to the share '$Share' as $Account"
