@@ -302,6 +302,212 @@ class ActionButton : Button
     }
 }
 
+// Live job progress, the way a backup tool should show it: which database is in
+// flight, how far through it is, how fast, and how long is left.
+//
+// The percentage comes from SQL Server itself - BACKUP ... WITH STATS raises
+// informational messages as it goes, which the engine relays as [PROGRESS] lines.
+// Throughput is measured rather than guessed: the staged .bak is polled as it grows,
+// so a slow disk or a stalled backup is visible instead of being averaged away.
+//
+// No glow here on purpose. This is a readout, not a state light - the same rule that
+// keeps the log pane flat.
+class ProgressPanel : Panel
+{
+    string jobLabel = "";
+    string currentDb = "";
+    string stage = "";
+    int dbPercent = -1;
+    int jobIndex = 0;
+    int jobTotal = 0;
+    bool active = false;
+    DateTime started = DateTime.MinValue;
+    DateTime dbStarted = DateTime.MinValue;
+
+    string stagingPath = "";
+    long stagedBytes = 0;
+    double mbPerSec = 0;
+    long lastBytes = 0;
+    DateTime lastSample = DateTime.MinValue;
+
+    System.Windows.Forms.Timer ticker;
+
+    public ProgressPanel()
+    {
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        ticker = new System.Windows.Forms.Timer();
+        ticker.Interval = 500;
+        ticker.Tick += new EventHandler(OnTick);
+    }
+
+    public void SetStagingPath(string path) { stagingPath = path; }
+
+    public void Begin(string label)
+    {
+        jobLabel = label;
+        currentDb = "";
+        stage = "starting";
+        dbPercent = -1;
+        jobIndex = 0;
+        jobTotal = 0;
+        stagedBytes = 0;
+        lastBytes = 0;
+        mbPerSec = 0;
+        started = DateTime.Now;
+        dbStarted = DateTime.Now;
+        lastSample = DateTime.Now;
+        active = true;
+        ticker.Start();
+        Invalidate();
+    }
+
+    public void Finish(string outcome)
+    {
+        active = false;
+        stage = outcome;
+        dbPercent = -1;
+        ticker.Stop();
+        Invalidate();
+    }
+
+    public void SetJob(int index, int total, string db)
+    {
+        jobIndex = index; jobTotal = total;
+        if (currentDb != db) { dbStarted = DateTime.Now; stagedBytes = 0; lastBytes = 0; mbPerSec = 0; }
+        currentDb = db;
+        dbPercent = -1;
+        Invalidate();
+    }
+
+    public void SetStage(string db, string value)
+    {
+        if (!string.IsNullOrEmpty(db)) { currentDb = db; }
+        stage = value;
+        // Percent only means anything during the backup itself; verify and copy are
+        // their own phases and a stale bar there would be a lie.
+        if (value != "backup") { dbPercent = -1; }
+        Invalidate();
+    }
+
+    public void SetPercent(string db, int pct)
+    {
+        if (!string.IsNullOrEmpty(db)) { currentDb = db; }
+        dbPercent = pct;
+        Invalidate();
+    }
+
+    // Measure the staged file rather than trusting a rate: this is what catches a
+    // share or disk that has gone slow.
+    void OnTick(object sender, EventArgs e)
+    {
+        if (active && !string.IsNullOrEmpty(stagingPath))
+        {
+            try
+            {
+                long best = 0;
+                if (Directory.Exists(stagingPath))
+                {
+                    foreach (string f in Directory.GetFiles(stagingPath, "*.bak"))
+                    {
+                        try { long len = new FileInfo(f).Length; if (len > best) { best = len; } }
+                        catch { }
+                    }
+                }
+                stagedBytes = best;
+                double secs = (DateTime.Now - lastSample).TotalSeconds;
+                if (secs >= 1.0)
+                {
+                    long delta = stagedBytes - lastBytes;
+                    if (delta > 0) { mbPerSec = (delta / 1048576.0) / secs; }
+                    else if (stage == "backup") { mbPerSec = 0; }
+                    lastBytes = stagedBytes;
+                    lastSample = DateTime.Now;
+                }
+            }
+            catch { }
+        }
+        Invalidate();
+    }
+
+    static string Span(TimeSpan t)
+    {
+        if (t.TotalHours >= 1) { return ((int)t.TotalHours).ToString(CultureInfo.InvariantCulture) + "h " + t.Minutes.ToString("00", CultureInfo.InvariantCulture) + "m"; }
+        if (t.TotalMinutes >= 1) { return t.Minutes.ToString(CultureInfo.InvariantCulture) + "m " + t.Seconds.ToString("00", CultureInfo.InvariantCulture) + "s"; }
+        return ((int)t.TotalSeconds).ToString(CultureInfo.InvariantCulture) + "s";
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
+        using (GraphicsPath path = Card.Rounded(r, 8))
+        {
+            using (SolidBrush b = new SolidBrush(Theme.Panel)) { g.FillPath(b, path); }
+            using (Pen p = new Pen(Theme.Line, 1f)) { g.DrawPath(p, path); }
+        }
+
+        using (SolidBrush ink3 = new SolidBrush(Theme.Ink3))
+        using (SolidBrush ink = new SolidBrush(Theme.Ink))
+        using (Font small = new Font("Segoe UI", 7.5f, FontStyle.Bold))
+        using (Font body = new Font("Segoe UI", 9f))
+        using (Font bold = new Font("Segoe UI", 9.5f, FontStyle.Bold))
+        {
+            if (!active && started == DateTime.MinValue)
+            {
+                g.DrawString("PROGRESS", small, ink3, 13, 10);
+                g.DrawString("Idle - nothing running.", body, ink3, 13, 28);
+                return;
+            }
+
+            string head = active ? (jobLabel + " running") : (jobLabel + " - " + stage);
+            g.DrawString(head.ToUpperInvariant(), small, ink3, 13, 9);
+
+            string who = string.IsNullOrEmpty(currentDb) ? "(preparing)" : currentDb;
+            if (jobTotal > 0)
+            {
+                who += "   " + jobIndex.ToString(CultureInfo.InvariantCulture) + " of " +
+                       jobTotal.ToString(CultureInfo.InvariantCulture);
+            }
+            if (!string.IsNullOrEmpty(stage)) { who += "   [" + stage + "]"; }
+            g.DrawString(who, bold, ink, 13, 24);
+
+            // Per-database bar. When SQL is not reporting a percentage - verifying,
+            // copying, pruning - the bar is deliberately left empty rather than
+            // animated, so a stall looks like a stall.
+            int barY = 46;
+            int barW = Width - 250;
+            if (barW < 120) { barW = 120; }
+            Rectangle bar = new Rectangle(13, barY, barW, 12);
+            using (SolidBrush bg = new SolidBrush(Theme.Bg)) { g.FillRectangle(bg, bar); }
+            using (Pen p = new Pen(Theme.Line, 1f)) { g.DrawRectangle(p, bar); }
+            if (dbPercent >= 0)
+            {
+                int w = (int)(bar.Width * (dbPercent / 100.0));
+                if (w > 0)
+                {
+                    using (SolidBrush fill = new SolidBrush(Theme.Ok)) { g.FillRectangle(fill, bar.X + 1, bar.Y + 1, Math.Max(1, w - 2), bar.Height - 1); }
+                }
+            }
+
+            string right = "";
+            if (dbPercent >= 0) { right += dbPercent.ToString(CultureInfo.InvariantCulture) + "%   "; }
+            if (mbPerSec > 0.05) { right += mbPerSec.ToString("0.0", CultureInfo.InvariantCulture) + " MB/s   "; }
+            if (stagedBytes > 0) { right += (stagedBytes / 1048576).ToString(CultureInfo.InvariantCulture) + " MB   "; }
+            TimeSpan elapsed = DateTime.Now - started;
+            right += Span(elapsed) + " elapsed";
+            if (active && dbPercent > 3 && dbPercent < 100)
+            {
+                TimeSpan dbElapsed = DateTime.Now - dbStarted;
+                double total = dbElapsed.TotalSeconds / (dbPercent / 100.0);
+                TimeSpan left = TimeSpan.FromSeconds(Math.Max(0, total - dbElapsed.TotalSeconds));
+                right += "   ~" + Span(left) + " left";
+            }
+            g.DrawString(right, body, ink3, bar.Right + 12, barY - 3);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- status
 
 class DbRow

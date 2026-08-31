@@ -14,6 +14,27 @@ using System.Windows.Forms;
 
 static class SebApp
 {
+    // A windowed exe has no console of its own, but it usually HAS a parent one when
+    // somebody runs it by hand or a test launches it. Attaching to that parent turns
+    // a silent "exited 2" into the actual reason. dev-ba lost real time to this exact
+    // silence: the diagnostic existed, it just went only to a temp file nobody knew
+    // to look in.
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    static extern bool AttachConsole(int processId);
+
+    static void Complain(string text)
+    {
+        try
+        {
+            if (AttachConsole(-1))   // -1 = ATTACH_PARENT_PROCESS
+            {
+                Console.Error.WriteLine(text);
+                Console.Error.Flush();
+            }
+        }
+        catch { }
+    }
+
     internal const string TaskName = "SqlExpressBackup";
     internal static string StateDir;
     internal static string UserDir;
@@ -44,9 +65,13 @@ static class SebApp
         }
         catch (Exception ex)
         {
+            string where = Path.Combine(Path.GetTempPath(), "SqlExpressBackupApp-error.txt");
+            TryWrite(where, ex.ToString());
+            string summary = "SQL Express Backup could not start: " + ex.Message +
+                Environment.NewLine + "Full detail: " + where;
+            Complain(summary);
             if (checkFile != null) { TryWrite(checkFile, "CHECK-FAIL " + ex.Message); return 2; }
-            MessageBox.Show("Could not start:" + Environment.NewLine + Environment.NewLine + ex.Message,
-                "SQL Express Backup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            MessageBox.Show(summary, "SQL Express Backup", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return 2;
         }
 
@@ -150,12 +175,15 @@ class MainForm : Form
     ActionButton btnSelfTest, btnRunNow, btnInstall, btnUninstall, btnFull;
     TextBox log;
     Label noteLabel;
+    ProgressPanel progress;
+    bool amElevated;
     System.Windows.Forms.Timer statusTimer;
     volatile bool busy;
 
     public MainForm()
     {
-        Text = "SQL Express Backup";
+        amElevated = IsElevated();
+        Text = "SQL Express Backup" + (amElevated ? " (administrator)" : "");
         MinimumSize = new Size(900, 680);
         Size = new Size(1020, 780);
         StartPosition = FormStartPosition.CenterScreen;
@@ -165,13 +193,14 @@ class MainForm : Form
         TableLayoutPanel root = new TableLayoutPanel();
         root.Dock = DockStyle.Fill;
         root.ColumnCount = 1;
-        root.RowCount = 6;
+        root.RowCount = 7;
         root.Padding = new Padding(16, 10, 16, 14);
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 46));   // header
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 104));  // cards
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 168));  // databases
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 100));  // settings
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));   // actions
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 74));   // progress
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));  // log
         Controls.Add(root);
 
@@ -180,7 +209,10 @@ class MainForm : Form
         root.Controls.Add(BuildDatabases(), 0, 2);
         root.Controls.Add(BuildSettings(), 0, 3);
         root.Controls.Add(BuildActions(), 0, 4);
-        root.Controls.Add(BuildLog(), 0, 5);
+        progress = new ProgressPanel();
+        progress.Dock = DockStyle.Fill;
+        root.Controls.Add(progress, 0, 5);
+        root.Controls.Add(BuildLog(), 0, 6);
 
         ApplyTheme();
 
@@ -189,6 +221,19 @@ class MainForm : Form
         statusTimer.Tick += delegate { RefreshStatus(); };
         statusTimer.Start();
         Shown += delegate { RefreshStatus(); };
+    }
+
+    static bool IsElevated()
+    {
+        try
+        {
+            using (System.Security.Principal.WindowsIdentity id = System.Security.Principal.WindowsIdentity.GetCurrent())
+            {
+                return new System.Security.Principal.WindowsPrincipal(id)
+                    .IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            }
+        }
+        catch { return false; }
     }
 
     Control BuildHeader()
@@ -477,6 +522,7 @@ class MainForm : Form
         dbList.EndUpdate();
         noteLabel.Text = s.ShareNote;
 
+        progress.SetStagingPath(s.StagingPath);
         if (!txtShare.Focused && !string.IsNullOrEmpty(s.SharePath)) { txtShare.Text = s.SharePath; }
         if (!txtStaging.Focused && !string.IsNullOrEmpty(s.StagingPath)) { txtStaging.Text = s.StagingPath; }
         if (!txtInterval.Focused) { txtInterval.Text = s.IntervalHours.ToString(CultureInfo.InvariantCulture); }
@@ -551,13 +597,56 @@ class MainForm : Form
     void Say(string line)
     {
         if (InvokeRequired) { BeginInvoke(new Action<string>(Say), new object[] { line }); return; }
+        // Progress markers drive the panel and stay OUT of the log. They are machine
+        // lines; a log full of them is a log nobody reads.
+        if (line != null && line.Length > 0 && line[0] == '[' && TryProgress(line)) { return; }
         log.AppendText(DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "  " + line + Environment.NewLine);
+    }
+
+    static string Field(string line, string key)
+    {
+        int i = line.IndexOf(key + "=", StringComparison.Ordinal);
+        if (i < 0) { return null; }
+        int start = i + key.Length + 1;
+        int end = line.IndexOf(' ', start);
+        if (end < 0) { end = line.Length; }
+        return line.Substring(start, end - start);
+    }
+
+    bool TryProgress(string line)
+    {
+        try
+        {
+            if (line.StartsWith("[PROGRESS]", StringComparison.Ordinal))
+            {
+                int pct;
+                if (int.TryParse(Field(line, "pct"), NumberStyles.Integer, CultureInfo.InvariantCulture, out pct))
+                { progress.SetPercent(Field(line, "db"), pct); }
+                return true;
+            }
+            if (line.StartsWith("[STAGE]", StringComparison.Ordinal))
+            {
+                progress.SetStage(Field(line, "db"), Field(line, "stage"));
+                return true;
+            }
+            if (line.StartsWith("[JOB]", StringComparison.Ordinal))
+            {
+                int idx, total;
+                int.TryParse(Field(line, "index"), NumberStyles.Integer, CultureInfo.InvariantCulture, out idx);
+                int.TryParse(Field(line, "total"), NumberStyles.Integer, CultureInfo.InvariantCulture, out total);
+                progress.SetJob(idx, total, Field(line, "db"));
+                return true;
+            }
+        }
+        catch { }
+        return false;
     }
 
     void SetBusy(bool value)
     {
         if (InvokeRequired) { BeginInvoke(new Action<bool>(SetBusy), new object[] { value }); return; }
         busy = value;
+        if (!value) { progress.Finish("finished"); }
         btnSelfTest.Enabled = !value;
         btnRunNow.Enabled = !value;
         btnInstall.Enabled = !value;
@@ -568,69 +657,75 @@ class MainForm : Form
         if (!value) { RefreshStatus(); }
     }
 
-    void RunEngine(string engineArgs, bool elevated, string label)
+    void RunEngine(string engineArgs, bool needsAdmin, string label)
     {
         if (busy) { return; }
+
+        // No PowerShell window, ever - but that is only possible when this process is
+        // already elevated. Redirecting a child's output requires UseShellExecute
+        // false, and launching it elevated requires UseShellExecute true, so the two
+        // are mutually exclusive across a UAC boundary. Elevate the CONSOLE once and
+        // every action after it runs hidden with its output streamed in here.
+        if (needsAdmin && !amElevated)
+        {
+            DialogResult answer = MessageBox.Show(this,
+                "This action needs administrator rights." + Environment.NewLine + Environment.NewLine +
+                "Restart the console as administrator? Everything then runs inside this " +
+                "window with no further prompts and no PowerShell windows." + Environment.NewLine + Environment.NewLine +
+                "Backups already scheduled keep running either way.",
+                "SQL Express Backup", MessageBoxButtons.OKCancel, MessageBoxIcon.Information);
+            if (answer == DialogResult.OK) { RelaunchElevated(); }
+            return;
+        }
+
         SetBusy(true);
+        progress.Begin(label);
         Say("--- " + label + " ---");
-        if (elevated) { Say("Windows will ask for an administrator. Output appears here once it starts."); }
-        Thread t = new Thread(delegate () { EngineWorker(engineArgs, elevated); });
+        Thread t = new Thread(delegate () { EngineWorker(engineArgs); });
         t.IsBackground = true;
         t.Start();
     }
 
-    void EngineWorker(string engineArgs, bool elevated)
+    void RelaunchElevated()
+    {
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo(Application.ExecutablePath);
+            psi.UseShellExecute = true;
+            psi.Verb = "runas";
+            Process.Start(psi);
+            Close();
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            Say("the administrator prompt was dismissed - nothing was changed");
+        }
+    }
+
+    void EngineWorker(string engineArgs)
     {
         string ps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
             "WindowsPowerShell\\v1.0\\powershell.exe");
         try
         {
-            if (!elevated)
+            // CreateNoWindow with redirected output - the reason this console had to
+            // become elevated itself. Across a UAC boundary the two are mutually
+            // exclusive, which is where the PowerShell windows came from.
+            ProcessStartInfo psi = new ProcessStartInfo(ps,
+                "-NoProfile -ExecutionPolicy Bypass -File \"" + SebApp.EnginePath + "\" " + engineArgs);
+            psi.UseShellExecute = false;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            psi.CreateNoWindow = true;
+            using (Process pr = Process.Start(psi))
             {
-                ProcessStartInfo psi = new ProcessStartInfo(ps,
-                    "-NoProfile -ExecutionPolicy Bypass -File \"" + SebApp.EnginePath + "\" " + engineArgs);
-                psi.UseShellExecute = false;
-                psi.RedirectStandardOutput = true;
-                psi.RedirectStandardError = true;
-                psi.CreateNoWindow = true;
-                using (Process pr = Process.Start(psi))
-                {
-                    pr.OutputDataReceived += delegate (object s, DataReceivedEventArgs e) { if (e.Data != null) { Say(e.Data); } };
-                    pr.ErrorDataReceived += delegate (object s, DataReceivedEventArgs e) { if (e.Data != null) { Say(e.Data); } };
-                    pr.BeginOutputReadLine();
-                    pr.BeginErrorReadLine();
-                    pr.WaitForExit();
-                    Say("--- finished, exit code " + pr.ExitCode.ToString(CultureInfo.InvariantCulture) + " ---");
-                }
-                return;
+                pr.OutputDataReceived += delegate (object s, DataReceivedEventArgs e) { if (e.Data != null) { Say(e.Data); } };
+                pr.ErrorDataReceived += delegate (object s, DataReceivedEventArgs e) { if (e.Data != null) { Say(e.Data); } };
+                pr.BeginOutputReadLine();
+                pr.BeginErrorReadLine();
+                pr.WaitForExit();
+                Say("--- finished, exit code " + pr.ExitCode.ToString(CultureInfo.InvariantCulture) + " ---");
             }
-
-            // Elevated: stdout cannot be redirected across a UAC boundary, so the
-            // child tees to a file and this tails it. The window is left VISIBLE on
-            // purpose - -Setup with a SQL login prompts for a password, and that
-            // prompt belongs in a real console, not swallowed into this pane.
-            string logFile = Path.Combine(Path.GetTempPath(), "seb-console-" + Guid.NewGuid().ToString("N") + ".log");
-            string inner = "& '" + SebApp.EnginePath.Replace("'", "''") + "' " + engineArgs +
-                           " *>&1 | Tee-Object -FilePath '" + logFile.Replace("'", "''") + "'";
-            ProcessStartInfo pe = new ProcessStartInfo(ps,
-                "-NoProfile -ExecutionPolicy Bypass -Command \"" + inner.Replace("\"", "\\\"") + "\"");
-            pe.UseShellExecute = true;
-            pe.Verb = "runas";
-            pe.WindowStyle = ProcessWindowStyle.Normal;
-
-            Process child;
-            try { child = Process.Start(pe); }
-            catch (System.ComponentModel.Win32Exception)
-            {
-                Say("the administrator prompt was dismissed - nothing was changed");
-                return;
-            }
-            Thread tail = new Thread(delegate () { TailInto(logFile, child); });
-            tail.IsBackground = true;
-            tail.Start();
-            child.WaitForExit();
-            Thread.Sleep(600);
-            Say("--- finished, exit code " + child.ExitCode.ToString(CultureInfo.InvariantCulture) + " ---");
         }
         catch (Exception ex) { Say("could not run the engine: " + ex.Message); }
         finally { SetBusy(false); }

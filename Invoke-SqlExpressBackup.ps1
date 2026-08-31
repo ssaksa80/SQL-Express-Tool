@@ -933,6 +933,44 @@ function Invoke-SebSqlNonQuery {
 # Pull every SQL error number out of a failed call. PowerShell wraps the
 # SqlException in a MethodInvocationException, so the real one is down the
 # InnerException chain.
+# ---------------------------------------------------------------------------
+# Progress, emitted as machine-readable lines on stdout.
+#
+# The console parses these to drive a real progress bar; a human reading the log
+# sees them too and they are meant to be legible either way. Deliberately a plain
+# text protocol rather than anything structured: the engine has to keep working when
+# it is run by hand in a console with nothing parsing it at all.
+#
+# SQL Server reports backup percentage through informational messages when the
+# statement carries WITH STATS. Those arrive on the connection's InfoMessage event,
+# not in any result set, so the handler below is the only way to see them.
+function Write-SebProgress {
+  param([string]$Database, [int]$Percent, [string]$Stage)
+  Write-Host ('[PROGRESS] db=' + $Database + ' pct=' + $Percent + ' stage=' + $Stage)
+}
+
+function Write-SebStage {
+  param([string]$Database, [string]$Stage)
+  Write-Host ('[STAGE] db=' + $Database + ' stage=' + $Stage)
+}
+
+function Write-SebJob {
+  param([int]$Index, [int]$Total, [string]$Database)
+  Write-Host ('[JOB] index=' + $Index + ' total=' + $Total + ' db=' + $Database)
+}
+
+# Percent messages look like "10 percent processed." in English and are localized
+# elsewhere, so the digits are taken and the words ignored.
+function Get-SebPercentFromMessage {
+  param([string]$Message)
+  if ([string]::IsNullOrWhiteSpace($Message)) { return -1 }
+  $m = [regex]::Match($Message, '(\d{1,3})\s*(?:percent|%)')
+  if (-not $m.Success) { return -1 }
+  $v = [int]$m.Groups[1].Value
+  if ($v -lt 0 -or $v -gt 100) { return -1 }
+  return $v
+}
+
 function Get-SebSqlErrorNumbers {
   param($ErrorRecord)
   $ex = $ErrorRecord.Exception
@@ -974,12 +1012,21 @@ function Invoke-SebBackupDatabase {
   $quoted = Get-SebQuotedName $Database
   $literal = Get-SebSqlLiteral $TargetFile
   $name = Get-SebSqlLiteral ($Database + ' full backup')
-  $base = @('INIT', 'FORMAT', 'CHECKSUM', ('NAME = ' + $name))
+  # STATS makes SQL emit a percentage as it goes; without it the connection stays
+  # silent until the backup finishes and there is nothing to show.
+  $base = @('INIT', 'FORMAT', 'CHECKSUM', 'STATS = 5', ('NAME = ' + $name))
 
   $withParts = $base
   if ($script:SebCompression -ne 'off') { $withParts = $base + @('COMPRESSION') }
   $sql = 'BACKUP DATABASE {0} TO DISK = {1} WITH {2}' -f $quoted, $literal, ($withParts -join ', ')
 
+  $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
+    param($eventSender, $eventArgs)
+    $pct = Get-SebPercentFromMessage $eventArgs.Message
+    if ($pct -ge 0) { Write-SebProgress -Database $script:SebProgressDb -Percent $pct -Stage 'backup' }
+  }
+  $script:SebProgressDb = $Database
+  $Connection.add_InfoMessage($handler)
   try {
     Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
     if ($script:SebCompression -eq 'unknown') { $script:SebCompression = 'on' }
@@ -1001,9 +1048,11 @@ function Invoke-SebBackupDatabase {
     $script:SebCompression = 'off'
     Write-SebLog 'this edition has no backup compression - continuing uncompressed' 'INFO'
   }
+  finally { }
 
   $sql = 'BACKUP DATABASE {0} TO DISK = {1} WITH {2}' -f $quoted, $literal, ($base -join ', ')
-  Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
+  try { Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql }
+  finally { $Connection.remove_InfoMessage($handler) }
 }
 
 function Test-SebBackupFile {
@@ -1246,12 +1295,17 @@ GROUP BY database_id
     $pendingList = New-Object System.Collections.ArrayList
     foreach ($item in $pending) { [void]$pendingList.Add($item) }
 
+    $dbIndex = 0
     foreach ($database in $databases) {
+      $dbIndex++
       $fileName = Get-SebFileName -Database $database -Stamp $stamp
       $staged = Join-Path $staging $fileName
       try {
+        Write-SebJob -Index $dbIndex -Total $databases.Count -Database $database
         Write-SebLog ('backing up {0}' -f $database)
+        Write-SebStage -Database $database -Stage 'backup'
         Invoke-SebBackupDatabase -Connection $connection -Database $database -TargetFile $staged
+        Write-SebStage -Database $database -Stage 'verify'
         Test-SebBackupFile -Connection $connection -TargetFile $staged
         $sizeMb = [long]((Get-Item -LiteralPath $staged).Length / 1MB)
         Write-SebLog ('{0} backed up and verified ({1} MB)' -f $database, $sizeMb)
@@ -1265,6 +1319,7 @@ GROUP BY database_id
         $plan = Get-SebRetentionPlan -HourlyFiles $hourlyFacts -DailyFiles $dailyFacts -Now $stamp `
           -HourlyKeep ([int]$Config.HourlyKeep) -DailyKeepDays ([int]$Config.DailyKeepDays)
 
+        Write-SebStage -Database $database -Stage 'copy'
         $targets = @(@{ Dir = $hourlyDir; Kind = 'hourly' })
         if ($plan.PromoteToDaily) { $targets += @{ Dir = $dailyDir; Kind = 'daily' } }
 
