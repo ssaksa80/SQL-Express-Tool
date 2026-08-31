@@ -41,12 +41,36 @@ where you would rather not build the exe.
 
 ### Which one to use
 
-**The PowerShell path is the supported one.** The exe is unsigned, and endpoint
+**The PowerShell path is the supported one.** The exe ships unsigned, and endpoint
 protection reasonably treats a freshly compiled binary that spawns elevated
 PowerShell as suspicious — CrowdStrike Falcon quarantines it on the estate this was
 written for. The `.ps1` and `.cmd` are not affected, because `powershell.exe` is
-signed and script rules are usually permissive. If you want the window to survive on
-a managed estate, sign the exe or have it allow-listed.
+signed and script rules are usually permissive.
+
+### Signing it
+
+The build signs the exe whenever a code-signing certificate is available, and says
+so plainly when it is not:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .uild-app.ps1 -CertThumbprint <thumbprint>
+```
+
+Omit `-CertThumbprint` and it uses the first code-signing certificate with a private
+key in `CurrentUser\My` or `LocalMachine\My`; pass `-NoSign` to skip. The signature
+is SHA-256 and timestamped, so it stays valid after the certificate expires — and a
+timestamp server that cannot be reached is a warning, not a build failure.
+
+**A self-signed certificate will not help.** EDR weighs reputation, and a
+certificate nobody has ever seen carries none; Windows will not trust it either
+unless it is installed into Trusted Root *and* Trusted Publishers on every machine
+that runs the tool. Enrol from your own CA — a certificate chaining to a root the
+domain already trusts is the thing that changes the outcome.
+
+Note that applying a signature and being able to *validate* it are different: a
+certificate from an internal CA reports `Valid` on a domain-joined machine and
+`UnknownError` on one that lacks that root. The file is signed correctly either way,
+so the build reports the distinction rather than failing on it.
 
 ## What it does
 

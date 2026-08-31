@@ -25,7 +25,11 @@
 [CmdletBinding()]
 param(
   [string]$OutDir,
-  [switch]$Quiet
+  [switch]$Quiet,
+  # Thumbprint of a code-signing certificate. Omit to use the first one found in the
+  # user or machine store; pass -NoSign to skip signing even when one is available.
+  [string]$CertThumbprint,
+  [switch]$NoSign
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,10 +98,88 @@ if ($LASTEXITCODE -ne 0) {
 }
 $out | Where-Object { "$_" -match 'warning' } | ForEach-Object { Say ("  " + $_) }
 
+# ---- signing --------------------------------------------------------------------
+# An unsigned binary that spawns elevated PowerShell is close to a textbook EDR
+# heuristic, and on a managed estate it gets quarantined - which is the endpoint
+# tool working, not failing. Signing is the fix, so the build signs whenever a
+# certificate is available and says plainly when it cannot.
+#
+# A SELF-SIGNED certificate does NOT help, and that is worth stating because it
+# looks like it should. EDR weighs reputation and a certificate nobody has seen
+# carries none; Windows will not trust it either unless it is in Trusted Root AND
+# Trusted Publishers on every machine that runs this. Enrol from your own CA - a
+# certificate chaining to a root the domain already trusts is what changes the
+# outcome.
+$signedOk = $false
+if (-not $NoSign) {
+  $cert = $null
+  if ($CertThumbprint) {
+    $wanted = $CertThumbprint.Replace(' ', '')
+    foreach ($store in @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\My')) {
+      $c = @(Get-ChildItem $store -ErrorAction SilentlyContinue |
+          Where-Object { $_.Thumbprint -eq $wanted -and $_.HasPrivateKey })
+      if ($c.Count -gt 0) { $cert = $c[0]; break }
+    }
+    if (-not $cert) { throw ("no certificate with a private key and thumbprint $wanted was found") }
+  }
+  else {
+    foreach ($store in @('Cert:\CurrentUser\My', 'Cert:\LocalMachine\My')) {
+      $c = @(Get-ChildItem $store -CodeSigningCert -ErrorAction SilentlyContinue |
+          Where-Object { $_.HasPrivateKey })
+      if ($c.Count -gt 0) { $cert = $c[0]; break }
+    }
+  }
+
+  if ($cert) {
+    Say ('signing  : ' + $cert.Subject + '  (' + $cert.Thumbprint.Substring(0, 12) + ')')
+    # Timestamping keeps the signature valid past the certificate's expiry but needs
+    # the network, and an untimestamped signature beats none - so that must not fail
+    # the build.
+    $sig = $null
+    try {
+      $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com' -ErrorAction Stop
+    }
+    catch {
+      Say '           (timestamp server unreachable - signing without a timestamp)'
+      $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert -HashAlgorithm SHA256
+    }
+    # Applying a signature and being able to VALIDATE it here are different things,
+    # and only the first is this build's job. A certificate from an internal CA
+    # reports Valid on a domain machine and UnknownError on one that does not trust
+    # that root - the file is signed correctly either way. So fail only when no
+    # signature was actually written, and report anything else rather than throwing.
+    if ($null -eq $sig -or $sig.Status -eq 'NotSigned' -or $null -eq $sig.SignerCertificate) {
+      throw ('signing did not apply a signature: ' + $(if ($sig) { "$($sig.Status) - $($sig.StatusMessage)" } else { 'no result' }))
+    }
+    if ($sig.Status -eq 'Valid') {
+      $signedOk = $true
+      Say '           signed and verifiable on this machine'
+    }
+    else {
+      $signedOk = $true
+      Say ('           signed, but this machine cannot validate the chain (' + $sig.Status + ').')
+      Say '           Expected when the signing root is not installed here. If the'
+      Say '           certificate is SELF-SIGNED, nothing will trust it anywhere and'
+      Say '           it will not stop endpoint protection quarantining the exe.'
+    }
+  }
+  else {
+    Say 'signing  : SKIPPED - no code-signing certificate in CurrentUser\My or LocalMachine\My.'
+    Say '           The exe is UNSIGNED and endpoint protection may quarantine it.'
+    Say '           Enrol one from your CA and re-run with -CertThumbprint, or use the'
+    Say '           PowerShell path, which does not depend on this at all.'
+  }
+}
+
 $size = [long]((Get-Item -LiteralPath $exe).Length / 1KB)
 Say ''
 Say ("built    : $exe  (${size} KB)")
 Say  'portable : copy that one file anywhere - it carries its UI and the engine'
 Say  'run      : double-click it - it opens a window. No browser, no listener.'
-Say  'note     : it is unsigned, so EDR may quarantine it. The PowerShell path'
-Say  '           (Invoke-SqlExpressBackup.ps1) always works and is the supported one.'
+if ($signedOk) {
+  Say  'signed   : yes - endpoint protection is far less likely to object.'
+}
+else {
+  Say  'note     : it is UNSIGNED, so EDR may quarantine it. The PowerShell path'
+  Say  '           (Invoke-SqlExpressBackup.ps1) always works and is the supported one.'
+}
