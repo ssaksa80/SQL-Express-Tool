@@ -191,7 +191,9 @@ hours. That shipped once. The test now asserts the path the app actually used.
 - **A dead UNC path takes about 7.5 minutes to fail.** The task's execution time limit
   and a named mutex keep that contained, but a share outage makes a pass slow.
 - **Restore is not automated.** This produces verified, restorable files; restoring is
-  a human decision.
+  a human decision. The procedure is written down: [docs/RESTORE.md](docs/RESTORE.md),
+  including the permission trap that makes a perfectly good backup unreadable and a
+  drill record proving a real database came back.
 - **The exe is unsigned**, so endpoint protection may quarantine it. See *Which one to
   use* above. The PowerShell path is unaffected.
 - **On Server Core there is no window.** Use the `.ps1` and `.cmd` directly; the

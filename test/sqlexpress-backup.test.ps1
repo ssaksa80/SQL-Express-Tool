@@ -648,4 +648,41 @@ finally { Remove-Item -LiteralPath $aclDir -Recurse -Force -ErrorAction Silently
 # ---- 10. the -DotSourceOnly guard must actually stop before doing anything ---------
 Assert ($raw -match 'if \(\$DotSourceOnly\) \{ return \}') 'the -DotSourceOnly guard returns BEFORE any mode dispatch runs'
 
+# ---- 11. the backup destination must let SQL READ what it will have to restore ----
+# Regression for a fault a restore drill found and nothing else could have: backups
+# are written by SQL into staging and copied to the destination by the engine, so
+# the copies were owned by the engine and SQL could not open them. Every pass was
+# green and RESTORE FILELISTONLY failed with operating system error 5 - a backup set
+# nobody could restore, reporting success four times a day.
+#
+# Asserted on the returned ACL rather than by creating a share, which needs
+# elevation. A rule only an administrator on a live host can check is a rule nobody
+# checks.
+# Well-known accounts, because AddAccessRule resolves the name to a SID eagerly and
+# a made-up domain principal throws instead of failing the assertion. What is under
+# test is the SHAPE of the grant - who gets read, who gets write - not the names.
+$MACH = 'NT AUTHORITY\NETWORK SERVICE'   # stands in for the machine account
+$SQLA = 'NT AUTHORITY\LOCAL SERVICE'     # stands in for the SQL service account
+$acl = New-SebShareAcl -MachineAccount $MACH -SqlAccount $SQLA
+$rules = @($acl.GetAccessRules($true, $false, [System.Security.Principal.NTAccount]))
+
+$sqlRule = @($rules | Where-Object { $_.IdentityReference.Value -eq $SQLA })
+Assert ($sqlRule.Count -eq 1) "the SQL service account gets exactly one rule on the destination (got $($sqlRule.Count)) - without it RESTORE cannot open the file it just backed up"
+Assert ($sqlRule[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) 'and that rule grants READ'
+Assert (-not ($sqlRule[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write)) 'but NOT write - SQL writes through staging and must not alter what is already archived'
+Assert ($sqlRule[0].InheritanceFlags -eq ([System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit')) 'and it is inherited, so the per-database folders and the .bak files carry it too'
+
+# The machine account is a DIFFERENT identity and covers a different path: local
+# loopback UNC presents the service's own virtual account, a remote share presents
+# the computer account. Granting one is not granting the other.
+$machRule = @($rules | Where-Object { $_.IdentityReference.Value -eq $MACH })
+Assert ($machRule.Count -eq 1) 'the machine account still gets its own rule'
+Assert ($machRule[0].FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) 'and it keeps WRITE - it is the identity that copies backups in'
+
+Assert ($acl.AreAccessRulesProtected) 'inheritance stays off, so a permissive parent folder cannot widen this'
+
+# Omitting the SQL account must not silently grant something else instead.
+$bare = New-SebShareAcl -MachineAccount $MACH -SqlAccount ''
+Assert (@($bare.GetAccessRules($true,$false,[System.Security.Principal.NTAccount]) | Where-Object { $_.IdentityReference.Value -eq $SQLA }).Count -eq 0) 'no SQL rule is invented when no SQL account is supplied'
+
 Write-Host 'ALL PASS'

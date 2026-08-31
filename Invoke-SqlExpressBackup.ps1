@@ -1849,20 +1849,12 @@ function Test-SebScheduledIdentity {
 # SYSTEM reaching \\thishost\share over the loopback authenticates as the COMPUTER
 # account, not as SYSTEM, so the machine account is what has to be granted on both
 # the share and the file system.
-function New-SebLocalShare {
-  param(
-    [string]$FolderPath,
-    [string]$ShareName,
-    [string]$MachineAccount = (Get-SebMachineAccount)
-  )
-  Import-SebShippedModule -Command 'Set-Acl' -Module 'Microsoft.PowerShell.Security'
-  Import-SebShippedModule -Command 'Get-SmbShare' -Module 'SmbShare'
-
-  if (-not (Test-Path -LiteralPath $FolderPath)) {
-    [void](New-Item -ItemType Directory -Path $FolderPath -Force)
-    Write-SebLog ('created backup folder {0}' -f $FolderPath)
-  }
-
+# The folder ACL, built and returned rather than applied. Separated because applying
+# it needs a real folder and elevation, and a rule that can only be checked by an
+# administrator on a live host is a rule nobody checks. This way the composition is
+# asserted directly - see deploy of the SQL service read grant in the test suite.
+function New-SebShareAcl {
+  param([string]$MachineAccount, [string]$SqlAccount)
   $acl = New-Object System.Security.AccessControl.DirectorySecurity
   $acl.SetAccessRuleProtection($true, $false)
   $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
@@ -1876,7 +1868,44 @@ function New-SebLocalShare {
     $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
         (New-Object System.Security.Principal.NTAccount($MachineAccount)), 'Modify', $inherit, $none, 'Allow')))
   }
-  Set-Acl -Path $FolderPath -AclObject $acl
+  # Read, not Modify: SQL must be able to RESTORE from here and nothing more. It
+  # writes through staging, so it has no business altering what is already archived.
+  if (-not [string]::IsNullOrWhiteSpace($SqlAccount)) {
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        (New-Object System.Security.Principal.NTAccount($SqlAccount)), 'ReadAndExecute', $inherit, $none, 'Allow')))
+  }
+  return $acl
+}
+
+# The SQL service account has to be granted READ here too, and that is not symmetry
+# for its own sake. Backups are written by SQL into staging and copied here by the
+# engine, so the copies land owned by the engine and SQL cannot open them - which
+# nothing notices, because BACKUP never reads them back. It surfaces the first time
+# somebody tries to RESTORE, which is the worst possible moment to find out. Found
+# by an actual restore drill, not by review: every backup verified, every pass
+# green, and RESTORE FILELISTONLY still failed with operating system error 5.
+#
+# It needs granting in TWO places, and the identities are not interchangeable. Over
+# a LOCAL loopback UNC the service presents as its own virtual account, so that
+# account needs both the share and the file system. Reaching a REMOTE share it
+# presents as the computer account instead. Grant only one and exactly one of those
+# two paths is broken.
+function New-SebLocalShare {
+  param(
+    [string]$FolderPath,
+    [string]$ShareName,
+    [string]$MachineAccount = (Get-SebMachineAccount),
+    [string]$SqlAccount
+  )
+  Import-SebShippedModule -Command 'Set-Acl' -Module 'Microsoft.PowerShell.Security'
+  Import-SebShippedModule -Command 'Get-SmbShare' -Module 'SmbShare'
+
+  if (-not (Test-Path -LiteralPath $FolderPath)) {
+    [void](New-Item -ItemType Directory -Path $FolderPath -Force)
+    Write-SebLog ('created backup folder {0}' -f $FolderPath)
+  }
+
+  Set-Acl -Path $FolderPath -AclObject (New-SebShareAcl -MachineAccount $MachineAccount -SqlAccount $SqlAccount)
 
   $existing = Get-SmbShare -Name $ShareName -ErrorAction SilentlyContinue
   if ($null -ne $existing) {
@@ -1890,8 +1919,11 @@ function New-SebLocalShare {
   else {
     $full = @('BUILTIN\Administrators')
     if (-not [string]::IsNullOrWhiteSpace($MachineAccount)) { $full += $MachineAccount }
-    [void](New-SmbShare -Name $ShareName -Path $FolderPath -FullAccess $full -Description 'SQL Express backups')
-    Write-SebLog ("shared {0} as '{1}', full access to {2}" -f $FolderPath, $ShareName, ($full -join ' and '))
+    $params = @{ Name = $ShareName; Path = $FolderPath; FullAccess = $full; Description = 'SQL Express backups' }
+    if (-not [string]::IsNullOrWhiteSpace($SqlAccount)) { $params['ReadAccess'] = @($SqlAccount) }
+    [void](New-SmbShare @params)
+    Write-SebLog ("shared {0} as '{1}', full access to {2}{3}" -f $FolderPath, $ShareName, ($full -join ' and '),
+      $(if (-not [string]::IsNullOrWhiteSpace($SqlAccount)) { ", read to $SqlAccount" } else { '' }))
   }
 
   return (Get-SebUncPath -HostName $env:COMPUTERNAME -ShareName $ShareName)
@@ -2218,7 +2250,7 @@ try {
     Write-Host '   NOTE: a share on THIS host is not an offsite copy. If this disk dies'
     Write-Host '   the backups die with it. Re-run -Setup against a real file server'
     Write-Host '   when you have one; everything else stays as it is.'
-    $unc = New-SebLocalShare -FolderPath $ShareFolder -ShareName $ShareName
+    $unc = New-SebLocalShare -FolderPath $ShareFolder -ShareName $ShareName -SqlAccount $sqlAccount
     Write-Host ('   share ready: ' + $unc)
 
     Write-Host ''
