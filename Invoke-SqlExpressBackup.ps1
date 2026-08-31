@@ -1549,8 +1549,16 @@ function Invoke-SebSetup {
   }
 
   $probe = Join-Path $Share ('.seb-write-probe-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-  Set-Content -LiteralPath $probe -Value 'probe' -Encoding ASCII
-  Remove-Item -LiteralPath $probe -Force
+  try {
+    Set-Content -LiteralPath $probe -Value 'probe' -Encoding ASCII -ErrorAction Stop
+    Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+  }
+  catch {
+    throw (Get-SebShareDenialMessage -Share $Share `
+        -Account ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+        -MachineAccount (Get-SebMachineAccount) `
+        -Original $_.Exception.Message)
+  }
   Write-Host ('  share is writable: {0}' -f $Share)
 
   if (-not $WindowsAuth) {
@@ -1587,6 +1595,24 @@ function Invoke-SebSetup {
   Write-Host ''
   Write-Host ('Setup complete. Config in {0}' -f $script:SebConfigDir)
   Write-Host 'Next:  -Install -As Task     (or -As Service, which needs nssm.exe)'
+}
+
+# "Access is denied" on its own is the least useful thing a backup tool can say.
+# It does not name the path, the account, or which of the several things setup
+# touches was refused - and this is the tool whose entire premise is being
+# debuggable during a change window. Built as a pure function so the wording is
+# tested rather than only seen when it is already 2am.
+function Get-SebShareDenialMessage {
+  param([string]$Share, [string]$Account, [string]$MachineAccount, [string]$Original)
+  $msg = "cannot write to the share '$Share' as $Account"
+  if (-not [string]::IsNullOrWhiteSpace($Original)) { $msg += " - $Original" }
+  $msg += ". Nothing has been changed."
+  $msg += " Check that this account has write access to the share AND to the folder behind it;"
+  $msg += " a share can grant Full while NTFS underneath refuses."
+  if (-not [string]::IsNullOrWhiteSpace($MachineAccount)) {
+    $msg += " The scheduled backup will reach it as $MachineAccount, not as you, so that account needs the same access."
+  }
+  return $msg
 }
 
 function Get-SebMachineAccount {
@@ -2101,7 +2127,20 @@ try {
   }
 }
 catch {
-  Write-SebLog $_.Exception.Message 'ERROR'
+  # Name the mode and any path the error carried. A bare message leaves the operator
+  # guessing which of staging, the share, the config folder or the key file was
+  # refused - they are four different problems with four different fixes.
+  $failedMode = 'Run'
+  foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest')) {
+    $v = Get-Variable -Name $m -ValueOnly -ErrorAction SilentlyContinue
+    if ($v) { $failedMode = $m; break }
+  }
+  $detail = "$($_.Exception.Message)"
+  $target = "$($_.CategoryInfo.TargetName)"
+  if (-not [string]::IsNullOrWhiteSpace($target) -and ($detail -notlike ("*" + $target + "*"))) {
+    $detail += "  [while touching: $target]"
+  }
+  Write-SebLog ("-$failedMode failed: $detail") 'ERROR'
   $exitCode = 2
 }
 finally {

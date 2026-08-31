@@ -391,6 +391,23 @@ Assert ($installBody.Success -and $installBody.Value -match 'Copy-SebEngineForSe
 $serviceBody = [regex]::Match($code, '(?s)function Install-SebService \{.*?\n\}')
 Assert ($serviceBody.Success -and $serviceBody.Value -match 'Copy-SebEngineForService') 'and so does the service install'
 
+# ---- 8f00. a refusal must say WHAT was refused ------------------------------------
+# Seen live: setup got as far as proving staging, then logged "Access is denied" and
+# nothing else. No path, no account, no operation - in the one tool whose whole
+# premise is being debuggable during a change window. Setup touches staging, the
+# share, the config folder and the key file; those are four different problems with
+# four different fixes, and a bare message picks none of them.
+$denial = Get-SebShareDenialMessage -Share '\\fs\sqlbackups' -Account 'CONTOSO\admin' -MachineAccount 'CONTOSO\HOST$' -Original 'Access is denied'
+Assert ($denial -match [regex]::Escape('\\fs\sqlbackups')) 'the refusal names the share it could not write'
+Assert ($denial -match 'CONTOSO\\admin') 'and the account it tried as'
+Assert ($denial -match 'Access is denied') 'and keeps the original error rather than replacing it'
+Assert ($denial -match '(?i)nothing has been changed') 'and says nothing was changed, so the operator is not hunting for damage'
+Assert ($denial -match [regex]::Escape('CONTOSO\HOST$')) 'and names the machine account the SCHEDULED run will use'
+Assert ($denial -match '(?i)NTFS') 'and points at the share-versus-NTFS trap, which is the usual cause'
+$bare = Get-SebShareDenialMessage -Share '\\fs\s' -Account 'me' -MachineAccount '' -Original ''
+Assert ($bare -match [regex]::Escape('\\fs\s')) 'it still names the share with no machine account and no inner error'
+Assert (-not ($bare -match 'reach it as')) 'and does not dangle a sentence about an account it does not know'
+
 # ---- 8f0. the account that will actually run the backups -------------------------
 # Setup proves the OPERATOR can connect. Under Windows authentication the scheduled
 # task connects as SYSTEM instead, so the operator's success says nothing about the

@@ -16,15 +16,6 @@ by the employer under contract or local law, the rights above rest with the
 employer rather than the individual author, and any decision to relicense or to
 publish is theirs to make. Nothing here asserts otherwise.
 
-THIRD-PARTY COMPONENTS
-assets/gsap.min.js is GSAP by Webflow (formerly GreenSock), redistributed here
-unmodified. GSAP is not covered by the terms above and is used under its own
-licence; the standard "no charge" licence permits use in most cases but not all -
-see https://gsap.com/licensing/ for the terms that apply to your use. If this tool
-is ever distributed beyond the copyright holder's own estate, confirm that the GSAP
-licence covers that use, or remove the animation layer, which the console degrades
-gracefully without.
-
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
 INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
 PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE
