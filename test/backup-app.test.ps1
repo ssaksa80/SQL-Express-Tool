@@ -136,6 +136,7 @@ try {
   Assert ($report -match 'CHECK-OK') "the smoke check reported OK ($($report -replace "`r?`n", ' | '))"
   Assert ($report -match 'engine-exists: true') 'the engine was extracted'
   Assert ($report -match 'form-built: true') 'the window was constructed - the layout does not throw'
+  Assert ($report -match 'restore-form-built: true') 'and so was the RESTORE window - it can destroy a database, so its layout must not be the first thing anyone runs'
   Assert ($report -match ('host: ' + [regex]::Escape($env:COMPUTERNAME))) 'it identified this host'
 
   # The escalation guard, checked against the path it actually used rather than the

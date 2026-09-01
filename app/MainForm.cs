@@ -157,6 +157,11 @@ static class SebApp
                 sb.AppendLine("schedule: " + s.ScheduleState);
                 sb.AppendLine("databases: " + s.Databases.Count.ToString(CultureInfo.InvariantCulture));
                 using (MainForm f = new MainForm()) { sb.AppendLine("form-built: " + (f.Controls.Count > 0).ToString().ToLowerInvariant()); }
+                // The restore window is constructed too. Layout code that has never
+                // executed is the code most likely to throw on first use, and this one
+                // opens in front of an operator who is already having a bad day. It is
+                // built and disposed WITHOUT being shown, so nothing runs a restore.
+                using (RestoreForm r = new RestoreForm()) { sb.AppendLine("restore-form-built: " + (r.Controls.Count > 0).ToString().ToLowerInvariant()); }
                 sb.AppendLine("CHECK-OK");
                 TryWrite(checkFile, sb.ToString());
                 return 0;
