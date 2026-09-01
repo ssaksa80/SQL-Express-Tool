@@ -1942,6 +1942,20 @@ function New-SebShareAcl {
 # account needs both the share and the file system. Reaching a REMOTE share it
 # presents as the computer account instead. Grant only one and exactly one of those
 # two paths is broken.
+# Share-level permissions the backups need, applied idempotently. Separated so the
+# reuse path and the create path grant exactly the same thing - the bug this fixes
+# was the two drifting apart, with only the create path granting the SQL service.
+function Grant-SebShareAccess {
+  param([string]$ShareName, [string]$MachineAccount, [string]$SqlAccount)
+  Import-SebShippedModule -Command 'Grant-SmbShareAccess' -Module 'SmbShare'
+  if (-not [string]::IsNullOrWhiteSpace($MachineAccount)) {
+    [void](Grant-SmbShareAccess -Name $ShareName -AccountName $MachineAccount -AccessRight Full -Force -ErrorAction SilentlyContinue)
+  }
+  if (-not [string]::IsNullOrWhiteSpace($SqlAccount)) {
+    [void](Grant-SmbShareAccess -Name $ShareName -AccountName $SqlAccount -AccessRight Read -Force -ErrorAction SilentlyContinue)
+  }
+}
+
 function New-SebLocalShare {
   param(
     [string]$FolderPath,
@@ -1967,6 +1981,14 @@ function New-SebLocalShare {
         'Remove it or choose another -ShareName rather than repointing something that may be in use.')
     }
     Write-SebLog ("share '{0}' already exists at {1} - reusing it" -f $ShareName, $FolderPath)
+    # Reusing a share must NOT mean reusing its permissions unquestioned. The rule
+    # that the SQL service needs read to RESTORE was added after some shares already
+    # existed, so a re-setup over an old share left restore-from-UNC broken while the
+    # NTFS ACL (re-applied above) looked fine - the exact split that made a backup
+    # readable locally and unreadable over its own share. Grant-SmbShareAccess is
+    # idempotent, so the grants are re-applied every time rather than only at
+    # creation. This is what the else branch does for a NEW share; the two must match.
+    Grant-SebShareAccess -ShareName $ShareName -MachineAccount $MachineAccount -SqlAccount $SqlAccount
   }
   else {
     $full = @('BUILTIN\Administrators')

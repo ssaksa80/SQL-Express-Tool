@@ -775,4 +775,30 @@ Assert ((Resolve-SebLocalShare -Root 'C:\plain\path') -eq 'C:\plain\path') 'a lo
 Assert ((Resolve-SebLocalShare -Root ('\otherhost\share')) -eq '\otherhost\share') 'a UNC for ANOTHER host is left alone'
 Assert ((Resolve-SebLocalShare -Root '') -eq '') 'an empty root is returned unchanged'
 
+# ---- 13. reusing a share must still grant the SQL service read --------------------
+# Regression for a fault a live re-setup surfaced: New-SebLocalShare granted the SQL
+# service read on the SMB share only when CREATING one. Re-running setup over an
+# existing share reused it and skipped the grant, so RESTORE from the UNC path failed
+# with operating system error 5 while the local path worked - a backup readable on
+# disk and unreadable over its own share. Both code paths now call one helper, so
+# they cannot drift.
+#
+# Asserted on the AST rather than by creating a share (which needs elevation and a
+# real SMB stack): the reuse branch must call the shared grant helper, or the create
+# path's grant is a promise only kept for brand-new shares.
+$engineText = Get-Content -Raw -LiteralPath $script
+$reuseIdx = $engineText.IndexOf("already exists at")
+Assert ($reuseIdx -ge 0) 'the share-reuse branch is present to test'
+$elseIdx = $engineText.IndexOf('New-SmbShare @params')
+$reuseBlock = $engineText.Substring($reuseIdx, [Math]::Max(0, $elseIdx - $reuseIdx))
+Assert ($reuseBlock -match 'Grant-SebShareAccess') 'the reuse path grants share access rather than silently keeping stale permissions'
+
+# And the helper must grant the SQL account READ specifically - not omit it, and not
+# hand it Full. This is what the AST check above cannot see: that the grant is right.
+$helperIdx = $engineText.IndexOf('function Grant-SebShareAccess')
+Assert ($helperIdx -ge 0) 'the shared grant helper exists'
+$helperBlock = $engineText.Substring($helperIdx, 700)
+Assert ($helperBlock -match 'SqlAccount' -and $helperBlock -match "AccessRight Read") 'the SQL service is granted READ on the share'
+Assert ($helperBlock -match "MachineAccount" -and $helperBlock -match "AccessRight Full") 'the machine account keeps Full - it is what copies backups in'
+
 Write-Host 'ALL PASS'
