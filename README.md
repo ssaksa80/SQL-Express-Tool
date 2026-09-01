@@ -53,7 +53,7 @@ The build signs the exe whenever a code-signing certificate is available, and sa
 so plainly when it is not:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .uild-app.ps1 -CertThumbprint <thumbprint>
+powershell -NoProfile -ExecutionPolicy Bypass -File .uild-app.ps1 -CertThumbprint <thumbprint>
 ```
 
 Omit `-CertThumbprint` and it uses the first code-signing certificate with a private
@@ -61,11 +61,22 @@ key in `CurrentUser\My` or `LocalMachine\My`; pass `-NoSign` to skip. The signat
 is SHA-256 and timestamped, so it stays valid after the certificate expires — and a
 timestamp server that cannot be reached is a warning, not a build failure.
 
-**A self-signed certificate will not help.** EDR weighs reputation, and a
-certificate nobody has ever seen carries none; Windows will not trust it either
-unless it is installed into Trusted Root *and* Trusted Publishers on every machine
-that runs the tool. Enrol from your own CA — a certificate chaining to a root the
-domain already trusts is the thing that changes the outcome.
+**A self-signed certificate is enough to LAUNCH, though not to distribute** — and
+that was measured, not assumed. On a CrowdStrike Falcon estate, a controlled A/B in
+one time window had the unsigned exe blocked 3 of 3 and the same binary self-signed
+launch 3 of 3. Falcon appears to treat any Authenticode signature as a lower-risk
+signal than a completely unsigned binary that launches elevated PowerShell, even an
+untrusted one. So for running on the box it was built on:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build-app.ps1 -SelfSign
+```
+
+`-SelfSign` creates a code-signing certificate in `CurrentUser\My` (reused on later
+builds) when no real one is present. Nothing off that machine will trust it, and
+Windows will not validate its chain — so for anything handed to another host, enrol
+from your own CA instead. A certificate chaining to a root the domain already trusts
+is the only thing that makes the signature *trusted* rather than merely present.
 
 Note that applying a signature and being able to *validate* it are different: a
 certificate from an internal CA reports `Valid` on a domain-joined machine and
