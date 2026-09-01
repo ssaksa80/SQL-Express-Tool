@@ -1985,6 +1985,15 @@ function Write-SebCheck {
   param([bool]$Ok, [string]$What)
   if ($Ok) { $script:SebStPass++; Write-Host ('  [ OK ] ' + $What) }
   else { $script:SebStFail++; Write-Host ('  [FAIL] ' + $What) -ForegroundColor Red }
+  # Also report the step as a stage. The self test spends minutes on preparation -
+  # resolving the service account, proving staging is writable with a real backup -
+  # all of it before any [JOB] marker exists. Without this the console sat at
+  # '(preparing) 0%' for over five minutes while working perfectly, which is the same
+  # fault as a finished job drawing an empty bar: the readout cannot tell the
+  # operator apart from a hang.
+  $short = $What
+  if ($short.Length -gt 58) { $short = $short.Substring(0, 55) + '...' }
+  Write-SebStage -Database '' -Stage $short
 }
 
 # A complete live proof against the real engine, in a throwaway location, on a

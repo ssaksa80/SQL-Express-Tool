@@ -83,6 +83,27 @@ try {
   Assert ($proc.ExitCode -eq 0) "--check exited 0 (got $($proc.ExitCode))"
   Assert (Test-Path -LiteralPath $checkFile) 'and wrote its findings'
 
+  # The progress arithmetic, exercised in the REAL compiled binary rather than
+  # reimplemented here. It runs without a window, a database or a backup, so it can
+  # be asserted every run - and it is the arithmetic behind the bar an operator uses
+  # to decide whether a job is stuck.
+  $progFile = Join-Path $outDir 'progress.txt'
+  $pp = Start-Process -FilePath $exe -ArgumentList '--check-progress', "`"$progFile`"" -PassThru -Wait -ErrorAction Stop
+  Assert (Test-Path -LiteralPath $progFile) '--check-progress wrote its findings'
+  $prog = Get-Content -LiteralPath $progFile -Raw
+  $progPass = @([regex]::Matches($prog, '(?m)^PASS ')).Count
+  $progFail = @([regex]::Matches($prog, '(?m)^FAIL ')).Count
+  Assert ($progPass -gt 12) "the progress checks actually ran (got $progPass assertions) - a mode that silently does nothing would otherwise pass here"
+  Assert ($progFail -eq 0) ("every progress assertion held (failed: " + (($prog -split "`r?`n" | Where-Object { $_ -like 'FAIL *' }) -join '; ') + ")")
+  Assert ($prog -match 'PROGRESS-OK') 'and the run reported OK overall'
+  Assert ($pp.ExitCode -eq 0) "--check-progress exited 0 (got $($pp.ExitCode))"
+
+  # The specific defect this replaced: a finished job drew an EMPTY bar, so success
+  # and never-started were indistinguishable. Pinned by name so it cannot regress
+  # quietly into 'the bar is blank again'.
+  Assert ($prog -match 'PASS finished is one') 'a finished job reports 100 percent, not a blank bar'
+  Assert ($prog -match 'PASS and the monotonic clamp stops it') 'and the bar cannot walk backwards'
+
   $report = Get-Content -LiteralPath $checkFile -Raw
   Assert ($report -match 'CHECK-OK') "the smoke check reported OK ($($report -replace "`r?`n", ' | '))"
   Assert ($report -match 'engine-exists: true') 'the engine was extracted'

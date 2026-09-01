@@ -312,8 +312,79 @@ class ActionButton : Button
 //
 // No glow here on purpose. This is a readout, not a state light - the same rule that
 // keeps the log pane flat.
+// The progress arithmetic, kept pure and separate from the painting so it can be
+// asserted. The old readout tracked percentage WITHIN the current database, which
+// SQL only reports during BACKUP ... WITH STATS - so verify, copy and finished all
+// drew an empty bar and a completed job looked exactly like one that never ran.
+static class JobProgress
+{
+    // Stage weights. Backup is the bulk of the work and the only stage SQL reports a
+    // percentage for; the rest are fixed points because there is no percentage to be
+    // had, and inventing a moving one would be a lie with extra steps.
+    public const double BackupSpan = 0.75;
+    public const double VerifyAt   = 0.85;
+    public const double CopyAt     = 0.95;
+
+    public static double Clamp01(double v)
+    {
+        if (v < 0.0) { return 0.0; }
+        if (v > 1.0) { return 1.0; }
+        return v;
+    }
+
+    // How much of the CURRENT database is done.
+    public static double Fraction(string stage, int pct)
+    {
+        if (stage == "backup")
+        {
+            if (pct < 0) { return 0.0; }
+            // Clamp the PERCENT, not the product. Clamping the result only stops it
+            // exceeding 1.0, so a bogus 300% still reported the database wholly done
+            // while it was mid-backup - past verify and copy, which have not happened.
+            int p = pct > 100 ? 100 : pct;
+            return (p / 100.0) * BackupSpan;
+        }
+        if (stage == "verify") { return VerifyAt; }
+        if (stage == "copy" || stage == "prune") { return CopyAt; }
+        if (stage == "finished" || stage == "done") { return 1.0; }
+        return 0.0;
+    }
+
+    // Overall job progress. This is what the bar shows.
+    public static double Overall(int index, int total, string stage, int pct)
+    {
+        if (stage == "finished" || stage == "done") { return 1.0; }
+        if (total <= 0) { return 0.0; }
+        int done = index - 1;
+        if (done < 0) { done = 0; }
+        if (done > total) { done = total; }
+        return Clamp01((done + Fraction(stage, pct)) / total);
+    }
+
+    // Never walk backwards. Starting database 4 of 8 computes lower than finishing
+    // database 3 of 8, and a bar that retreats destroys trust in the whole readout.
+    public static double Monotonic(double previous, double next)
+    {
+        return next < previous ? previous : next;
+    }
+
+    // The sheen is a liveness signal, not decoration. If nothing is moving it must
+    // stop moving, or the animation asserts progress that is not happening.
+    public static bool Stalled(string stage, double mbPerSec, double secondsAtZero)
+    {
+        if (stage != "backup" && stage != "copy") { return false; }
+        if (mbPerSec > 0.0001) { return false; }
+        return secondsAtZero >= 5.0;
+    }
+}
+
 class ProgressPanel : Panel
 {
+    double overall = 0.0;
+    double sheenPhase = 0.0;
+    DateTime zeroSince = DateTime.MinValue;
+    bool stalled = false;
+
     string jobLabel = "";
     string currentDb = "";
     string stage = "";
@@ -336,9 +407,15 @@ class ProgressPanel : Panel
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
         ticker = new System.Windows.Forms.Timer();
-        ticker.Interval = 500;
+        ticker.Interval = IdleMs;
         ticker.Tick += new EventHandler(OnTick);
     }
+
+    // 60ms while something is running, so the sheen moves smoothly; back to a lazy
+    // half-second when idle, because repainting a static bar 16 times a second is
+    // just heat.
+    const int ActiveMs = 60;
+    const int IdleMs = 500;
 
     public void SetStagingPath(string path) { stagingPath = path; }
 
@@ -356,7 +433,12 @@ class ProgressPanel : Panel
         started = DateTime.Now;
         dbStarted = DateTime.Now;
         lastSample = DateTime.Now;
+        overall = 0.0;
+        sheenPhase = 0.0;
+        stalled = false;
+        zeroSince = DateTime.MinValue;
         active = true;
+        ticker.Interval = ActiveMs;
         ticker.Start();
         Invalidate();
     }
@@ -366,6 +448,14 @@ class ProgressPanel : Panel
         active = false;
         stage = outcome;
         dbPercent = -1;
+        stalled = false;
+        // A finished job is a full bar. This is the bug being fixed: the old readout
+        // blanked the bar here, so success and never-started rendered identically.
+        if (outcome == "finished" || outcome == "done" || outcome == "ok")
+        {
+            overall = 1.0;
+        }
+        ticker.Interval = IdleMs;
         ticker.Stop();
         Invalidate();
     }
@@ -376,6 +466,7 @@ class ProgressPanel : Panel
         if (currentDb != db) { dbStarted = DateTime.Now; stagedBytes = 0; lastBytes = 0; mbPerSec = 0; }
         currentDb = db;
         dbPercent = -1;
+        Recompute();
         Invalidate();
     }
 
@@ -386,6 +477,7 @@ class ProgressPanel : Panel
         // Percent only means anything during the backup itself; verify and copy are
         // their own phases and a stale bar there would be a lie.
         if (value != "backup") { dbPercent = -1; }
+        Recompute();
         Invalidate();
     }
 
@@ -393,7 +485,13 @@ class ProgressPanel : Panel
     {
         if (!string.IsNullOrEmpty(db)) { currentDb = db; }
         dbPercent = pct;
+        Recompute();
         Invalidate();
+    }
+
+    void Recompute()
+    {
+        overall = JobProgress.Monotonic(overall, JobProgress.Overall(jobIndex, jobTotal, stage, dbPercent));
     }
 
     // Measure the staged file rather than trusting a rate: this is what catches a
@@ -425,6 +523,14 @@ class ProgressPanel : Panel
                 }
             }
             catch { }
+
+            if (mbPerSec > 0.0001) { zeroSince = DateTime.MinValue; }
+            else if (zeroSince == DateTime.MinValue) { zeroSince = DateTime.Now; }
+            double atZero = zeroSince == DateTime.MinValue ? 0.0 : (DateTime.Now - zeroSince).TotalSeconds;
+            stalled = JobProgress.Stalled(stage, mbPerSec, atZero);
+
+            if (!stalled) { sheenPhase += 0.018; if (sheenPhase > 1.6) { sheenPhase = -0.25; } }
+            Recompute();
         }
         Invalidate();
     }
@@ -481,26 +587,55 @@ class ProgressPanel : Panel
             Rectangle bar = new Rectangle(13, barY, barW, 12);
             using (SolidBrush bg = new SolidBrush(Theme.Bg)) { g.FillRectangle(bg, bar); }
             using (Pen p = new Pen(Theme.Line, 1f)) { g.DrawRectangle(p, bar); }
-            if (dbPercent >= 0)
+            // Overall job progress, not the current database's percentage. Amber while
+            // stalled, so a share that has gone quiet is visibly different from one
+            // that is working.
+            int fillW = (int)Math.Round((bar.Width - 2) * overall);
+            if (fillW > 0)
             {
-                int w = (int)(bar.Width * (dbPercent / 100.0));
-                if (w > 0)
+                Rectangle inner = new Rectangle(bar.X + 1, bar.Y + 1, fillW, bar.Height - 1);
+                using (SolidBrush fill = new SolidBrush(stalled ? Theme.Warn : Theme.Ok)) { g.FillRectangle(fill, inner); }
+
+                // The sheen. Clipped to the filled part so it never leaks onto the
+                // empty track, and frozen while stalled - a moving highlight over a
+                // job that is not moving would assert progress that is not happening.
+                if (active && !stalled && overall < 1.0)
                 {
-                    using (SolidBrush fill = new SolidBrush(Theme.Ok)) { g.FillRectangle(fill, bar.X + 1, bar.Y + 1, Math.Max(1, w - 2), bar.Height - 1); }
+                    g.SetClip(inner);
+                    int sw = 58;
+                    int sx = inner.X + (int)(sheenPhase * (inner.Width + sw)) - sw;
+                    using (LinearGradientBrush sheen = new LinearGradientBrush(
+                               new Rectangle(sx, inner.Y, sw, inner.Height),
+                               Color.FromArgb(0, 255, 255, 255),
+                               Color.FromArgb(0, 255, 255, 255),
+                               LinearGradientMode.Horizontal))
+                    {
+                        ColorBlend cb = new ColorBlend(3);
+                        cb.Colors = new Color[] {
+                            Color.FromArgb(0, 255, 255, 255),
+                            Color.FromArgb(110, 255, 255, 255),
+                            Color.FromArgb(0, 255, 255, 255) };
+                        cb.Positions = new float[] { 0f, 0.5f, 1f };
+                        sheen.InterpolationColors = cb;
+                        g.FillRectangle(sheen, sx, inner.Y, sw, inner.Height);
+                    }
+                    g.ResetClip();
                 }
             }
 
             string right = "";
-            if (dbPercent >= 0) { right += dbPercent.ToString(CultureInfo.InvariantCulture) + "%   "; }
-            if (mbPerSec > 0.05) { right += mbPerSec.ToString("0.0", CultureInfo.InvariantCulture) + " MB/s   "; }
+            right += ((int)Math.Round(overall * 100)).ToString(CultureInfo.InvariantCulture) + "%   ";
+            if (stalled) { right += "stalled   "; }
+            else if (mbPerSec > 0.05) { right += mbPerSec.ToString("0.0", CultureInfo.InvariantCulture) + " MB/s   "; }
             if (stagedBytes > 0) { right += (stagedBytes / 1048576).ToString(CultureInfo.InvariantCulture) + " MB   "; }
             TimeSpan elapsed = DateTime.Now - started;
             right += Span(elapsed) + " elapsed";
-            if (active && dbPercent > 3 && dbPercent < 100)
+            // Estimate from OVERALL progress, so it accounts for databases still queued
+            // rather than resetting its guess at every one.
+            if (active && !stalled && overall > 0.03 && overall < 1.0)
             {
-                TimeSpan dbElapsed = DateTime.Now - dbStarted;
-                double total = dbElapsed.TotalSeconds / (dbPercent / 100.0);
-                TimeSpan left = TimeSpan.FromSeconds(Math.Max(0, total - dbElapsed.TotalSeconds));
+                double totalSecs = elapsed.TotalSeconds / overall;
+                TimeSpan left = TimeSpan.FromSeconds(Math.Max(0, totalSecs - elapsed.TotalSeconds));
                 right += "   ~" + Span(left) + " left";
             }
             g.DrawString(right, body, ink3, bar.Right + 12, barY - 3);

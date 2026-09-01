@@ -22,6 +22,62 @@ static class SebApp
     [System.Runtime.InteropServices.DllImport("kernel32.dll")]
     static extern bool AttachConsole(int processId);
 
+    static int CheckProgress(string path)
+    {
+        StringBuilder sb = new StringBuilder();
+        int bad = 0;
+        // local assertion helper
+        List<string> fails = new List<string>();
+
+        Check(sb, fails, "starting is zero", JobProgress.Overall(1, 8, "starting", -1) == 0.0);
+        Check(sb, fails, "finished is one", JobProgress.Overall(8, 8, "finished", -1) == 1.0);
+        // The bug this fixes: a finished job must not render as an empty bar.
+        Check(sb, fails, "finished is one even mid-job", JobProgress.Overall(3, 8, "finished", -1) == 1.0);
+        Check(sb, fails, "backup at 100 pct does not fill the whole database",
+              Math.Abs(JobProgress.Fraction("backup", 100) - 0.75) < 1e-9);
+        Check(sb, fails, "verify is past backup", JobProgress.Fraction("verify", -1) > JobProgress.Fraction("backup", 100));
+        Check(sb, fails, "copy is past verify", JobProgress.Fraction("copy", -1) > JobProgress.Fraction("verify", -1));
+        Check(sb, fails, "first of eight backing up is under an eighth",
+              JobProgress.Overall(1, 8, "backup", 50) < 0.125);
+        Check(sb, fails, "eighth of eight copying is nearly whole",
+              JobProgress.Overall(8, 8, "copy", -1) > 0.99);
+        Check(sb, fails, "zero total does not divide by zero", JobProgress.Overall(1, 0, "backup", 50) == 0.0);
+        Check(sb, fails, "percent above 100 is clamped", JobProgress.Fraction("backup", 300) <= 0.75);
+        Check(sb, fails, "unknown stage contributes nothing", JobProgress.Fraction("banana", 50) == 0.0);
+
+        // Monotonic. The regression is NOT across a database boundary - at database 4
+        // of 8, three really are finished. It happens INSIDE one database: the engine
+        // emits [JOB] before [STAGE], so database 4 is briefly reported still in the
+        // previous database's 'copy' stage before its own 'backup' stage arrives.
+        double a = JobProgress.Overall(4, 8, "copy", -1);
+        double b = JobProgress.Overall(4, 8, "backup", 0);
+        Check(sb, fails, "the raw value really can go backwards within a database", b < a);
+        Check(sb, fails, "and the monotonic clamp stops it", JobProgress.Monotonic(a, b) == a);
+        Check(sb, fails, "crossing to the next database still moves forward",
+              JobProgress.Overall(4, 8, "starting", -1) > JobProgress.Overall(3, 8, "copy", -1));
+        Check(sb, fails, "while genuine forward movement passes through",
+              JobProgress.Monotonic(0.5, 0.6) == 0.6);
+
+        Check(sb, fails, "no throughput for six seconds during backup is a stall",
+              JobProgress.Stalled("backup", 0.0, 6.0));
+        Check(sb, fails, "no throughput for two seconds is not yet a stall",
+              !JobProgress.Stalled("backup", 0.0, 2.0));
+        Check(sb, fails, "throughput means no stall", !JobProgress.Stalled("backup", 1.5, 60.0));
+        Check(sb, fails, "verify reports no throughput and must not count as stalled",
+              !JobProgress.Stalled("verify", 0.0, 600.0));
+
+        bad = fails.Count;
+        sb.AppendLine(bad == 0 ? "PROGRESS-OK" : ("PROGRESS-FAIL " + bad));
+        TryWrite(path, sb.ToString());
+        return bad == 0 ? 0 : 1;
+    }
+
+    static void Check(StringBuilder sb, List<string> fails, string what, bool ok)
+    {
+        sb.AppendLine((ok ? "PASS " : "FAIL ") + what);
+        if (!ok) { fails.Add(what); }
+    }
+
     static void Complain(string text)
     {
         try
@@ -44,10 +100,18 @@ static class SebApp
     static int Main(string[] args)
     {
         string checkFile = null;
+        string progressFile = null;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
+            if (args[i] == "--check-progress" && i + 1 < args.Length) { progressFile = args[++i]; }
         }
+
+        // The progress arithmetic is pure, so it can be checked without a window, a
+        // database or a backup. It runs the REAL compiled JobProgress - not a
+        // reimplementation of it in the test - and writes findings to a file, because
+        // a windowed exe has no console to report to.
+        if (progressFile != null) { return CheckProgress(progressFile); }
 
         try
         {
@@ -613,6 +677,16 @@ class MainForm : Form
         return line.Substring(start, end - start);
     }
 
+    // stage= is always the LAST field on a marker line, and its value can contain
+    // spaces - the self test reports human-readable step names through it. Reading to
+    // the first space would truncate 'connected to the instance' to 'connected'.
+    static string FieldRest(string line, string key)
+    {
+        int i = line.IndexOf(key + "=", StringComparison.Ordinal);
+        if (i < 0) { return null; }
+        return line.Substring(i + key.Length + 1).TrimEnd();
+    }
+
     bool TryProgress(string line)
     {
         try
@@ -626,7 +700,7 @@ class MainForm : Form
             }
             if (line.StartsWith("[STAGE]", StringComparison.Ordinal))
             {
-                progress.SetStage(Field(line, "db"), Field(line, "stage"));
+                progress.SetStage(Field(line, "db"), FieldRest(line, "stage"));
                 return true;
             }
             if (line.StartsWith("[JOB]", StringComparison.Ordinal))
