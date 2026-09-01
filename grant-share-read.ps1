@@ -28,7 +28,8 @@ $pubForSvc = Get-Content 'C:\ProgramData\SqlExpressBackup\public.json' -Raw | Co
 $inst = [string]$pubForSvc.InstanceName
 if ($inst -eq 'MSSQLSERVER' -or [string]::IsNullOrWhiteSpace($inst)) { $svcName = 'MSSQLSERVER' }
 else { $svcName = 'MSSQL$' + $inst }
-$sqlAccount = (Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Services' + $svcName) -Name 'ObjectName' -ErrorAction Stop).ObjectName
+$svcKey = Join-Path 'HKLM:\SYSTEM\CurrentControlSet\Services' $svcName
+$sqlAccount = (Get-ItemProperty -LiteralPath $svcKey -Name 'ObjectName' -ErrorAction Stop).ObjectName
 if ([string]::IsNullOrWhiteSpace($sqlAccount)) { throw ('could not resolve the account for service ' + $svcName) }
 Write-Host ('SQL service (' + $svcName + ') runs as: ' + $sqlAccount)
 
