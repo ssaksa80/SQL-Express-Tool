@@ -20,14 +20,19 @@ if (-not (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security
 }
 Write-Host ("running as " + $id.Name)
 
-# The SQL service account, out of the registry (fast, no WMI).
-$svc = Get-CimInstance Win32_Service -Filter "Name LIKE 'MSSQL$%' AND Name NOT LIKE '%TELEMETRY%'" |
-       Select-Object -First 1
-$sqlAccount = $svc.StartName
-if ([string]::IsNullOrWhiteSpace($sqlAccount)) { throw "could not resolve the SQL service account" }
-Write-Host ("SQL service account: " + $sqlAccount)
+# The SQL service account, straight from the registry - no WMI (the WQL filter with a
+# literal $ in the service name is exactly what broke the first version of this).
+# The service name comes from the configured instance: a named instance is
+# MSSQL$<name>, the default instance is MSSQLSERVER.
+$pubForSvc = Get-Content 'C:\ProgramData\SqlExpressBackup\public.json' -Raw | ConvertFrom-Json
+$inst = [string]$pubForSvc.InstanceName
+if ($inst -eq 'MSSQLSERVER' -or [string]::IsNullOrWhiteSpace($inst)) { $svcName = 'MSSQLSERVER' }
+else { $svcName = 'MSSQL$' + $inst }
+$sqlAccount = (Get-ItemProperty -LiteralPath ('HKLM:\SYSTEM\CurrentControlSet\Services' + $svcName) -Name 'ObjectName' -ErrorAction Stop).ObjectName
+if ([string]::IsNullOrWhiteSpace($sqlAccount)) { throw ('could not resolve the account for service ' + $svcName) }
+Write-Host ('SQL service (' + $svcName + ') runs as: ' + $sqlAccount)
 
-$machine = "$env:USERDOMAIN\$env:COMPUTERNAME$"
+$machine = $env:USERDOMAIN + '' + $env:COMPUTERNAME + '$'
 
 Write-Host ''
 Write-Host '== granting =='
