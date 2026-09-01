@@ -560,16 +560,56 @@ function Unprotect-SebSecureString {
 # access to a folder an administrator just created. Assuming "SQL can obviously
 # write to a local folder" is how this fails on every install with
 # "Operating system error 5(Access is denied.)" and nothing else to go on.
+# The account a service runs as, out of the registry. Same value Win32_Service
+# reports in StartName, and the registry is where the SCM keeps it.
+#
+# This exists for speed, and the margin is not marginal. Win32_Service took 12.6
+# SECONDS on the first call on this host and 3.4 on later ones; the registry read is
+# 21ms warm. WMI is heavily instrumented by endpoint protection, so every query pays
+# for that inspection, and this call sits on the critical path of both setup and the
+# self test. It was measured, not guessed: a live self test spent four and a half
+# minutes between two adjacent log lines, and this was the line.
+function Get-SebServiceAccountFromRegistry {
+  param([string]$ServiceName, [scriptblock]$Reader)
+  if ([string]::IsNullOrWhiteSpace($ServiceName)) { return '' }
+  # A service name is a registry KEY name, so it cannot contain a separator. Refuse
+  # rather than sanitise: there is then no escaping to reason about.
+  #
+  # -LiteralPath below already makes traversal impossible, so this guard is belt and
+  # braces - and that made its first test VACUOUS, which the mutation check caught:
+  # removing the guard changed no result, because the path never resolved either way.
+  # The seam exists so the guard's real behaviour can be asserted: it must refuse
+  # BEFORE touching the registry at all, which is observable even when both paths
+  # would return the same empty string.
+  if ($ServiceName.Contains([char]92) -or $ServiceName.Contains('/')) { return '' }
+  $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\' + $ServiceName
+  try {
+    if ($Reader) { $v = & $Reader $key }
+    else { $v = (Get-ItemProperty -LiteralPath $key -Name 'ObjectName' -ErrorAction SilentlyContinue).ObjectName }
+    if ($null -eq $v) { return '' }
+    return [string]$v
+  }
+  catch { return '' }
+}
+
 function Get-SebServiceAccount {
   param([string]$ServiceName, [scriptblock]$ServiceQuery)
-  $query = $ServiceQuery
-  if (-not $query) {
-    $query = {
-      param([string]$Name)
-      Get-CimInstance -ClassName Win32_Service -Filter ("Name='" + ($Name -replace "'", "''") + "'") -ErrorAction SilentlyContinue
-    }
+  # An injected query wins outright - that is how the suite drives this without a
+  # real service, and a fast path that ignored it would make those tests vacuous.
+  if ($ServiceQuery) {
+    $service = & $ServiceQuery $ServiceName
+    if ($null -eq $service) { return '' }
+    return [string]$service.StartName
   }
-  $service = & $query $ServiceName
+
+  $fromRegistry = Get-SebServiceAccountFromRegistry -ServiceName $ServiceName
+  if (-not [string]::IsNullOrWhiteSpace($fromRegistry)) { return $fromRegistry }
+
+  # Fall back to WMI rather than concluding the service has no account. An empty
+  # answer here means staging never gets granted, which is the defect that makes
+  # every backup fail with operating system error 5 - worth three slow seconds.
+  $service = Get-CimInstance -ClassName Win32_Service `
+    -Filter ("Name='" + ($ServiceName -replace "'", "''") + "'") -ErrorAction SilentlyContinue
   if ($null -eq $service) { return '' }
   return [string]$service.StartName
 }

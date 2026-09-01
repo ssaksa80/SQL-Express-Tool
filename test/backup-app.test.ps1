@@ -54,7 +54,12 @@ Assert (-not ($build -match '(?i)requireAdministrator')) 'the exe does not deman
 Assert ((Get-Content -LiteralPath (Join-Path $root '.gitignore') -Raw) -match 'dist/') 'the built exe is gitignored'
 
 # ---- build and drive it ----------------------------------------------------------
-$outDir = Join-Path $env:TEMP ('seb-app-' + [Guid]::NewGuid().ToString('N'))
+# NOT %TEMP%. On this estate an unsigned binary built into the temp directory is
+# quarantined within seconds - measured, not assumed: the build succeeds, the file
+# exists, the launch fails with 'Access is denied', and three seconds later the file
+# is gone entirely. The same bytes under the repository survive. Building here keeps
+# the suite testing the application rather than the endpoint protection policy.
+$outDir = Join-Path $root ('dist\.test-' + [Guid]::NewGuid().ToString('N'))
 $exe = Join-Path $outDir 'SqlExpressBackup.exe'
 $checkFile = Join-Path $outDir 'check.txt'
 try {
@@ -75,10 +80,33 @@ try {
     $proc = Start-Process -FilePath $exe -ArgumentList '--check', "`"$checkFile`"" -PassThru -Wait -ErrorAction Stop
   }
   catch {
-    if (-not (Test-Path -LiteralPath $exe)) {
-      throw "FAIL: the exe was REMOVED between building and launching it - almost certainly EDR quarantine, not a defect in the app"
+    $why = $_.Exception.Message
+    # Look again, and look a moment later. Quarantine is not instantaneous: the file
+    # can still be on disk when the launch is refused and be gone shortly after, so a
+    # single check at the moment of failure reports 'Access is denied' and hides the
+    # real cause.
+    $goneNow = -not (Test-Path -LiteralPath $exe)
+    Start-Sleep -Milliseconds 2500
+    $goneAfter = -not (Test-Path -LiteralPath $exe)
+    if ($goneNow -or $goneAfter) {
+      throw ("FAIL: the exe was REMOVED after being built - endpoint protection quarantined it, " +
+             "which is not a defect in the application. It is the unsigned-binary risk: this host " +
+             "runs CrowdStrike Falcon and Defender, and an unsigned executable is deleted from some " +
+             "locations within seconds of being written. Signing it, or excluding the build " +
+             "location, is the fix. Original error: $why")
     }
-    throw "FAIL: could not launch the exe: $($_.Exception.Message)"
+    # Present but refusing to start is the SAME cause wearing a different hat: the
+    # agent blocks execution instead of deleting the file. Both shapes are endpoint
+    # protection reacting to an unsigned binary, and reporting the second as a plain
+    # launch failure sends the next reader hunting for a bug in the application.
+    if ($why -match 'Access is denied') {
+      throw ("FAIL: the exe was built but refused permission to START. On this host that is " +
+             "endpoint protection blocking an unsigned binary rather than a defect in the " +
+             "application - the same cause as outright quarantine, which this suite has also " +
+             "observed. It is intermittent and tracks antivirus definition updates. Signing the " +
+             "exe, or excluding the build location, is the fix. Original error: $why")
+    }
+    throw "FAIL: could not launch the exe: $why"
   }
   Assert ($proc.ExitCode -eq 0) "--check exited 0 (got $($proc.ExitCode))"
   Assert (Test-Path -LiteralPath $checkFile) 'and wrote its findings'

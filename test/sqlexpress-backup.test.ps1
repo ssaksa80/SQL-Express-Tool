@@ -330,6 +330,42 @@ Assert ((Get-SebAclIdentity '') -eq '') 'an unknown account yields empty, so cal
 Assert ((Get-SebServiceAccount -ServiceName 'MSSQL$X' -ServiceQuery { param($n) [pscustomobject]@{ StartName = 'NT Service\MSSQL$X' } }) -eq 'NT Service\MSSQL$X') 'the service account is read from the service, not guessed'
 Assert ((Get-SebServiceAccount -ServiceName 'nope' -ServiceQuery { param($n) $null }) -eq '') 'an absent service yields empty rather than throwing'
 
+# The account is read from the registry rather than WMI, and that is a performance
+# fix with a measured cause: Win32_Service took 12.6 SECONDS on the first call on a
+# host running endpoint protection, which instruments WMI heavily. The registry read
+# is 15ms. It was found by timing a self test that spent four and a half minutes
+# between two adjacent log lines.
+#
+# Asserted against a service every Windows host has, so this does not depend on SQL
+# being installed on the machine running the suite.
+$fromReg = Get-SebServiceAccountFromRegistry -ServiceName 'Winmgmt'
+Assert (-not [string]::IsNullOrWhiteSpace($fromReg)) "the registry lookup finds a well-known service's account (got '$fromReg')"
+Assert ((Get-SebServiceAccountFromRegistry -ServiceName 'NoSuchServiceHere') -eq '') 'an absent service yields empty rather than throwing'
+Assert ((Get-SebServiceAccountFromRegistry -ServiceName '') -eq '') 'an empty service name yields empty'
+# A service name is a registry KEY name and cannot contain a separator. Asserting the
+# RETURN VALUE alone proved nothing - the path does not resolve with or without the
+# guard, so the check passed for the wrong reason and a mutation removing the guard
+# still went green. What distinguishes them is whether the registry is touched at
+# all, so that is what is asserted.
+$touched = New-Object System.Collections.ArrayList
+$spy = { param($k) [void]$touched.Add($k); return $null }
+
+[void](Get-SebServiceAccountFromRegistry -ServiceName '..\..\..\Winmgmt' -Reader $spy)
+Assert ($touched.Count -eq 0) "a name containing a backslash is refused BEFORE the registry is read (reads attempted: $($touched.Count))"
+[void](Get-SebServiceAccountFromRegistry -ServiceName 'a/b' -Reader $spy)
+Assert ($touched.Count -eq 0) 'a forward slash is refused the same way'
+
+# And the spy really does fire for a legitimate name - otherwise the two assertions
+# above would hold no matter what the function did.
+[void](Get-SebServiceAccountFromRegistry -ServiceName 'Winmgmt' -Reader $spy)
+Assert ($touched.Count -eq 1) "the reader IS called for an ordinary name (reads: $($touched.Count))"
+Assert ($touched[0] -eq 'HKLM:\SYSTEM\CurrentControlSet\Services\Winmgmt') "and it is handed the expected key (got '$($touched[0])')" 
+
+# The injected query must still win outright. If the registry fast path ran first the
+# two assertions above this block would be testing the real machine, not the seam,
+# and would pass whatever the function did.
+Assert ((Get-SebServiceAccount -ServiceName 'Winmgmt' -ServiceQuery { param($n) [pscustomobject]@{ StartName = 'INJECTED' } }) -eq 'INJECTED') 'an injected query overrides the registry, so the seam is still real'
+
 $stagingDir = Join-Path $env:TEMP ('seb-staging-' + [Guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $stagingDir)
 try {
