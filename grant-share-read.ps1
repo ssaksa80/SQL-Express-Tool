@@ -33,14 +33,25 @@ $sqlAccount = (Get-ItemProperty -LiteralPath $svcKey -Name 'ObjectName' -ErrorAc
 if ([string]::IsNullOrWhiteSpace($sqlAccount)) { throw ('could not resolve the account for service ' + $svcName) }
 Write-Host ('SQL service (' + $svcName + ') runs as: ' + $sqlAccount)
 
-$machine = $env:USERDOMAIN + '' + $env:COMPUTERNAME + '$'
+# Machine account WITHOUT a domain prefix - it resolves via the machine's own domain,
+# and it sidesteps $env:USERDOMAIN, which is not dependable across an elevated logon.
+$machine = $env:COMPUTERNAME + '$'
 
+# Each grant stands alone. The machine account is usually already Full from setup, so
+# its grant failing is not fatal; the SQL service Read is the one that must land, and
+# it must not be blocked by anything before it.
 Write-Host ''
 Write-Host '== granting =='
-Grant-SmbShareAccess -Name $ShareName -AccountName $machine     -AccessRight Full -Force | Out-Null
-Grant-SmbShareAccess -Name $ShareName -AccountName $sqlAccount  -AccessRight Read -Force | Out-Null
-Write-Host ("  $machine -> Full")
-Write-Host ("  $sqlAccount -> Read")
+foreach ($g in @(
+    @{ Account = $machine;    Right = 'Full' },
+    @{ Account = $sqlAccount; Right = 'Read' })) {
+  try {
+    Grant-SmbShareAccess -Name $ShareName -AccountName $g.Account -AccessRight $g.Right -Force -ErrorAction Stop | Out-Null
+    Write-Host ("  " + $g.Account + " -> " + $g.Right + "  OK")
+  } catch {
+    Write-Host ("  " + $g.Account + " -> " + $g.Right + "  FAILED: " + $_.Exception.Message.Split([char]10)[0]) -ForegroundColor Yellow
+  }
+}
 
 Write-Host ''
 Write-Host '== share ACL now =='
