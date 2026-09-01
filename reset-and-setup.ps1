@@ -25,6 +25,12 @@ $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $engine = Join-Path $here 'Invoke-SqlExpressBackup.ps1'
 
+# Everything this prints also goes here, world-readable, so the outcome can be read
+# back even if the console output is lost. Written to the repo dir, which the
+# ordinary account can read.
+$transcript = Join-Path $here 'reset-last-run.log'
+try { Start-Transcript -LiteralPath $transcript -Force | Out-Null } catch {}
+
 function Sec($n) { Write-Host ''; Write-Host ("== " + $n + " " + ('=' * [Math]::Max(0, 62 - $n.Length))) }
 
 # --- elevation gate --------------------------------------------------------------
@@ -32,6 +38,9 @@ $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Write-Host "NOT ELEVATED. Run this as the admin account (t2-):" -ForegroundColor Yellow
   Write-Host "  right-click PowerShell -> Run as administrator, sign in as adminaccount, then re-run this script."
+  Write-Host ("current identity: " + $id.Name)
+  try { ("NOT ELEVATED - ran as " + $id.Name + " at " + (Get-Date -Format o)) | Set-Content -LiteralPath $transcript } catch {}
+  try { Stop-Transcript | Out-Null } catch {}
   exit 2
 }
 Write-Host ("running as " + $id.Name)
@@ -69,4 +78,7 @@ Write-Host ("full install exit " + $rc)
 
 Sec 'result'
 & powershell -NoProfile -ExecutionPolicy Bypass -File $engine -Status
+try { Stop-Transcript | Out-Null } catch {}
+Write-Host ''
+Write-Host ("full output saved to " + $transcript)
 exit $rc
