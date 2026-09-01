@@ -74,6 +74,18 @@ param(
   [switch]$Loop,                  # service mode: keep running, one pass per interval
   [switch]$Status,
   [switch]$SelfTest,
+  [switch]$RestoreList,
+  [string]$RestoreInspect,
+  [string]$RestoreVerify,
+  [switch]$RestoreRun,
+  [string]$RestoreFrom,
+  [string]$RestoreAs,
+  [string]$RestoreDataDir,
+  [string]$RestoreLogDir,
+  [switch]$RestoreReplace,
+  [switch]$RestoreRestrictedUser,
+  [switch]$RestoreCloseConnections,
+  [string]$RestoreRecoveryState = 'RECOVERY',
   [switch]$FullInstall,
   [string]$ShareName = 'SqlBackups',
   [string]$ShareFolder = 'C:\SqlBackups',
@@ -2045,6 +2057,194 @@ function Write-SebCheck {
 # It never touches an existing database - the pass is scoped by OnlyDatabase - and
 # it needs no elevation, because it works in a folder it creates and owns and
 # connects with the caller's own Windows credentials.
+# ---------------------------------------------------------------------------
+# RESTORE
+#
+# The console drives these. They deliberately live here rather than in the window,
+# because the engine already performs HEADERONLY, FILELISTONLY and RESTORE ... WITH
+# MOVE inside the self test, and that code is exercised on every run. A second
+# implementation in C# would be two things that must agree forever about relocation
+# and recovery state, and they would diverge at the worst possible time.
+#
+# Output is JSON on one line, because the caller is a program. Everything a human
+# needs is already in the log.
+
+# What a restore needs to know, readable WITHOUT elevation.
+#
+# Restoring requires sysadmin on the instance, which is a SQL right - it does not
+# require local administrator, and demanding one to get the other would be a lie
+# about what the operation needs. config.json is deliberately locked to SYSTEM and
+# Administrators because it holds sealed credentials; public.json carries the same
+# instance and share paths for exactly this kind of reader.
+function Read-SebRestoreContext {
+  try {
+    $cfg = Read-SebConfig
+    return [pscustomobject]@{ DataSource = [string]$cfg.DataSource; SharePath = [string]$cfg.SharePath }
+  }
+  catch {
+    $p = Get-SebPublicPath
+    if (-not (Test-Path -LiteralPath $p)) {
+      throw 'no configuration found. Run -Setup first, or start the console as an administrator if the settings exist but cannot be read.'
+    }
+    $j = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
+    return [pscustomobject]@{ DataSource = [string]$j.DataSource; SharePath = [string]$j.SharePath }
+  }
+}
+
+# A UNC pointing at THIS host, resolved to the folder behind it.
+#
+# The local-share setup grants the SMB share to Administrators and the machine
+# account, which is what the SYSTEM scheduled task needs - and means an ordinary
+# operator is refused at the share even though they can read the folder perfectly
+# well. Restoring is not an administrative act, so being blocked by a share ACL that
+# exists for the scheduler would be an accident, not a policy.
+function Resolve-SebLocalShare {
+  param([string]$Root)
+  if ([string]::IsNullOrWhiteSpace($Root) -or $Root.Length -lt 3 -or $Root[0] -ne [char]92 -or $Root[1] -ne [char]92) { return $Root }
+  $sep = [char]92
+  $parts = @($Root.TrimStart($sep).Split($sep))
+  if ($parts.Count -lt 2) { return $Root }
+  $host_ = $parts[0]
+  if ($host_ -ne $env:COMPUTERNAME -and $host_ -ne 'localhost' -and $host_ -ne '.') { return $Root }
+  try {
+    Import-SebShippedModule -Command 'Get-SmbShare' -Module 'SmbShare'
+    $share = Get-SmbShare -Name $parts[1] -ErrorAction SilentlyContinue
+    if ($null -eq $share) { return $Root }
+    $local = [string]$share.Path
+    if ($parts.Count -gt 2) {
+      $rest = ($parts[2..($parts.Count - 1)]) -join $sep
+      if (-not [string]::IsNullOrWhiteSpace($rest)) { $local = [System.IO.Path]::Combine($local, $rest) }
+    }
+    if (Test-Path -LiteralPath $local) { return $local }
+  }
+  catch { }
+  return $Root
+}
+
+function Get-SebRestoreCatalogue {
+  param([string]$Root)
+  $sets = @()
+  if ([string]::IsNullOrWhiteSpace($Root)) { return $sets }
+  # Prefer the UNC, because that is what the scheduler writes and what the operator
+  # sees in the settings - but fall back to the folder behind it rather than
+  # reporting no backups exist when the truth is this account cannot open the share.
+  try { if (-not (Test-Path -LiteralPath $Root)) { $Root = Resolve-SebLocalShare -Root $Root } }
+  catch { $Root = Resolve-SebLocalShare -Root $Root }
+  try { if (-not (Test-Path -LiteralPath $Root)) { return $sets } }
+  catch { return $sets }
+  # <root>\<host>\<instance>\<database>\<kind>\<db>_<stamp>.bak
+  foreach ($f in @(Get-ChildItem -LiteralPath $Root -Recurse -Filter '*.bak' -File -ErrorAction SilentlyContinue)) {
+    $kind = Split-Path -Leaf (Split-Path -Parent $f.FullName)
+    $db = Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $f.FullName))
+    $stamp = Get-SebStampFromName -Name $f.Name -Fallback $f.LastWriteTime
+    $sets += [pscustomobject]@{
+      Database = $db
+      Kind     = $kind
+      Path     = $f.FullName
+      Bytes    = $f.Length
+      TakenUtc = $stamp.ToUniversalTime().ToString('o')
+    }
+  }
+  return @($sets | Sort-Object Database, @{ Expression = 'TakenUtc'; Descending = $true })
+}
+
+# Can the SQL SERVICE read this file? Not can the operator - those are different
+# accounts, and the difference is the fault a restore drill found: every backup
+# verified, every pass green, and RESTORE FILELISTONLY refused with operating system
+# error 5 because the copies were written by the engine and never granted to SQL.
+#
+# Asked BEFORE the operator commits to anything, because the symptom reads as a
+# corrupt backup and is not.
+function Test-SebRestoreReadable {
+  param($Connection, [string]$Path)
+  try {
+    [void](Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE FILELISTONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $Path)))
+    return @{ Ok = $true; Reason = '' }
+  }
+  catch {
+    $m = [string]$_.Exception.Message
+    if ($m -match 'operating system error 5' -or $m -match 'Access is denied') {
+      return @{ Ok = $false; Reason = 'denied' }
+    }
+    return @{ Ok = $false; Reason = $m }
+  }
+}
+
+function Get-SebRestoreInspect {
+  param($Connection, [string]$Path)
+  $readable = Test-SebRestoreReadable -Connection $Connection -Path $Path
+  $result = [ordered]@{
+    Path = $Path; Readable = $readable.Ok; ReadReason = $readable.Reason
+    Database = ''; TakenUtc = ''; Compressed = $false; Files = @(); Verified = $null; Error = ''
+  }
+  if (-not $readable.Ok) { return $result }
+  try {
+    $h = Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE HEADERONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $Path))
+    if ($h.Count -gt 0) {
+      $result.Database = [string](Get-SebValue $h[0].DatabaseName)
+      $finish = Get-SebValue $h[0].BackupFinishDate
+      if ($finish) { $result.TakenUtc = ([datetime]$finish).ToUniversalTime().ToString('o') }
+      $result.Compressed = ([long](Get-SebValue $h[0].CompressedBackupSize) -lt [long](Get-SebValue $h[0].BackupSize))
+    }
+    $fl = Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE FILELISTONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $Path))
+    $files = @()
+    foreach ($row in $fl) {
+      $files += [pscustomobject]@{
+        LogicalName = [string](Get-SebValue $row.LogicalName)
+        Type        = [string](Get-SebValue $row.Type)
+        SizeBytes   = [long](Get-SebValue $row.Size)
+      }
+    }
+    $result.Files = $files
+  }
+  catch { $result.Error = [string]$_.Exception.Message }
+  return $result
+}
+
+# The MOVE clauses. Two folders is the common case - all data files to one, the log
+# to another - which is how NetWorker frames it and is markedly better than editing
+# one row per file. Per-file override sits on top of that, not instead of it.
+function Get-SebRestoreMoveClauses {
+  param($Files, [string]$TargetName, [string]$DataDir, [string]$LogDir)
+  $moves = @()
+  $dataIndex = 0
+  foreach ($f in @($Files)) {
+    $isLog = ([string]$f.Type -eq 'L')
+    $dir = if ($isLog) { $LogDir } else { $DataDir }
+    if ([string]::IsNullOrWhiteSpace($dir)) { $dir = $DataDir }
+    # The first data file is <name>.mdf; further ones must not collide with it.
+    if ($isLog) { $leaf = $TargetName + '_log.ldf' }
+    elseif ($dataIndex -eq 0) { $leaf = $TargetName + '.mdf'; $dataIndex++ }
+    else { $leaf = ($TargetName + '_' + $dataIndex + '.ndf'); $dataIndex++ }
+    # [IO.Path]::Combine, not Join-Path. Join-Path RESOLVES the path and throws
+    # "a drive with the name 'D' does not exist" for any drive this machine lacks -
+    # and the machine building the statement is not necessarily the one that will run
+    # it. Restoring to another instance is a first-class case; failing because the
+    # console cannot see the target's drive letters would be absurd.
+    $moves += ('MOVE {0} TO {1}' -f (Get-SebSqlLiteral ([string]$f.LogicalName)), (Get-SebSqlLiteral ([System.IO.Path]::Combine($dir, $leaf))))
+  }
+  return $moves
+}
+
+function Get-SebRestoreSql {
+  param(
+    [string]$Path, [string]$TargetName, $Files,
+    [string]$DataDir, [string]$LogDir,
+    [string]$RecoveryState = 'RECOVERY',
+    [bool]$Replace = $false, [bool]$RestrictedUser = $false
+  )
+  $with = @()
+  $with += Get-SebRestoreMoveClauses -Files $Files -TargetName $TargetName -DataDir $DataDir -LogDir $LogDir
+  $state = $RecoveryState.ToUpperInvariant()
+  if ($state -ne 'RECOVERY' -and $state -ne 'NORECOVERY' -and $state -ne 'STANDBY') { $state = 'RECOVERY' }
+  $with += $state
+  if ($Replace) { $with += 'REPLACE' }
+  if ($RestrictedUser) { $with += 'RESTRICTED_USER' }
+  $with += 'STATS = 5'
+  return ('RESTORE DATABASE {0} FROM DISK = {1} WITH {2}' -f
+    (Get-SebQuotedName $TargetName), (Get-SebSqlLiteral $Path), ($with -join ', '))
+}
+
 function Invoke-SebSelfTest {
   param([string]$PinnedInstance, [string]$WorkRoot)
 
@@ -2281,6 +2481,104 @@ try {
     else {
       Install-SebService -ScriptPath $scriptPath -ConfigDirectory $script:SebConfigDir -Hours ([int]$config.IntervalHours) -Nssm (Resolve-SebNssm -Explicit $NssmPath)
     }
+  }
+  elseif ($RestoreList) {
+    $config = Read-SebRestoreContext
+    $root = [string]$config.SharePath
+    $reason = ''
+    $sets = @()
+    try { $sets = @(Get-SebRestoreCatalogue -Root $root) }
+    catch { $reason = [string]$_.Exception.Message }
+    if ($sets.Count -eq 0 -and $reason -eq '') {
+      $resolved = Resolve-SebLocalShare -Root $root
+      $readable = $false
+      try { $readable = Test-Path -LiteralPath $resolved } catch { }
+      if (-not $readable) { $reason = ('this account cannot read {0}' -f $root) }
+    }
+    Write-Host (ConvertTo-Json @{ Root = $root; Sets = @($sets); Reason = $reason } -Depth 4 -Compress)
+  }
+  elseif (-not [string]::IsNullOrWhiteSpace($RestoreInspect)) {
+    $config = Read-SebRestoreContext
+    $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
+    try { Write-Host (ConvertTo-Json (Get-SebRestoreInspect -Connection $connection -Path $RestoreInspect) -Depth 4 -Compress) }
+    finally { $connection.Close() }
+  }
+  elseif (-not [string]::IsNullOrWhiteSpace($RestoreVerify)) {
+    $config = Read-SebRestoreContext
+    $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
+    try {
+      Write-SebStage -Database '' -Stage 'verifying backup media'
+      Invoke-SebSqlNonQuery -Connection $connection -Sql ('RESTORE VERIFYONLY FROM DISK = {0} WITH CHECKSUM' -f (Get-SebSqlLiteral $RestoreVerify))
+      Write-Host (ConvertTo-Json @{ Ok = $true; Error = '' } -Compress)
+    }
+    catch { Write-Host (ConvertTo-Json @{ Ok = $false; Error = [string]$_.Exception.Message } -Compress); $exitCode = 1 }
+    finally { $connection.Close() }
+  }
+  elseif ($RestoreRun) {
+    if ([string]::IsNullOrWhiteSpace($RestoreFrom)) { throw '-RestoreRun needs -RestoreFrom <path to .bak>' }
+    if ([string]::IsNullOrWhiteSpace($RestoreAs)) { throw '-RestoreRun needs -RestoreAs <database name>' }
+    $config = Read-SebRestoreContext
+    $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
+    try {
+      $info = Get-SebRestoreInspect -Connection $connection -Path $RestoreFrom
+      if (-not $info.Readable) {
+        throw ('SQL Server cannot read {0}. This is a PERMISSION fault, not a corrupt backup: the file is read by the SQL service account, not by you. Grant that account read on the folder. The symptom is identical to a damaged file, which is why it is checked before anything is committed.' -f $RestoreFrom)
+      }
+      if (@($info.Files).Count -eq 0) { throw ('no files listed in {0} - it is not a usable backup set' -f $RestoreFrom) }
+
+      $dataDir = $RestoreDataDir
+      if ([string]::IsNullOrWhiteSpace($dataDir)) {
+        $rows = Invoke-SebSqlTable -Connection $connection -Sql "SELECT CAST(SERVERPROPERTY('InstanceDefaultDataPath') AS nvarchar(400)) AS p"
+        $dataDir = [string](Get-SebValue $rows[0].p)
+      }
+      $logDir = $RestoreLogDir
+      if ([string]::IsNullOrWhiteSpace($logDir)) { $logDir = $dataDir }
+
+      # Refuse to clobber a file already on disk. RESTORE overwrites without asking,
+      # and the file it overwrites may belong to a database nobody mentioned here.
+      foreach ($clause in (Get-SebRestoreMoveClauses -Files $info.Files -TargetName $RestoreAs -DataDir $dataDir -LogDir $logDir)) {
+        $target = ($clause -split ' TO ')[1].Trim().Trim("'")
+        if ((Test-Path -LiteralPath $target) -and -not $RestoreReplace) {
+          throw ('{0} already exists. Restoring would overwrite a file that may belong to another database. Choose a different name, or move that file first.' -f $target)
+        }
+      }
+
+      if ($RestoreCloseConnections) {
+        try { Invoke-SebSqlNonQuery -Connection $connection -Sql ('ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE' -f (Get-SebQuotedName $RestoreAs)) }
+        catch { }
+      }
+
+      Write-SebJob -Index 1 -Total 1 -Database $RestoreAs
+      Write-SebStage -Database $RestoreAs -Stage 'backup'
+      $sql = Get-SebRestoreSql -Path $RestoreFrom -TargetName $RestoreAs -Files $info.Files -DataDir $dataDir -LogDir $logDir -RecoveryState $RestoreRecoveryState -Replace:([bool]$RestoreReplace) -RestrictedUser:([bool]$RestoreRestrictedUser)
+      Write-SebLog ('restoring {0} from {1}' -f $RestoreAs, $RestoreFrom)
+
+      # Percent comes from SQL itself, exactly as it does for BACKUP.
+      $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
+        param($eventSender, $eventArgs)
+        $pct = Get-SebPercentFromMessage $eventArgs.Message
+        if ($pct -ge 0) { Write-SebProgress -Database $script:SebProgressDb -Percent $pct -Stage 'backup' }
+      }
+      $script:SebProgressDb = $RestoreAs
+      $connection.add_InfoMessage($handler)
+      try { Invoke-SebSqlNonQuery -Connection $connection -Sql $sql }
+      finally { $connection.remove_InfoMessage($handler) }
+
+      Write-SebStage -Database $RestoreAs -Stage 'verify'
+      $ok = $true
+      $checkMessage = ''
+      if ($RestoreRecoveryState.ToUpperInvariant() -eq 'RECOVERY') {
+        try { Invoke-SebSqlNonQuery -Connection $connection -Sql ('DBCC CHECKDB({0}) WITH NO_INFOMSGS' -f (Get-SebQuotedName $RestoreAs)) }
+        catch { $ok = $false; $checkMessage = [string]$_.Exception.Message }
+      }
+      else { $checkMessage = 'left in ' + $RestoreRecoveryState.ToUpperInvariant() + ' - CHECKDB cannot run until the database is recovered' }
+
+      Write-SebStage -Database $RestoreAs -Stage 'finished'
+      Write-SebLog ('restore finished: {0}' -f $RestoreAs)
+      Write-Host (ConvertTo-Json @{ Ok = $ok; Database = $RestoreAs; Check = $checkMessage } -Compress)
+      if (-not $ok) { $exitCode = 1 }
+    }
+    finally { $connection.Close() }
   }
   elseif ($Uninstall) {
     Assert-SebElevated -Mode 'Uninstall'

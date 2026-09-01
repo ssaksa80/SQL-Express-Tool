@@ -46,16 +46,122 @@ static class Theme
 {
     public static bool Dark = false;
 
-    public static Color Bg { get { return Dark ? Color.FromArgb(14, 20, 24) : Color.FromArgb(244, 246, 248); } }
-    public static Color Panel { get { return Dark ? Color.FromArgb(21, 29, 35) : Color.White; } }
-    public static Color Ink { get { return Dark ? Color.FromArgb(230, 237, 242) : Color.FromArgb(22, 35, 43); } }
-    public static Color Ink2 { get { return Dark ? Color.FromArgb(169, 188, 200) : Color.FromArgb(64, 82, 96); } }
-    public static Color Ink3 { get { return Dark ? Color.FromArgb(125, 145, 158) : Color.FromArgb(107, 127, 141); } }
-    public static Color Line { get { return Dark ? Color.FromArgb(36, 49, 58) : Color.FromArgb(216, 224, 230); } }
-    public static Color Steel { get { return Dark ? Color.FromArgb(143, 196, 224) : Color.FromArgb(44, 74, 92); } }
-    public static Color Ok { get { return Dark ? Color.FromArgb(79, 209, 160) : Color.FromArgb(28, 122, 82); } }
-    public static Color Warn { get { return Dark ? Color.FromArgb(232, 180, 79) : Color.FromArgb(154, 98, 18); } }
-    public static Color Bad { get { return Dark ? Color.FromArgb(255, 128, 128) : Color.FromArgb(163, 42, 42); } }
+    // Windows 11 neutrals. The previous palette was blue-tinted, which read as a
+    // separate product sitting next to Explorer; these are the greys the OS uses.
+    public static Color Bg     { get { return Dark ? Color.FromArgb(32, 32, 32)    : Color.FromArgb(243, 243, 243); } }
+    public static Color Panel  { get { return Dark ? Color.FromArgb(43, 43, 43)    : Color.White; } }
+    public static Color Sunken { get { return Dark ? Color.FromArgb(37, 37, 37)    : Color.FromArgb(250, 250, 250); } }
+    public static Color Ink    { get { return Dark ? Color.FromArgb(255, 255, 255) : Color.FromArgb(27, 27, 27); } }
+    public static Color Ink2   { get { return Dark ? Color.FromArgb(200, 200, 200) : Color.FromArgb(70, 70, 70); } }
+    public static Color Ink3   { get { return Dark ? Color.FromArgb(154, 154, 154) : Color.FromArgb(138, 138, 138); } }
+    public static Color Line   { get { return Dark ? Color.FromArgb(58, 58, 58)    : Color.FromArgb(229, 229, 229); } }
+    public static Color Steel  { get { return Dark ? Color.FromArgb(200, 200, 200) : Color.FromArgb(70, 70, 70); } }
+    public static Color Ok     { get { return Dark ? Color.FromArgb(108, 203, 95)  : Color.FromArgb(15, 123, 15); } }
+    public static Color Warn   { get { return Dark ? Color.FromArgb(252, 225, 0)   : Color.FromArgb(157, 93, 0); } }
+    public static Color Bad    { get { return Dark ? Color.FromArgb(255, 153, 164) : Color.FromArgb(196, 43, 28); } }
+
+    // The user's own accent colour, so the window belongs to their desktop rather
+    // than to whoever picked a blue. Falls back to the Windows default accent.
+    static Color? accent;
+    public static Color Accent
+    {
+        get
+        {
+            if (accent == null) { accent = ReadAccent(); }
+            Color a = accent.Value;
+            // The stored accent is tuned for a light surface. On dark it has to be
+            // lightened or it disappears into the background it sits on.
+            if (Dark) { return Lighten(a, 0.45f); }
+            return a;
+        }
+    }
+
+    // Text that sits ON the accent. Chosen by luminance rather than assumed white:
+    // a yellow or lime accent with white text on it is unreadable.
+    public static Color OnAccent
+    {
+        get
+        {
+            Color a = Accent;
+            double lum = (0.299 * a.R + 0.587 * a.G + 0.114 * a.B) / 255.0;
+            return lum > 0.6 ? Color.FromArgb(16, 16, 16) : Color.White;
+        }
+    }
+
+    static Color Lighten(Color c, float amount)
+    {
+        return Color.FromArgb(
+            (int)(c.R + (255 - c.R) * amount),
+            (int)(c.G + (255 - c.G) * amount),
+            (int)(c.B + (255 - c.B) * amount));
+    }
+
+    static Color ReadAccent()
+    {
+        try
+        {
+            object v = Microsoft.Win32.Registry.GetValue(
+                @"HKEY_CURRENT_USER\Software\Microsoft\Windows\DWM", "ColorizationColor", null);
+            if (v != null)
+            {
+                // Stored as AARRGGBB; the alpha byte is not a transparency we want.
+                int argb = Convert.ToInt32(v);
+                return Color.FromArgb(255, (argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF);
+            }
+        }
+        catch { }
+        return Color.FromArgb(0, 103, 192);   // Windows default accent
+    }
+
+    // Segoe UI Variable is the Windows 11 UI face and is absent on Windows 10, where
+    // asking for it silently substitutes something that is not Segoe at all. Resolve
+    // once against the installed families and fall back deliberately.
+    static string uiFace;
+    public static string Face
+    {
+        get
+        {
+            if (uiFace == null)
+            {
+                uiFace = "Segoe UI";
+                try
+                {
+                    foreach (FontFamily f in FontFamily.Families)
+                    {
+                        if (f.Name == "Segoe UI Variable Text") { uiFace = f.Name; break; }
+                    }
+                }
+                catch { }
+            }
+            return uiFace;
+        }
+    }
+
+    static string monoFace;
+    public static string MonoFace
+    {
+        get
+        {
+            if (monoFace == null)
+            {
+                monoFace = "Consolas";
+                try
+                {
+                    foreach (FontFamily f in FontFamily.Families)
+                    {
+                        if (f.Name == "Cascadia Mono") { monoFace = f.Name; break; }
+                    }
+                }
+                catch { }
+            }
+            return monoFace;
+        }
+    }
+
+    public static Font Mono(float size) { return new Font(MonoFace, size); }
+
+    public static Font UI(float size) { return new Font(Face, size); }
+    public static Font UI(float size, FontStyle style) { return new Font(Face, size, style); }
 
     public static Color ToneColor(string tone)
     {
@@ -74,6 +180,15 @@ static class Theme
             else { Dark = SystemPrefersDark(); }
         }
         catch { Dark = false; }
+    }
+
+    // The accent is cached, and the theme flip changes how it is derived, so the
+    // cache has to be dropped when the theme does. Without this a light-tuned accent
+    // survives into dark mode and is invisible on it.
+    public static void Toggle()
+    {
+        Dark = !Dark;
+        accent = null;
     }
 
     public static void Save()
@@ -200,37 +315,43 @@ class Card : Panel
         g.SmoothingMode = SmoothingMode.AntiAlias;
         Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
         bool toned = tone != "unknown";
-        Color edge = toned ? Theme.ToneColor(tone) : Theme.Line;
+        Color accentEdge = toned ? Theme.ToneColor(tone) : Theme.Line;
 
+        // Windows 11 states a card with a small accent BAR, not a coloured outline
+        // around the whole thing. Outlining the card in green made a healthy status
+        // shout as loudly as a failure, and made four cards in a row look like four
+        // alerts. The border stays neutral; only the bar carries the state.
         using (GraphicsPath path = Rounded(r, 8))
         {
             using (SolidBrush b = new SolidBrush(Theme.Panel)) { g.FillPath(b, path); }
-            if (toned)
+            using (Pen p = new Pen(Theme.Line, 1f)) { g.DrawPath(p, path); }
+        }
+
+        if (toned)
+        {
+            // A brief brightening when the state CHANGES, then it settles. The glow is
+            // an event marker, not a permanent decoration.
+            int extra = (int)(glow * 90);
+            Color bar = Color.FromArgb(Math.Min(255, 205 + extra), accentEdge);
+            using (SolidBrush b = new SolidBrush(bar))
+            using (GraphicsPath bp = Rounded(new Rectangle(r.X + 1, r.Y + 9, 3, r.Height - 19), 2))
             {
-                for (int i = 3; i >= 1; i--)
-                {
-                    int a = (int)((14 - i * 3) + glow * 40);
-                    if (a < 0) { a = 0; }
-                    if (a > 255) { a = 255; }
-                    using (Pen p = new Pen(Color.FromArgb(a, edge), i * 2))
-                    using (GraphicsPath gp = Rounded(Rectangle.Inflate(r, i, i), 8 + i)) { g.DrawPath(p, gp); }
-                }
+                g.FillPath(b, bp);
             }
-            using (Pen p = new Pen(edge, 1f)) { g.DrawPath(p, path); }
         }
 
         using (SolidBrush b = new SolidBrush(Theme.Ink3))
-        using (Font f = new Font("Segoe UI", 7.5f, FontStyle.Bold))
+        using (Font f = Theme.UI(7.5f, FontStyle.Bold))
         {
             g.DrawString(Eyebrow.ToUpperInvariant(), f, b, 13, 11);
         }
         using (SolidBrush b = new SolidBrush(Theme.Ink))
-        using (Font f = new Font("Segoe UI", Big.Length > 18 ? 10f : 17f, FontStyle.Bold))
+        using (Font f = Theme.UI(Big.Length > 18 ? 10f : 17f, FontStyle.Bold))
         {
             g.DrawString(Big, f, b, new RectangleF(12, 26, Width - 22, 30));
         }
         using (SolidBrush b = new SolidBrush(Theme.Ink3))
-        using (Font f = new Font("Segoe UI", 8f))
+        using (Font f = Theme.UI(8f))
         {
             g.DrawString(Sub, f, b, new RectangleF(13, Height - 24, Width - 22, 20));
         }
@@ -256,7 +377,9 @@ class ActionButton : Button
 {
     public string Why = "";
     public bool Danger = false;
+    public bool Primary = false;
     bool hot = false;
+    bool down = false;
 
     public ActionButton()
     {
@@ -267,38 +390,60 @@ class ActionButton : Button
     }
 
     protected override void OnMouseEnter(EventArgs e) { hot = true; Invalidate(); base.OnMouseEnter(e); }
-    protected override void OnMouseLeave(EventArgs e) { hot = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseLeave(EventArgs e) { hot = false; down = false; Invalidate(); base.OnMouseLeave(e); }
+    protected override void OnMouseDown(MouseEventArgs e) { down = true; Invalidate(); base.OnMouseDown(e); }
+    protected override void OnMouseUp(MouseEventArgs e) { down = false; Invalidate(); base.OnMouseUp(e); }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
+
+        // Windows 11 states a button by moving its FILL, not by adding a halo. The
+        // previous version drew a soft glow on hover, which is a Fluent-era effect
+        // and reads as decoration next to real Windows 11 controls.
+        Color face = Theme.Panel;
         Color edge = Theme.Line;
-        if (hot && Enabled) { edge = Danger ? Theme.Bad : Theme.Steel; }
+        Color ink = Enabled ? Theme.Ink : Theme.Ink3;
+
+        if (Primary && Enabled)
+        {
+            face = Theme.Accent;
+            edge = Theme.Accent;
+            ink = Theme.OnAccent;
+            if (down) { face = Blend(face, Theme.Bg, 0.24f); }
+            else if (hot) { face = Blend(face, Theme.Bg, 0.10f); }
+        }
+        else if (Enabled)
+        {
+            if (down) { face = Blend(Theme.Panel, Theme.Bg, 0.55f); }
+            else if (hot) { face = Blend(Theme.Panel, Theme.Bg, 0.30f); }
+            if (hot && Danger) { edge = Theme.Bad; ink = Theme.Bad; }
+        }
+        else { face = Theme.Sunken; }
 
         using (GraphicsPath path = Card.Rounded(r, 7))
         {
-            using (SolidBrush b = new SolidBrush(Theme.Bg)) { g.FillPath(b, path); }
-            if (hot && Enabled)
-            {
-                for (int i = 3; i >= 1; i--)
-                {
-                    using (Pen p = new Pen(Color.FromArgb(16 - i * 3, edge), i * 2))
-                    using (GraphicsPath gp = Card.Rounded(Rectangle.Inflate(r, i, i), 7 + i)) { g.DrawPath(p, gp); }
-                }
-            }
+            using (SolidBrush b = new SolidBrush(face)) { g.FillPath(b, path); }
             using (Pen p = new Pen(edge, 1f)) { g.DrawPath(p, path); }
         }
 
-        Color ink = Enabled ? Theme.Ink : Theme.Ink3;
         using (SolidBrush b = new SolidBrush(ink))
-        using (Font f = new Font("Segoe UI", 9.5f, FontStyle.Bold)) { g.DrawString(Text, f, b, 12, 9); }
-        using (SolidBrush b = new SolidBrush(Theme.Ink3))
-        using (Font f = new Font("Segoe UI", 8f))
+        using (Font f = Theme.UI(9.5f, FontStyle.Bold)) { g.DrawString(Text, f, b, 12, 9); }
+        using (SolidBrush b = new SolidBrush(Primary && Enabled ? ink : Theme.Ink3))
+        using (Font f = Theme.UI(8f))
         {
             g.DrawString(Why, f, b, new RectangleF(12, 27, Width - 22, Height - 30));
         }
+    }
+
+    static Color Blend(Color a, Color b, float t)
+    {
+        return Color.FromArgb(
+            (int)(a.R + (b.R - a.R) * t),
+            (int)(a.G + (b.G - a.G) * t),
+            (int)(a.B + (b.B - a.B) * t));
     }
 }
 
@@ -418,6 +563,56 @@ class ProgressPanel : Panel
     const int IdleMs = 500;
 
     public void SetStagingPath(string path) { stagingPath = path; }
+
+    // Marker parsing lives with the panel that consumes it, so the restore window and
+    // the main window cannot drift into reading the same protocol differently.
+    // Returns true when the line WAS a marker and should stay out of the log.
+    public bool Consume(string line)
+    {
+        try
+        {
+            if (line.StartsWith("[PROGRESS]", StringComparison.Ordinal))
+            {
+                int pct;
+                if (int.TryParse(Field(line, "pct"), NumberStyles.Integer, CultureInfo.InvariantCulture, out pct))
+                { SetPercent(Field(line, "db"), pct); }
+                return true;
+            }
+            if (line.StartsWith("[STAGE]", StringComparison.Ordinal))
+            {
+                SetStage(Field(line, "db"), FieldRest(line, "stage"));
+                return true;
+            }
+            if (line.StartsWith("[JOB]", StringComparison.Ordinal))
+            {
+                int idx, total;
+                int.TryParse(Field(line, "index"), NumberStyles.Integer, CultureInfo.InvariantCulture, out idx);
+                int.TryParse(Field(line, "total"), NumberStyles.Integer, CultureInfo.InvariantCulture, out total);
+                SetJob(idx, total, Field(line, "db"));
+                return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    static string Field(string line, string key)
+    {
+        int i = line.IndexOf(key + "=", StringComparison.Ordinal);
+        if (i < 0) { return null; }
+        int start = i + key.Length + 1;
+        int end = line.IndexOf(' ', start);
+        if (end < 0) { end = line.Length; }
+        return line.Substring(start, end - start);
+    }
+
+    // stage= is always last and its value may contain spaces.
+    static string FieldRest(string line, string key)
+    {
+        int i = line.IndexOf(key + "=", StringComparison.Ordinal);
+        if (i < 0) { return null; }
+        return line.Substring(i + key.Length + 1).TrimEnd();
+    }
 
     public void Begin(string label)
     {
@@ -555,9 +750,9 @@ class ProgressPanel : Panel
 
         using (SolidBrush ink3 = new SolidBrush(Theme.Ink3))
         using (SolidBrush ink = new SolidBrush(Theme.Ink))
-        using (Font small = new Font("Segoe UI", 7.5f, FontStyle.Bold))
-        using (Font body = new Font("Segoe UI", 9f))
-        using (Font bold = new Font("Segoe UI", 9.5f, FontStyle.Bold))
+        using (Font small = Theme.UI(7.5f, FontStyle.Bold))
+        using (Font body = Theme.UI(9f))
+        using (Font bold = Theme.UI(9.5f, FontStyle.Bold))
         {
             if (!active && started == DateTime.MinValue)
             {

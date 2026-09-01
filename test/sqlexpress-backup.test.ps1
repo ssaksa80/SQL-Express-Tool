@@ -721,4 +721,58 @@ Assert ($acl.AreAccessRulesProtected) 'inheritance stays off, so a permissive pa
 $bare = New-SebShareAcl -MachineAccount $MACH -SqlAccount ''
 Assert (@($bare.GetAccessRules($true,$false,[System.Security.Principal.NTAccount]) | Where-Object { $_.IdentityReference.Value -eq $SQLA }).Count -eq 0) 'no SQL rule is invented when no SQL account is supplied'
 
+# ---- 12. the restore sequence -----------------------------------------------------
+# Pure construction, so it is asserted directly rather than by restoring a database.
+# What matters is that the statement says what the operator was shown it says.
+
+$files = @(
+  [pscustomobject]@{ LogicalName = 'db';      Type = 'D' },
+  [pscustomobject]@{ LogicalName = 'db_log';  Type = 'L' }
+)
+
+$mv = @(Get-SebRestoreMoveClauses -Files $files -TargetName 'Target' -DataDir 'D:\data' -LogDir 'L:\logs')
+Assert ($mv.Count -eq 2) "one MOVE per file in the backup set (got $($mv.Count))"
+Assert ($mv[0] -eq "MOVE 'db' TO 'D:\data\Target.mdf'") "the data file goes to the data folder (got '$($mv[0])')"
+Assert ($mv[1] -eq "MOVE 'db_log' TO 'L:\logs\Target_log.ldf'") "and the log file goes to the LOG folder, which is the whole point of two folders (got '$($mv[1])')"
+
+# Secondary data files must not collide with the primary. Naming them all <target>.mdf
+# would make RESTORE overwrite the first with the second and lose half the database.
+$three = @(
+  [pscustomobject]@{ LogicalName = 'a'; Type = 'D' },
+  [pscustomobject]@{ LogicalName = 'b'; Type = 'D' },
+  [pscustomobject]@{ LogicalName = 'c'; Type = 'L' }
+)
+$mv3 = @(Get-SebRestoreMoveClauses -Files $three -TargetName 'T' -DataDir 'D:\d' -LogDir 'D:\d')
+$targets = @($mv3 | ForEach-Object { ($_ -split ' TO ')[1] })
+Assert (@($targets | Sort-Object -Unique).Count -eq 3) "three files land on three DISTINCT paths (got $((@($targets | Sort-Object -Unique)).Count))"
+Assert ($mv3[1] -match '_1\.ndf') "the second data file becomes an .ndf rather than overwriting the .mdf (got '$($mv3[1])')"
+
+# One folder supplied means both go there - the common case, and it must not produce
+# an empty path for the log.
+$one = @(Get-SebRestoreMoveClauses -Files $files -TargetName 'T' -DataDir 'D:\only' -LogDir '')
+Assert ($one[1] -eq "MOVE 'db_log' TO 'D:\only\T_log.ldf'") "an empty log folder falls back to the data folder (got '$($one[1])')"
+
+$sql = Get-SebRestoreSql -Path 'C:\b\x.bak' -TargetName 'Target' -Files $files -DataDir 'D:\d' -LogDir 'D:\d'
+Assert ($sql -match '^RESTORE DATABASE \[Target\] FROM DISK') "the statement restores to the requested name (got '$($sql.Substring(0, [Math]::Min(60, $sql.Length)))')"
+Assert ($sql -match 'RECOVERY') 'and recovers by default'
+Assert ($sql -notmatch 'REPLACE') 'and does NOT carry REPLACE unless it was asked for - this is the difference between a new database and destroying a live one'
+Assert ($sql -notmatch 'RESTRICTED_USER') 'nor RESTRICTED_USER'
+
+$sqlR = Get-SebRestoreSql -Path 'C:\b\x.bak' -TargetName 'T' -Files $files -DataDir 'D:\d' -LogDir 'D:\d' -Replace $true -RestrictedUser $true
+Assert ($sqlR -match 'REPLACE') 'REPLACE appears when it is asked for'
+Assert ($sqlR -match 'RESTRICTED_USER') 'and so does RESTRICTED_USER'
+
+# NORECOVERY is what makes a chain possible; silently substituting RECOVERY would
+# recover the database after the first backup set and make the rest unrestorable.
+$sqlN = Get-SebRestoreSql -Path 'C:\b\x.bak' -TargetName 'T' -Files $files -DataDir 'D:\d' -LogDir 'D:\d' -RecoveryState 'NORECOVERY'
+Assert ($sqlN -match 'NORECOVERY') 'NORECOVERY is honoured'
+$sqlJunk = Get-SebRestoreSql -Path 'C:\b\x.bak' -TargetName 'T' -Files $files -DataDir 'D:\d' -LogDir 'D:\d' -RecoveryState 'banana'
+Assert ($sqlJunk -match ', RECOVERY,') "an unrecognised recovery state falls back to RECOVERY rather than being pasted into the statement (got '$sqlJunk')"
+
+# A UNC pointing anywhere else must be left alone - resolving someone else's server to
+# a local path would restore from the wrong file.
+Assert ((Resolve-SebLocalShare -Root 'C:\plain\path') -eq 'C:\plain\path') 'a local path is returned unchanged'
+Assert ((Resolve-SebLocalShare -Root ('\otherhost\share')) -eq '\otherhost\share') 'a UNC for ANOTHER host is left alone'
+Assert ((Resolve-SebLocalShare -Root '') -eq '') 'an empty root is returned unchanged'
+
 Write-Host 'ALL PASS'

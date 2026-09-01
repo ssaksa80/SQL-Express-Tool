@@ -236,6 +236,7 @@ class MainForm : Form
     TextBox txtShare, txtStaging, txtInterval, txtHourly, txtDaily;
     ComboBox cboAuth;
     Button btnSave, btnTheme, btnQuit;
+    ActionButton btnRestore;
     ActionButton btnSelfTest, btnRunNow, btnInstall, btnUninstall, btnFull;
     TextBox log;
     Label noteLabel;
@@ -251,7 +252,7 @@ class MainForm : Form
         MinimumSize = new Size(900, 680);
         Size = new Size(1020, 780);
         StartPosition = FormStartPosition.CenterScreen;
-        Font = new Font("Segoe UI", 9f);
+        Font = Theme.UI(9f);
         DoubleBuffered = true;
 
         TableLayoutPanel root = new TableLayoutPanel();
@@ -308,7 +309,7 @@ class MainForm : Form
         pip.Location = new Point(2, 13);
         titleLabel = new Label();
         titleLabel.Text = "SQL Express Backup";
-        titleLabel.Font = new Font("Segoe UI", 12f, FontStyle.Bold);
+        titleLabel.Font = Theme.UI(12f, FontStyle.Bold);
         titleLabel.AutoSize = true;
         titleLabel.Location = new Point(26, 10);
         hostLabel = new Label();
@@ -317,7 +318,7 @@ class MainForm : Form
         btnQuit = SmallButton("Quit", 0);
         btnQuit.Click += delegate { Close(); };
         btnTheme = SmallButton("Theme", 1);
-        btnTheme.Click += delegate { Theme.Dark = !Theme.Dark; Theme.Save(); ApplyTheme(); };
+        btnTheme.Click += delegate { Theme.Toggle(); Theme.Save(); ApplyTheme(); };
         p.Controls.AddRange(new Control[] { pip, titleLabel, hostLabel, btnQuit, btnTheme });
         p.Resize += delegate
         {
@@ -449,7 +450,7 @@ class MainForm : Form
     {
         Label l = new Label();
         l.Text = text.ToUpperInvariant();
-        l.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+        l.Font = Theme.UI(7.5f, FontStyle.Bold);
         l.Dock = DockStyle.Fill;
         l.TextAlign = ContentAlignment.BottomLeft;
         l.Margin = new Padding(3, 0, 3, 0);
@@ -469,14 +470,18 @@ class MainForm : Form
     {
         TableLayoutPanel t = new TableLayoutPanel();
         t.Dock = DockStyle.Fill;
-        t.ColumnCount = 5;
+        t.ColumnCount = 6;
         t.RowCount = 1;
-        for (int i = 0; i < 5; i++) { t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 20f)); }
+        for (int i = 0; i < 6; i++) { t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / 6f)); }
 
         btnSelfTest = Act("Self test", "Scratch database, backed up, restored, dropped. No prompt.", false);
         btnSelfTest.Click += delegate { RunEngine("-SelfTest", false, "self test"); };
         btnRunNow = Act("Run backup now", "One pass, immediately. Needs an administrator.", false);
+        // The one thing this application exists to do, so it carries the accent.
+        btnRunNow.Primary = true;
         btnRunNow.Click += delegate { RunEngine("-Run", true, "run"); };
+        btnRestore = Act("Restore", "Browse backup sets and restore a database.", false);
+        btnRestore.Click += delegate { OpenRestore(); };
         btnInstall = Act("Install schedule", "Every database, on the interval above, as SYSTEM.", false);
         btnInstall.Click += delegate { RunEngine("-Install -As Task", true, "install"); };
         btnUninstall = Act("Uninstall schedule", "Stops the schedule. Backups are not touched.", true);
@@ -484,7 +489,7 @@ class MainForm : Form
         btnFull = Act("Full install", "Make a local share, set up, schedule, back up now.", true);
         btnFull.Click += delegate { FullInstall(); };
 
-        ActionButton[] all = new ActionButton[] { btnSelfTest, btnRunNow, btnInstall, btnUninstall, btnFull };
+        ActionButton[] all = new ActionButton[] { btnSelfTest, btnRunNow, btnRestore, btnInstall, btnUninstall, btnFull };
         for (int i = 0; i < all.Length; i++)
         {
             all[i].Dock = DockStyle.Fill;
@@ -492,6 +497,21 @@ class MainForm : Form
             t.Controls.Add(all[i], i, 0);
         }
         return t;
+    }
+
+    // Non-modal on purpose: a restore is long, and the operator needs to keep reading
+    // the log and the status behind it while one runs.
+    RestoreForm restoreWindow;
+    void OpenRestore()
+    {
+        if (restoreWindow != null && !restoreWindow.IsDisposed)
+        {
+            if (restoreWindow.WindowState == FormWindowState.Minimized) { restoreWindow.WindowState = FormWindowState.Normal; }
+            restoreWindow.Activate();
+            return;
+        }
+        restoreWindow = new RestoreForm();
+        restoreWindow.Show(this);
     }
 
     ActionButton Act(string text, string why, bool danger)
@@ -511,7 +531,7 @@ class MainForm : Form
         log.ScrollBars = ScrollBars.Vertical;
         log.Dock = DockStyle.Fill;
         log.BorderStyle = BorderStyle.FixedSingle;
-        log.Font = new Font("Consolas", 8.5f);
+        log.Font = Theme.Mono(8.5f);
         log.Text = "Ready." + Environment.NewLine;
         return log;
     }
@@ -663,58 +683,10 @@ class MainForm : Form
         if (InvokeRequired) { BeginInvoke(new Action<string>(Say), new object[] { line }); return; }
         // Progress markers drive the panel and stay OUT of the log. They are machine
         // lines; a log full of them is a log nobody reads.
-        if (line != null && line.Length > 0 && line[0] == '[' && TryProgress(line)) { return; }
+        if (line != null && line.Length > 0 && line[0] == '[' && progress.Consume(line)) { return; }
         log.AppendText(DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture) + "  " + line + Environment.NewLine);
     }
 
-    static string Field(string line, string key)
-    {
-        int i = line.IndexOf(key + "=", StringComparison.Ordinal);
-        if (i < 0) { return null; }
-        int start = i + key.Length + 1;
-        int end = line.IndexOf(' ', start);
-        if (end < 0) { end = line.Length; }
-        return line.Substring(start, end - start);
-    }
-
-    // stage= is always the LAST field on a marker line, and its value can contain
-    // spaces - the self test reports human-readable step names through it. Reading to
-    // the first space would truncate 'connected to the instance' to 'connected'.
-    static string FieldRest(string line, string key)
-    {
-        int i = line.IndexOf(key + "=", StringComparison.Ordinal);
-        if (i < 0) { return null; }
-        return line.Substring(i + key.Length + 1).TrimEnd();
-    }
-
-    bool TryProgress(string line)
-    {
-        try
-        {
-            if (line.StartsWith("[PROGRESS]", StringComparison.Ordinal))
-            {
-                int pct;
-                if (int.TryParse(Field(line, "pct"), NumberStyles.Integer, CultureInfo.InvariantCulture, out pct))
-                { progress.SetPercent(Field(line, "db"), pct); }
-                return true;
-            }
-            if (line.StartsWith("[STAGE]", StringComparison.Ordinal))
-            {
-                progress.SetStage(Field(line, "db"), FieldRest(line, "stage"));
-                return true;
-            }
-            if (line.StartsWith("[JOB]", StringComparison.Ordinal))
-            {
-                int idx, total;
-                int.TryParse(Field(line, "index"), NumberStyles.Integer, CultureInfo.InvariantCulture, out idx);
-                int.TryParse(Field(line, "total"), NumberStyles.Integer, CultureInfo.InvariantCulture, out total);
-                progress.SetJob(idx, total, Field(line, "db"));
-                return true;
-            }
-        }
-        catch { }
-        return false;
-    }
 
     void SetBusy(bool value)
     {
@@ -856,11 +828,11 @@ class FullInstallDialog : Form
         Size = new Size(620, 400);
         BackColor = Theme.Bg;
         ForeColor = Theme.Ink;
-        Font = new Font("Segoe UI", 9f);
+        Font = Theme.UI(9f);
 
         Label head = new Label();
         head.Text = "This will, on " + Environment.MachineName + ":";
-        head.Font = new Font("Segoe UI", 10f, FontStyle.Bold);
+        head.Font = Theme.UI(10f, FontStyle.Bold);
         head.SetBounds(16, 14, 560, 22);
 
         Label steps = new Label();

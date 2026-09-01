@@ -56,7 +56,9 @@ Say ("compiler : " + $csc)
 $engine = Join-Path $root 'Invoke-SqlExpressBackup.ps1'
 $sources = @(
   (Join-Path $appDir 'SqlExpressBackupApp.cs'),
-  (Join-Path $appDir 'MainForm.cs')
+  (Join-Path $appDir 'MainForm.cs'),
+  (Join-Path $appDir 'RestoreForm.cs'),
+  (Join-Path $appDir 'RestorePanels.cs')
 )
 
 $required = @{ 'engine' = $engine }
@@ -86,6 +88,10 @@ $cscArgs = @(
   '/warnaserror-'
   '/reference:System.Windows.Forms.dll'
   '/reference:System.Drawing.dll'
+  # The engine answers the restore modes in JSON, because the caller is a program.
+  # JavaScriptSerializer ships in the .NET Framework itself - no package, nothing to
+  # vendor, and this tool redistributes no third-party code.
+  '/reference:System.Web.Extensions.dll'
   ('/out:' + $exe)
   ('/resource:' + $engine + ',Invoke-SqlExpressBackup.ps1')
 ) + $sources
