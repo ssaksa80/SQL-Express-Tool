@@ -175,7 +175,7 @@ class DbaView
     {
         DateTime d;
         if (DateTime.TryParse(utc, CultureInfo.InvariantCulture,
-            DateTimeStyles.RoundtripKind | DateTimeStyles.AdjustToUniversal, out d))
+            DateTimeStyles.RoundtripKind, out d))
         {
             return d.ToLocalTime().ToString("d MMM HH:mm", CultureInfo.CurrentCulture);
         }

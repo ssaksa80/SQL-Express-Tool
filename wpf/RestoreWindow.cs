@@ -413,7 +413,7 @@ class RestoreWindow
     static string LocalTime(string utc)
     {
         DateTime d;
-        if (DateTime.TryParse(utc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind | DateTimeStyles.AdjustToUniversal, out d))
+        if (DateTime.TryParse(utc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out d))
         { return d.ToLocalTime().ToString("d MMM HH:mm", CultureInfo.CurrentCulture); }
         return utc;
     }

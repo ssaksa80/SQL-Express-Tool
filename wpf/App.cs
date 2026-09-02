@@ -101,6 +101,20 @@ class SebWpf
 
         Application app = new Application();
 
+        // An unhandled exception should be recorded and, on the UI thread, survived -
+        // a single bad row or a malformed timestamp must not take the whole window down
+        // with a silent 0xE0434352. Both handlers write the detail to a file, since a
+        // windowed exe has no console to print to.
+        app.DispatcherUnhandledException += delegate(object s, System.Windows.Threading.DispatcherUnhandledExceptionEventArgs e)
+        {
+            LogCrash("dispatcher", e.Exception);
+            e.Handled = true;
+        };
+        AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
+        {
+            LogCrash("domain", e.ExceptionObject as Exception);
+        };
+
         // A fresh download that has not chosen a mode gets the first-run chooser. "Just
         // run once" continues into the normal window; the other choices set up and
         // relaunch, then shut this instance down. A deep-link flag (--restore /
@@ -115,6 +129,17 @@ class SebWpf
         ShowMain(app, openRestoreOnLoad, selfTestOnLoad);
         app.Run();
         return 0;
+    }
+
+    static void LogCrash(string where, Exception ex)
+    {
+        try
+        {
+            string p = Path.Combine(Path.GetTempPath(), "SqlExpressBackupApp-wpf-error.txt");
+            File.AppendAllText(p, DateTime.Now.ToString("s") + " [" + where + "] " +
+                (ex == null ? "unknown" : ex.ToString()) + Environment.NewLine + Environment.NewLine);
+        }
+        catch { }
     }
 
     static void ShowMain(Application app, bool openRestoreOnLoad, bool selfTestOnLoad)
