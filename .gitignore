@@ -4,3 +4,6 @@ dist/
 
 # Local run transcripts - may contain real host/account/DB names, never commit
 *-last-run.log
+
+# WPF shell build output
+dist-wpf/
