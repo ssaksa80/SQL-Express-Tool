@@ -7,6 +7,20 @@ running on Express therefore have **no backups at all** unless someone builds th
 schedule outside the engine. This does that, and tries hard not to be the kind of
 backup job that reports success for a year and then cannot restore.
 
+## Two front-ends
+
+There are two ways to drive the same engine, and one engine underneath both:
+
+- **The application** — a modern, DPI-native Windows app with a Modern/DBA view toggle,
+  a real restore window, and portable or installed modes with a self-registering
+  installer. This is the one to reach for. See **[docs/APP.md](docs/APP.md)**, built
+  with `build-wpf.ps1`.
+- **The console** — the original operator window described below, built with
+  `build-app.ps1`. Still supported; lighter, and the reference for how the engine is
+  set up and scheduled.
+
+The rest of this README covers the console and the engine they share.
+
 ## Quick start
 
 Build it once, then run the one file it produces:
