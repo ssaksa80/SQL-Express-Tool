@@ -32,7 +32,8 @@ $sources = @(
   (Join-Path $here 'wpf\Ui.cs'),
   (Join-Path $here 'wpf\Engine.cs'),
   (Join-Path $here 'wpf\ModernView.cs'),
-  (Join-Path $here 'wpf\DbaView.cs')
+  (Join-Path $here 'wpf\DbaView.cs'),
+  (Join-Path $here 'wpf\RestoreWindow.cs')
 )
 $manifest = Join-Path $here 'wpf\app.manifest'
 

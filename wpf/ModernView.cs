@@ -226,6 +226,7 @@ class ModernView
 
     // ---- actions ------------------------------------------------------------------
 
+    public void StartSelfTest() { RunMode("-SelfTest", "Self test"); }
     void SelfTest() { RunMode("-SelfTest", "Self test"); }
     void RunBackup() { RunMode("-Run", "Backup"); }
 

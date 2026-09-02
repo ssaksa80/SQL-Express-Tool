@@ -154,6 +154,50 @@ static class Engine
         return result;
     }
 
+    // Inspect a backup file: readability pre-check, header, file list. Returns the
+    // parsed dictionary (Readable, Database, Compressed, Files, ...) or null.
+    public static Dictionary<string, object> RestoreInspect(string path)
+    {
+        StringBuilder all = new StringBuilder();
+        Run("-RestoreInspect \"" + path + "\"", delegate(string line) { all.AppendLine(line); });
+        string json = LastJsonLine(all.ToString());
+        if (json == null) { return null; }
+        try
+        {
+            JavaScriptSerializer js = new JavaScriptSerializer();
+            js.MaxJsonLength = 64 * 1024 * 1024;
+            return js.Deserialize<Dictionary<string, object>>(json);
+        }
+        catch { return null; }
+    }
+
+    // Verify media (RESTORE VERIFYONLY WITH CHECKSUM). Returns true on Ok.
+    public static bool RestoreVerify(string path, out string error)
+    {
+        error = "";
+        StringBuilder all = new StringBuilder();
+        Run("-RestoreVerify \"" + path + "\"", delegate(string line) { all.AppendLine(line); });
+        string json = LastJsonLine(all.ToString());
+        if (json == null) { error = "no response from engine"; return false; }
+        try
+        {
+            JavaScriptSerializer js = new JavaScriptSerializer();
+            Dictionary<string, object> d = js.Deserialize<Dictionary<string, object>>(json);
+            bool ok = d != null && d.ContainsKey("Ok") && Convert.ToBoolean(d["Ok"]);
+            if (!ok && d != null && d.ContainsKey("Error")) { error = Convert.ToString(d["Error"]); }
+            return ok;
+        }
+        catch (Exception ex) { error = ex.Message; return false; }
+    }
+
+    // Read one string field from a parsed dictionary (helper for callers).
+    public static string Field(Dictionary<string, object> d, string k) { return Str(d, k); }
+    public static bool FieldBool(Dictionary<string, object> d, string k)
+    {
+        try { if (d != null && d.ContainsKey(k) && d[k] != null) { return Convert.ToBoolean(d[k]); } } catch { }
+        return false;
+    }
+
     static string LastJsonLine(string output)
     {
         string found = null;

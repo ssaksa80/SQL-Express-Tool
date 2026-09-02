@@ -25,9 +25,13 @@ class SebWpf
     static int Main(string[] args)
     {
         string checkFile = null;
+        bool openRestoreOnLoad = false;
+        bool selfTestOnLoad = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
+            if (args[i] == "--restore") { openRestoreOnLoad = true; }
+            if (args[i] == "--selftest") { selfTestOnLoad = true; }
         }
 
         settings = AppSettings.Load();
@@ -38,12 +42,15 @@ class SebWpf
             try
             {
                 Window probe = BuildWindow();
-                // construct both views headless — layout code that never runs is the
-                // code most likely to throw on first use.
+                // construct every view and the restore window headless — layout code
+                // that never runs is the code most likely to throw on first use, and
+                // the restore window can destroy a database, so its layout must not be
+                // the first thing anyone runs live.
                 FrameworkElement m = new ModernView(null).Build();
                 FrameworkElement d = new DbaView(null).Build();
+                FrameworkElement rw = new RestoreWindow().BuildRoot();
                 File.WriteAllText(checkFile, "WPF-CHECK-OK view=" + settings.View + " theme=" + settings.Theme +
-                    " modern=" + (m != null) + " dba=" + (d != null));
+                    " modern=" + (m != null) + " dba=" + (d != null) + " restore=" + (rw != null));
                 return 0;
             }
             catch (Exception ex)
@@ -56,6 +63,8 @@ class SebWpf
         Application app = new Application();
         Window win = BuildWindow();
         win.Closing += delegate { SaveGeometry(win); };
+        if (openRestoreOnLoad) { win.Loaded += delegate { OpenRestore(); }; }
+        if (selfTestOnLoad) { win.Loaded += delegate { if (currentModern != null) { currentModern.StartSelfTest(); } }; }
         app.Run(win);
         return 0;
     }
@@ -82,6 +91,7 @@ class SebWpf
         rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // view
         Rebuild(win);
         win.Content = rootGrid;
+        mainWin = win;
         return win;
     }
 
@@ -192,28 +202,21 @@ class SebWpf
         return b;
     }
 
+    static ModernView currentModern;
     static void SwitchView()
     {
-        if (settings.View == "dba") { host.Child = new DbaView(OpenRestore).Build(); }
-        else { host.Child = new ModernView(OpenRestore).Build(); }
+        if (settings.View == "dba") { host.Child = new DbaView(OpenRestore).Build(); currentModern = null; }
+        else { ModernView mv = new ModernView(OpenRestore); currentModern = mv; host.Child = mv.Build(); }
     }
 
-    // Restore is a separate window (decision locked). A full WPF restore window is a
-    // later phase; for now this opens a lightweight placeholder so the entry point is
-    // wired and testable.
+    // Restore is a separate window (decision locked). It drives the engine's restore
+    // modes - the shell owns no restore logic of its own.
+    static Window mainWin;
+    static RestoreWindow restore;
     static void OpenRestore()
     {
-        Window w = new Window();
-        w.Title = "Restore — SQL Express Backup";
-        w.Width = 720; w.Height = 480; w.Background = Theme.Bg; w.FontFamily = Ui.Face;
-        w.WindowStartupLocation = WindowStartupLocation.CenterOwner;
-        StackPanel sp = new StackPanel();
-        sp.VerticalAlignment = VerticalAlignment.Center; sp.HorizontalAlignment = HorizontalAlignment.Center;
-        sp.Children.Add(Ui.Text("Restore", 22, Theme.Ink, FontWeights.SemiBold));
-        TextBlock s = Ui.Text("The full restore window arrives in the next phase.", 13, Theme.Ink3);
-        s.Margin = new Thickness(0, 8, 0, 0); sp.Children.Add(s);
-        w.Content = sp;
-        w.Show();
+        restore = new RestoreWindow();
+        restore.Show(mainWin);
     }
 
     static void SaveGeometry(Window win)

@@ -7,3 +7,4 @@ dist/
 
 # WPF shell build output
 dist-wpf/
+dist-wpf-b/
