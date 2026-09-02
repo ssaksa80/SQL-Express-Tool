@@ -1,3 +1,6 @@
 # Built by build-app.ps1. The source and the build script are the reviewable
 # artifacts; a binary in the tree is neither reviewable nor trustworthy.
 dist/
+
+# Local run transcripts - may contain real host/account/DB names, never commit
+*-last-run.log

@@ -14,7 +14,7 @@ try { Start-Transcript -LiteralPath $log -Force | Out-Null } catch {}
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   ("NOT ELEVATED - ran as " + $id.Name) | Set-Content -LiteralPath $log
-  Write-Host "NOT ELEVATED. Open PowerShell as administrator, sign in as adminaccount, and re-run." -ForegroundColor Yellow
+  Write-Host "NOT ELEVATED. Open PowerShell as administrator, sign in as your administrator account, and re-run." -ForegroundColor Yellow
   try { Stop-Transcript | Out-Null } catch {}
   exit 2
 }

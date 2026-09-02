@@ -37,7 +37,7 @@ function Sec($n) { Write-Host ''; Write-Host ("== " + $n + " " + ('=' * [Math]::
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Write-Host "NOT ELEVATED. Run this as the admin account (t2-):" -ForegroundColor Yellow
-  Write-Host "  right-click PowerShell -> Run as administrator, sign in as adminaccount, then re-run this script."
+  Write-Host "  right-click PowerShell -> Run as administrator, sign in as your administrator account, then re-run this script."
   Write-Host ("current identity: " + $id.Name)
   try { ("NOT ELEVATED - ran as " + $id.Name + " at " + (Get-Date -Format o)) | Set-Content -LiteralPath $transcript } catch {}
   try { Stop-Transcript | Out-Null } catch {}
