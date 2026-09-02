@@ -33,7 +33,9 @@ $sources = @(
   (Join-Path $here 'wpf\Engine.cs'),
   (Join-Path $here 'wpf\ModernView.cs'),
   (Join-Path $here 'wpf\DbaView.cs'),
-  (Join-Path $here 'wpf\RestoreWindow.cs')
+  (Join-Path $here 'wpf\RestoreWindow.cs'),
+  (Join-Path $here 'wpf\Install.cs'),
+  (Join-Path $here 'wpf\FirstRun.cs')
 )
 $manifest = Join-Path $here 'wpf\app.manifest'
 
@@ -43,7 +45,10 @@ $args = @(
   ('/lib:' + $wpflib),
   '/reference:PresentationFramework.dll', '/reference:PresentationCore.dll',
   '/reference:WindowsBase.dll', '/reference:System.Xaml.dll',
-  '/reference:System.Web.Extensions.dll',
+  '/reference:System.Web.Extensions.dll', '/reference:System.Windows.Forms.dll',
+  # The PowerShell engine is embedded so the exe is self-contained: portable and
+  # installed modes both extract it beside themselves.
+  ('/resource:' + (Join-Path $here 'Invoke-SqlExpressBackup.ps1') + ',SqlExpressBackup.engine.ps1'),
   ('/win32manifest:' + $manifest),
   ('/out:' + $exe)
 ) + $sources

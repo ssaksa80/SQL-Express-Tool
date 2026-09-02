@@ -40,22 +40,23 @@ static class Engine
     public static string FindEngine()
     {
         if (enginePath != null) { return enginePath; }
-        List<string> candidates = new List<string>();
+        // The exe carries the engine embedded; extract it for the current mode. Fall
+        // back to any copy already on disk (e.g. the console's per-user extraction).
+        try { enginePath = Install.EnsureEngine(AppSettings.Mode); } catch { }
+        if (enginePath != null && File.Exists(enginePath)) { return enginePath; }
         try
         {
             string exeDir = Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
-            candidates.Add(Path.Combine(exeDir, "Invoke-SqlExpressBackup.ps1"));
-            candidates.Add(Path.Combine(Path.Combine(exeDir, "engine"), "Invoke-SqlExpressBackup.ps1"));
+            string[] fallbacks = new string[] {
+                Path.Combine(exeDir, "Invoke-SqlExpressBackup.ps1"),
+                Path.Combine(Path.Combine(exeDir, "engine"), "Invoke-SqlExpressBackup.ps1"),
+                Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "SqlExpressBackup"), Path.Combine("engine", "Invoke-SqlExpressBackup.ps1"))
+            };
+            foreach (string c in fallbacks) { if (File.Exists(c)) { enginePath = c; return c; } }
         }
         catch { }
-        candidates.Add(Path.Combine(Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "SqlExpressBackup"), Path.Combine("engine", "Invoke-SqlExpressBackup.ps1")));
-        foreach (string c in candidates)
-        {
-            try { if (File.Exists(c)) { enginePath = c; return c; } } catch { }
-        }
-        return null;
+        return enginePath;
     }
 
     static string PublicJsonPath()

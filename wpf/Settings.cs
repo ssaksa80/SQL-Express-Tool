@@ -30,16 +30,14 @@ public class AppSettings
     public int KeepHourly = 3;
     public int KeepDaily = 7;
 
-    static string Dir()
-    {
-        string d = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "SqlExpressBackup");
-        Directory.CreateDirectory(d);
-        return d;
-    }
+    // Set by the bootstrapper once the run mode is known, so a portable copy keeps its
+    // settings beside the executable and an installed one keeps them per-user.
+    public static AppMode Mode = AppMode.Fresh;
 
-    static string FilePath() { return Path.Combine(Dir(), "wpf-settings.json"); }
+    static string FilePath()
+    {
+        return Path.Combine(Install.SettingsDir(Mode), "wpf-settings.json");
+    }
 
     public static AppSettings Load()
     {

@@ -27,15 +27,54 @@ class SebWpf
         string checkFile = null;
         bool openRestoreOnLoad = false;
         bool selfTestOnLoad = false;
+        bool doInstall = false, doUninstall = false, quiet = false;
+        string portableTo = null;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
             if (args[i] == "--restore") { openRestoreOnLoad = true; }
             if (args[i] == "--selftest") { selfTestOnLoad = true; }
+            if (args[i] == "--install") { doInstall = true; }
+            if (args[i] == "--uninstall") { doUninstall = true; }
+            if (args[i] == "--quiet") { quiet = true; }
+            if (args[i] == "--portable" && i + 1 < args.Length) { portableTo = args[++i]; }
         }
 
+        // Silent portable setup: extract to a folder and launch it there. Also the path
+        // the first-run chooser takes after picking a folder.
+        if (portableTo != null)
+        {
+            try
+            {
+                string pexe = Install.DoPortable(portableTo);
+                if (!quiet) { Install.Relaunch("", false, pexe); }
+            }
+            catch { }
+            return 0;
+        }
+
+        // Install / uninstall run before any UI. Both need administrator; if we are not
+        // elevated, relaunch with the same verb and let UAC prompt.
+        if (doInstall)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--install", true); return 0; }
+            string installedExe = Install.DoInstall();
+            Install.Relaunch("", false, installedExe); // launch the installed copy
+            return 0;
+        }
+        if (doUninstall)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--uninstall" + (quiet ? " --quiet" : ""), true); return 0; }
+            Install.DoUninstall();
+            return 0;
+        }
+
+        AppMode mode = Install.DetectMode();
+        AppSettings.Mode = mode;
         settings = AppSettings.Load();
         Theme.Load(settings.Theme);
+        // Make sure the engine is unpacked for this mode before any view queries it.
+        try { Engine.FindEngine(); } catch { }
 
         if (checkFile != null)
         {
@@ -61,12 +100,30 @@ class SebWpf
         }
 
         Application app = new Application();
+
+        // A fresh download that has not chosen a mode gets the first-run chooser. "Just
+        // run once" continues into the normal window; the other choices set up and
+        // relaunch, then shut this instance down.
+        if (mode == AppMode.Fresh)
+        {
+            FirstRun fr = new FirstRun(app, delegate { ShowMain(app, false, false); });
+            app.Run(fr.Build());
+            return 0;
+        }
+
+        ShowMain(app, openRestoreOnLoad, selfTestOnLoad);
+        app.Run();
+        return 0;
+    }
+
+    static void ShowMain(Application app, bool openRestoreOnLoad, bool selfTestOnLoad)
+    {
         Window win = BuildWindow();
         win.Closing += delegate { SaveGeometry(win); };
         if (openRestoreOnLoad) { win.Loaded += delegate { OpenRestore(); }; }
         if (selfTestOnLoad) { win.Loaded += delegate { if (currentModern != null) { currentModern.StartSelfTest(); } }; }
-        app.Run(win);
-        return 0;
+        app.MainWindow = win;
+        win.Show();
     }
 
     static Window BuildWindow()
