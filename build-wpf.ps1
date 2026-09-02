@@ -27,7 +27,12 @@ $exe = Join-Path $out 'SqlExpressBackup.exe'
 
 $sources = @(
   (Join-Path $here 'wpf\App.cs'),
-  (Join-Path $here 'wpf\Settings.cs')
+  (Join-Path $here 'wpf\Settings.cs'),
+  (Join-Path $here 'wpf\Theme.cs'),
+  (Join-Path $here 'wpf\Ui.cs'),
+  (Join-Path $here 'wpf\Engine.cs'),
+  (Join-Path $here 'wpf\ModernView.cs'),
+  (Join-Path $here 'wpf\DbaView.cs')
 )
 $manifest = Join-Path $here 'wpf\app.manifest'
 
