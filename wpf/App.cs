@@ -103,8 +103,9 @@ class SebWpf
 
         // A fresh download that has not chosen a mode gets the first-run chooser. "Just
         // run once" continues into the normal window; the other choices set up and
-        // relaunch, then shut this instance down.
-        if (mode == AppMode.Fresh)
+        // relaunch, then shut this instance down. A deep-link flag (--restore /
+        // --selftest) means "just run now", so it skips the chooser.
+        if (mode == AppMode.Fresh && !openRestoreOnLoad && !selfTestOnLoad)
         {
             FirstRun fr = new FirstRun(app, delegate { ShowMain(app, false, false); });
             app.Run(fr.Build());
