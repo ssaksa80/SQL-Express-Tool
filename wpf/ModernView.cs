@@ -4,6 +4,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
@@ -62,7 +63,7 @@ class ModernView
         sp.Children.Add(Ui.NavItem("", "Overview", true, null));
         sp.Children.Add(Ui.NavItem("", "Databases", false, null));
         sp.Children.Add(Ui.NavItem("", "Restore", false, openRestore));
-        sp.Children.Add(Ui.NavItem("", "Schedule", false, null));
+        sp.Children.Add(Ui.NavItem("", "Schedule", false, ShowSchedule));
         sp.Children.Add(Ui.NavItem("", "Activity", false, ShowFullLog));
 
         b.Child = sp;
@@ -186,6 +187,100 @@ class ModernView
             Dispatch(delegate { log.SetLines(ls); });
         });
         t.IsBackground = true; t.Start();
+    }
+
+    // The Schedule nav item: a small window with the backup schedule, read from the
+    // engine's published status (interval, last run, the estimated next run, pending
+    // copies, instance, share). No elevation and no SQL round-trip.
+    void ShowSchedule()
+    {
+        Window w = new Window();
+        w.Title = "Backup schedule";
+        w.Width = 480; w.Height = 400; w.MinWidth = 380; w.MinHeight = 280;
+        w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        w.Background = Theme.Bg; w.FontFamily = Ui.Face;
+        ScrollViewer sv = new ScrollViewer(); sv.Padding = new Thickness(20, 18, 20, 18);
+        StackPanel sp = new StackPanel();
+        sp.Children.Add(Ui.Text("Reading schedule…", 13, Theme.Ink3));
+        sv.Content = sp; w.Content = sv;
+        w.Show(); w.Activate();
+        Thread t = new Thread(delegate ()
+        {
+            BackupStatus st = Engine.ReadStatus();
+            Dispatch(delegate { FillSchedule(sp, st); });
+        });
+        t.IsBackground = true; t.Start();
+    }
+
+    void FillSchedule(StackPanel sp, BackupStatus st)
+    {
+        sp.Children.Clear();
+        sp.Children.Add(Ui.Text("Backup schedule", 18, Theme.Ink, FontWeights.SemiBold));
+        sp.Children.Add(Gap(12));
+
+        if (!st.Found)
+        {
+            TextBlock none = Ui.Text("No schedule is configured yet. Run setup, then install the scheduled task:", 12.5, Theme.Ink2);
+            none.TextWrapping = TextWrapping.Wrap; sp.Children.Add(none);
+            sp.Children.Add(Gap(6));
+            TextBlock cmd = Ui.Text("Invoke-SqlExpressBackup.ps1 -Setup   →   -Install -As Task", 12, Theme.Ink3);
+            cmd.FontFamily = new FontFamily("Cascadia Mono, Consolas"); cmd.TextWrapping = TextWrapping.Wrap;
+            sp.Children.Add(cmd);
+            return;
+        }
+
+        ScheduleRow(sp, "Interval", "every " + st.IntervalHours + " hour" + (st.IntervalHours == 1 ? "" : "s"));
+        ScheduleRow(sp, "Last run", st.LastRunUtc == "" ? "—" : (LocalTime(st.LastRunUtc) + (st.LastResult == "" ? "" : "   (" + st.LastResult + ")")));
+        ScheduleRow(sp, "Next run (est.)", NextRun(st));
+        ScheduleRow(sp, "Pending copies", st.PendingCount.ToString());
+        ScheduleRow(sp, "Instance", st.Instance == "" ? "—" : st.Instance);
+        ScheduleRow(sp, "Share", st.SharePath == "" ? "—" : st.SharePath);
+
+        sp.Children.Add(Gap(14));
+        TextBlock note = Ui.Text("The scheduled task runs as SYSTEM every " + st.IntervalHours
+            + " hours. To change the interval, re-run setup and re-install the task.", 12, Theme.Ink3);
+        note.TextWrapping = TextWrapping.Wrap;
+        sp.Children.Add(note);
+    }
+
+    void ScheduleRow(StackPanel sp, string label, string value)
+    {
+        Grid g = new Grid(); g.Margin = new Thickness(0, 5, 0, 5);
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(135) });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        g.Children.Add(Ui.Text(label, 12.5, Theme.Ink3));
+        TextBlock v = Ui.Text(value, 12.5, Theme.Ink); v.TextWrapping = TextWrapping.Wrap; Grid.SetColumn(v, 1);
+        g.Children.Add(v);
+        sp.Children.Add(g);
+    }
+
+    static Border Gap(double h) { Border b = new Border(); b.Height = h; return b; }
+
+    static string NextRun(BackupStatus st)
+    {
+        try
+        {
+            DateTime last;
+            if (DateTime.TryParse(st.LastRunUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out last))
+            {
+                DateTime next = last.ToUniversalTime().AddHours(st.IntervalHours).ToLocalTime();
+                string when = next.ToString("d MMM HH:mm", CultureInfo.CurrentCulture);
+                if (next < DateTime.Now) { when += "   (overdue)"; }
+                return when;
+            }
+        }
+        catch { }
+        return "—";
+    }
+
+    static string LocalTime(string utc)
+    {
+        DateTime d;
+        if (DateTime.TryParse(utc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out d))
+        {
+            return d.ToLocalTime().ToString("d MMM HH:mm", CultureInfo.CurrentCulture);
+        }
+        return utc;
     }
 
     // ---- data ---------------------------------------------------------------------
