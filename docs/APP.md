@@ -83,10 +83,12 @@ Use the **Uninstall** button in Installed apps, or:
 & "C:\Program Files\SQL Express Backup\SqlExpressBackup.exe" --uninstall
 ```
 
-Uninstall removes the registry entry, the Start-menu shortcut, and the install folder.
-**It never touches your backups** — those live on the share, not in the install
-directory. (A running executable cannot delete itself, so the folder removal is handed
-to a short detached command that runs once the app exits.)
+Uninstall first removes the **scheduled task** (so it is not left running with no app
+behind it), then the registry entry, the Start-menu shortcut, and the install folder.
+**It never touches your backups or your configuration** — the backups live on the share,
+not in the install directory, and the sealed credential and config are left in place. (A
+running executable cannot delete itself, so the folder removal is handed to a short
+detached command that runs once the app exits.)
 
 ---
 
@@ -163,6 +165,39 @@ full recent log.
 
 ---
 
+## Configuring and scheduling
+
+Backups are configured and scheduled from inside the app. Each of these writes the locked
+configuration and registers a scheduled task that runs as SYSTEM, so each needs
+administrator — rather than run the whole app elevated, the app spawns a single elevated
+helper for the one job through a Windows UAC prompt and streams its output back live.
+
+### Set up backups
+
+**Set up…** (on the overview) opens a wizard: the SQL instance (blank picks the only one
+on the host), the backup share (a UNC path), the staging folder, the interval, and how
+many hourly and daily copies to keep. It uses **Windows authentication** — the SQL service
+account — so no SQL password is ever entered in the app. Applying it configures the engine
+and registers the scheduled task in one elevated step, with the engine's output shown as
+it runs.
+
+### Changing the schedule
+
+The **Schedule** window (in the sidebar) shows the interval, the last run, the estimated
+next run, pending copies, the instance and the share. Below that, **Change schedule** lets
+you pick a new interval and, optionally, new retention counts, and **Apply** re-registers
+the task — again in one elevated step. Only the values you change are changed; the rest of
+the configuration is left as it is.
+
+### Running a backup now
+
+**Run backup now** runs a pass immediately. A backup reads the SYSTEM-only sealed
+credential, so it runs elevated; when the app is not already elevated it runs the pass as
+an elevated job and streams the same glowing progress bar and activity log a scheduled run
+would.
+
+---
+
 ## Settings and persistence
 
 Everything you change is saved immediately, and the app reopens exactly as you left it:
@@ -187,6 +222,10 @@ Useful for scripted deployment and for testing:
 | `--portable <path>` | Extract a portable copy to `<path>` and launch it. |
 | `--restore` | Open straight to the restore window. |
 | `--selftest` | Run a self test on launch. |
+| `--backup-now` | Run one backup pass now (elevates if needed). Behind **Run backup now**. |
+| `--reschedule <file>` | Apply the interval/retention in a JSON file and re-register the task (elevates). Behind **Change schedule**. |
+| `--apply-setup <file>` | Configure and schedule from a JSON file, Windows auth (elevates). Behind the setup wizard. |
+| `--live <file>` | With the three above: stream the engine's output to `<file>`, ending in `[EXIT] N`, so the launching app can tail it live across the UAC boundary. |
 | `--check <file>` | Construct every view headless and write findings to `<file>`; used by the test suite. No window is shown. |
 
 ---
@@ -238,7 +277,10 @@ same engine the PowerShell console uses, embedded in the executable and extracte
 demand. It performs the backups, the retention, the verification, and the restores; the
 application reads its status and drives its modes, relaying the engine's progress markers
 into the glowing progress bar (which turns amber if a job stalls) and streaming its output
-into the activity log.
+into the activity log. The elevated modes — `-Setup`, `-Reschedule`, `-Run`, `-Uninstall`
+— are driven the same way, run in a short elevated helper process whose output the app
+tails live, so configuration and scheduling never require running the whole UI as
+administrator.
 
 This split is deliberate. The engine is tested and mutation-verified; a second
 implementation of the backup or restore logic inside the UI would be two things that

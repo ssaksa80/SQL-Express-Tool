@@ -306,14 +306,16 @@ class ModernView
         schedApplyBtn.IsHitTestVisible = false; schedApplyBtn.Opacity = 0.5;
         schedStatus.Foreground = Theme.Ink3;
         schedStatus.Text = "Approve the elevation prompt to apply…";
-        Elevate.Run("--reschedule \"" + tmp + "\"", 90, delegate(bool ok, string output)
-        {
-            try { System.IO.File.Delete(tmp); } catch { }
-            schedApplyBtn.IsHitTestVisible = true; schedApplyBtn.Opacity = 1.0;
-            schedStatus.Foreground = ok ? Theme.Ok : Theme.Bad;
-            schedStatus.Text = ok ? ("Schedule updated — every " + interval + " hours.") : ("Failed: " + FirstLine(output));
-            if (ok) { Refresh(); }
-        });
+        Elevate.Run("--reschedule \"" + tmp + "\"", 90,
+            delegate(string line) { if (line.Trim().Length > 0 && !line.StartsWith("{")) { schedStatus.Text = line; } },
+            delegate(bool ok, string output)
+            {
+                try { System.IO.File.Delete(tmp); } catch { }
+                schedApplyBtn.IsHitTestVisible = true; schedApplyBtn.Opacity = 1.0;
+                schedStatus.Foreground = ok ? Theme.Ok : Theme.Bad;
+                schedStatus.Text = ok ? ("Schedule updated — every " + interval + " hours.") : ("Failed: " + FirstLine(output));
+                if (ok) { Refresh(); }
+            });
     }
 
     static string FirstLine(string s)
@@ -458,15 +460,28 @@ class ModernView
         if (busy) { return; }
         busy = true;
         activityArea.Visibility = Visibility.Visible;
-        glow.Visibility = Visibility.Collapsed;
+        glow.Visibility = Visibility.Visible;
+        glow.Begin("Backup (elevated)");
         log.SetTitle("Backup — elevated");
-        log.SetLines(new string[] { "Approve the Windows elevation prompt to run the backup as SYSTEM…" });
-        Elevate.Run("--backup-now", 600, delegate(bool ok, string output)
-        {
-            log.SetTitle(ok ? "Backup finished" : "Backup failed");
-            log.SetLines(SplitLines(output));
-            busy = false; Refresh();
-        });
+        log.Clear();
+        log.Append("Approve the Windows elevation prompt to run the backup as SYSTEM…");
+        int total = 1, index = 0; string stage = "starting"; int pct = -1;
+        Elevate.Run("--backup-now", 600,
+            delegate(string line)
+            {
+                bool marker = false;
+                if (line.StartsWith("[JOB]")) { index = FieldInt(line, "index", index); total = FieldInt(line, "total", total); marker = true; }
+                else if (line.StartsWith("[STAGE]")) { stage = FieldRest(line, "stage"); marker = true; }
+                else if (line.StartsWith("[PROGRESS]")) { pct = FieldInt(line, "pct", pct); marker = true; }
+                double overall = Overall(index, total, stage, pct);
+                if (marker) { glow.Update(overall, "Backup  ·  " + stage + (total > 1 ? ("  " + index + "/" + total) : "")); }
+                if (!line.StartsWith("[PROGRESS]")) { log.Append(line); }
+            },
+            delegate(bool ok, string output)
+            {
+                glow.Finish(ok, ok ? "Backup finished" : "Backup failed (or elevation declined)");
+                busy = false; Refresh();
+            });
     }
 
     void OpenSetup()

@@ -32,7 +32,7 @@ class SebWpf
         // headless elevated jobs (spawned by the UI through UAC): each does its work and
         // writes a "exit=N\n<output>" result file the non-elevated UI polls.
         bool backupNow = false;
-        string rescheduleJson = null, applySetupJson = null, resultFile = null;
+        string rescheduleJson = null, applySetupJson = null, liveFile = null;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
@@ -45,7 +45,7 @@ class SebWpf
             if (args[i] == "--backup-now") { backupNow = true; }
             if (args[i] == "--reschedule" && i + 1 < args.Length) { rescheduleJson = args[++i]; }
             if (args[i] == "--apply-setup" && i + 1 < args.Length) { applySetupJson = args[++i]; }
-            if (args[i] == "--result" && i + 1 < args.Length) { resultFile = args[++i]; }
+            if (args[i] == "--live" && i + 1 < args.Length) { liveFile = args[++i]; }
         }
 
         // Silent portable setup: extract to a folder and launch it there. Also the path
@@ -86,21 +86,21 @@ class SebWpf
         // result file the non-elevated UI polls, and exits without any window.
         if (backupNow)
         {
-            if (!Install.IsElevated()) { Install.Relaunch("--backup-now" + ResultArg(resultFile), true); return 0; }
+            if (!Install.IsElevated()) { Install.Relaunch("--backup-now" + LiveArg(liveFile), true); return 0; }
             AppSettings.Mode = Install.DetectMode();
-            return RunEngineHeadless("-Run", resultFile);
+            return RunEngineHeadless("-Run", liveFile);
         }
         if (rescheduleJson != null)
         {
-            if (!Install.IsElevated()) { Install.Relaunch("--reschedule \"" + rescheduleJson + "\"" + ResultArg(resultFile), true); return 0; }
+            if (!Install.IsElevated()) { Install.Relaunch("--reschedule \"" + rescheduleJson + "\"" + LiveArg(liveFile), true); return 0; }
             AppSettings.Mode = Install.DetectMode();
-            return RunEngineHeadless(BuildRescheduleArgs(rescheduleJson), resultFile);
+            return RunEngineHeadless(BuildRescheduleArgs(rescheduleJson), liveFile);
         }
         if (applySetupJson != null)
         {
-            if (!Install.IsElevated()) { Install.Relaunch("--apply-setup \"" + applySetupJson + "\"" + ResultArg(resultFile), true); return 0; }
+            if (!Install.IsElevated()) { Install.Relaunch("--apply-setup \"" + applySetupJson + "\"" + LiveArg(liveFile), true); return 0; }
             AppSettings.Mode = Install.DetectMode();
-            return ApplySetup(applySetupJson, resultFile);
+            return ApplySetup(applySetupJson, liveFile);
         }
 
         AppMode mode = Install.DetectMode();
@@ -165,28 +165,40 @@ class SebWpf
         return 0;
     }
 
-    static string ResultArg(string resultFile)
+    static string LiveArg(string liveFile)
     {
-        return resultFile != null ? (" --result \"" + resultFile + "\"") : "";
+        return liveFile != null ? (" --live \"" + liveFile + "\"") : "";
     }
 
-    // Run one engine mode and write "exit=N" plus its output to the result file the UI
-    // polls across the UAC boundary. Returns the engine exit code.
-    static int RunEngineHeadless(string engineArgs, string resultFile)
+    // Run one engine mode, streaming each output line to the live file (append + flush)
+    // so the UI can tail it in real time, then a final "[EXIT] N" sentinel that tells the
+    // tailer the job is done and carries the exit code. Returns the engine exit code.
+    static int RunEngineHeadless(string engineArgs, string liveFile)
     {
-        System.Text.StringBuilder all = new System.Text.StringBuilder();
         int code = 9;
-        try { code = Engine.Run(engineArgs, delegate(string line) { all.AppendLine(line); }); }
-        catch (Exception ex) { all.AppendLine("[ERROR] " + ex.Message); }
-        WriteResult(resultFile, code, all.ToString());
+        using (System.IO.TextWriter w = OpenLive(liveFile))
+        {
+            try { code = Engine.Run(engineArgs, delegate(string line) { WriteLive(w, line); }); }
+            catch (Exception ex) { WriteLive(w, "[ERROR] " + ex.Message); }
+            WriteLive(w, "[EXIT] " + code);
+        }
         return code;
     }
 
-    static void WriteResult(string resultFile, int code, string output)
+    static System.IO.TextWriter OpenLive(string liveFile)
     {
-        if (resultFile == null) { return; }
-        try { File.WriteAllText(resultFile, "exit=" + code + "\n" + output); } catch { }
+        if (liveFile == null) { return System.IO.TextWriter.Null; }
+        try
+        {
+            System.IO.StreamWriter w = new System.IO.StreamWriter(
+                new System.IO.FileStream(liveFile, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite));
+            w.AutoFlush = true;
+            return w;
+        }
+        catch { return System.IO.TextWriter.Null; }
     }
+
+    static void WriteLive(System.IO.TextWriter w, string line) { try { w.WriteLine(line); } catch { } }
 
     static System.Collections.Generic.Dictionary<string, object> ReadJson(string path)
     {
@@ -215,31 +227,33 @@ class SebWpf
     // then -Reschedule to register the SYSTEM task from the new config. -Reschedule
     // creates the task if none exists and re-registers it if one does, so this same path
     // serves both a first setup and a later reconfigure. Both stream into one result file.
-    static int ApplySetup(string jsonPath, string resultFile)
+    static int ApplySetup(string jsonPath, string liveFile)
     {
         System.Collections.Generic.Dictionary<string, object> d = ReadJson(jsonPath);
-        if (d == null) { WriteResult(resultFile, 9, "[ERROR] could not read the setup settings"); return 9; }
-        string setup = "-Setup -UseWindowsAuth";
-        if (d.ContainsKey("Instance") && Str(d["Instance"]).Length > 0) { setup += " -Instance \"" + Str(d["Instance"]) + "\""; }
-        if (d.ContainsKey("SharePath")) { setup += " -SharePath \"" + Str(d["SharePath"]) + "\""; }
-        if (d.ContainsKey("StagingPath") && Str(d["StagingPath"]).Length > 0) { setup += " -StagingPath \"" + Str(d["StagingPath"]) + "\""; }
-        if (d.ContainsKey("IntervalHours")) { setup += " -IntervalHours " + ToInt(d["IntervalHours"]); }
-        if (d.ContainsKey("HourlyKeep")) { setup += " -HourlyKeep " + ToInt(d["HourlyKeep"]); }
-        if (d.ContainsKey("DailyKeepDays")) { setup += " -DailyKeepDays " + ToInt(d["DailyKeepDays"]); }
-
-        System.Text.StringBuilder all = new System.Text.StringBuilder();
-        all.AppendLine("== configuring ==");
-        int code = 9;
-        try { code = Engine.Run(setup, delegate(string line) { all.AppendLine(line); }); }
-        catch (Exception ex) { all.AppendLine("[ERROR] " + ex.Message); }
-        if (code == 0)
+        using (System.IO.TextWriter w = OpenLive(liveFile))
         {
-            all.AppendLine("== scheduling ==");
-            try { code = Engine.Run("-Reschedule", delegate(string line) { all.AppendLine(line); }); }
-            catch (Exception ex) { all.AppendLine("[ERROR] " + ex.Message); }
+            if (d == null) { WriteLive(w, "[ERROR] could not read the setup settings"); WriteLive(w, "[EXIT] 9"); return 9; }
+            string setup = "-Setup -UseWindowsAuth";
+            if (d.ContainsKey("Instance") && Str(d["Instance"]).Length > 0) { setup += " -Instance \"" + Str(d["Instance"]) + "\""; }
+            if (d.ContainsKey("SharePath")) { setup += " -SharePath \"" + Str(d["SharePath"]) + "\""; }
+            if (d.ContainsKey("StagingPath") && Str(d["StagingPath"]).Length > 0) { setup += " -StagingPath \"" + Str(d["StagingPath"]) + "\""; }
+            if (d.ContainsKey("IntervalHours")) { setup += " -IntervalHours " + ToInt(d["IntervalHours"]); }
+            if (d.ContainsKey("HourlyKeep")) { setup += " -HourlyKeep " + ToInt(d["HourlyKeep"]); }
+            if (d.ContainsKey("DailyKeepDays")) { setup += " -DailyKeepDays " + ToInt(d["DailyKeepDays"]); }
+
+            WriteLive(w, "== configuring ==");
+            int code = 9;
+            try { code = Engine.Run(setup, delegate(string line) { WriteLive(w, line); }); }
+            catch (Exception ex) { WriteLive(w, "[ERROR] " + ex.Message); }
+            if (code == 0)
+            {
+                WriteLive(w, "== scheduling ==");
+                try { code = Engine.Run("-Reschedule", delegate(string line) { WriteLive(w, line); }); }
+                catch (Exception ex) { WriteLive(w, "[ERROR] " + ex.Message); }
+            }
+            WriteLive(w, "[EXIT] " + code);
+            return code;
         }
-        WriteResult(resultFile, code, all.ToString());
-        return code;
     }
 
     static int ToInt(object o) { try { return Convert.ToInt32(o); } catch { return 0; } }

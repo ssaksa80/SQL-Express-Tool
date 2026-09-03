@@ -90,16 +90,18 @@ class SetupWizard
         applyBtn.IsHitTestVisible = false; applyBtn.Opacity = 0.5;
         log.Visibility = Visibility.Visible;
         log.SetTitle("Working");
-        log.SetLines(new string[] { "Approve the Windows elevation prompt to configure and schedule…" });
+        log.Clear();
+        log.Append("Approve the Windows elevation prompt to configure and schedule…");
 
-        Elevate.Run("--apply-setup \"" + tmp + "\"", 180, delegate(bool ok, string output)
-        {
-            try { File.Delete(tmp); } catch { }
-            log.SetTitle(ok ? "Setup complete" : "Setup failed");
-            log.SetLines(SplitLines(output));
-            applyBtn.IsHitTestVisible = true; applyBtn.Opacity = 1.0;
-            if (ok && onDone != null) { onDone(); }
-        });
+        Elevate.Run("--apply-setup \"" + tmp + "\"", 180,
+            delegate(string line) { log.Append(line); },
+            delegate(bool ok, string output)
+            {
+                try { File.Delete(tmp); } catch { }
+                log.SetTitle(ok ? "Setup complete" : "Setup failed");
+                applyBtn.IsHitTestVisible = true; applyBtn.Opacity = 1.0;
+                if (ok && onDone != null) { onDone(); }
+            });
     }
 
     TextBox Field(StackPanel sp, string label, string value, string hint)
