@@ -191,6 +191,68 @@ static class Engine
         catch (Exception ex) { error = ex.Message; return false; }
     }
 
+    // The engine's log directory: %ProgramData%\SqlExpressBackup\logs, holding one
+    // backup-YYYYMM.log per month (line format: "yyyy-MM-dd HH:mm:ss [LEVEL] message").
+    public static string LogDir()
+    {
+        return Path.Combine(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "SqlExpressBackup"), "logs");
+    }
+
+    // Recent engine log lines, newest last. When dbFilter is set, only lines mentioning
+    // that database are returned - but if that yields nothing, the recent tail is
+    // returned instead, so a click on a set always shows something rather than a blank
+    // pane. Reads the two newest monthly files so a set from last month is still covered,
+    // and shares the file with the writer (the scheduled task may hold it open).
+    public static List<string> ReadLog(string dbFilter, int maxLines)
+    {
+        List<string> lines = new List<string>();
+        try
+        {
+            string dir = LogDir();
+            if (!Directory.Exists(dir)) { return lines; }
+            string[] files = Directory.GetFiles(dir, "backup-*.log");
+            Array.Sort(files, StringComparer.Ordinal); // yyyyMM names sort oldest->newest
+            int take = files.Length > 2 ? 2 : files.Length;
+            List<string> all = new List<string>();
+            for (int i = files.Length - take; i < files.Length; i++)
+            {
+                foreach (string ln in ReadLinesShared(files[i])) { all.Add(ln); }
+            }
+            List<string> filtered = all;
+            if (!string.IsNullOrEmpty(dbFilter))
+            {
+                List<string> hit = new List<string>();
+                foreach (string ln in all)
+                {
+                    if (ln.IndexOf(dbFilter, StringComparison.OrdinalIgnoreCase) >= 0) { hit.Add(ln); }
+                }
+                if (hit.Count > 0) { filtered = hit; }
+            }
+            int start = filtered.Count - maxLines; if (start < 0) { start = 0; }
+            for (int i = start; i < filtered.Count; i++) { lines.Add(filtered[i]); }
+        }
+        catch { }
+        return lines;
+    }
+
+    static string[] ReadLinesShared(string path)
+    {
+        List<string> ls = new List<string>();
+        try
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (StreamReader sr = new StreamReader(fs))
+            {
+                string line;
+                while ((line = sr.ReadLine()) != null) { ls.Add(line); }
+            }
+        }
+        catch { }
+        return ls.ToArray();
+    }
+
     // Read one string field from a parsed dictionary (helper for callers).
     public static string Field(Dictionary<string, object> d, string k) { return Str(d, k); }
     public static bool FieldBool(Dictionary<string, object> d, string k)

@@ -26,8 +26,9 @@ class RestoreWindow
     StackPanel confirmRow;
     TextBox confirmBox;
     Border startBtn;
-    TextBlock progressText;
-    Border progressFill, progressTrack;
+    GlowBar glow;
+    LogPane log;
+    Border logHost;
 
     Dictionary<string, List<RestoreSet>> byDb = new Dictionary<string, List<RestoreSet>>();
     RestoreSet current;
@@ -53,6 +54,7 @@ class RestoreWindow
     {
         Grid root = new Grid();
         root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // log pane
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // progress
 
         Grid body = new Grid();
@@ -62,9 +64,24 @@ class RestoreWindow
         FrameworkElement d = DetailPane(); Grid.SetColumn(d, 1); body.Children.Add(d);
         root.Children.Add(body);
 
+        logHost = LogHost();
+        logHost.Visibility = Visibility.Collapsed;
+        Grid.SetRow(logHost, 1); root.Children.Add(logHost);
+
         Border prog = ProgressBar();
-        Grid.SetRow(prog, 1); root.Children.Add(prog);
+        Grid.SetRow(prog, 2); root.Children.Add(prog);
         return root;
+    }
+
+    Border LogHost()
+    {
+        Border b = new Border();
+        b.Background = Theme.Surface; b.BorderBrush = Theme.Line; b.BorderThickness = new Thickness(0, 1, 0, 0);
+        b.Padding = new Thickness(14, 10, 14, 10);
+        log = new LogPane("Log", true, delegate { logHost.Visibility = Visibility.Collapsed; });
+        log.Height = 170;
+        b.Child = log;
+        return b;
     }
 
     Border TreePane()
@@ -97,20 +114,10 @@ class RestoreWindow
     {
         Border b = new Border();
         b.Background = Theme.Surface; b.BorderBrush = Theme.Line; b.BorderThickness = new Thickness(0, 1, 0, 0);
-        b.Padding = new Thickness(18, 10, 18, 12);
-        StackPanel sp = new StackPanel();
-        progressText = Ui.Text("Ready", 12, Theme.Ink3);
-        progressText.Margin = new Thickness(0, 0, 0, 7);
-        sp.Children.Add(progressText);
-        progressTrack = new Border();
-        progressTrack.Height = 7; progressTrack.CornerRadius = new CornerRadius(4);
-        progressTrack.Background = Theme.Sunken; progressTrack.BorderBrush = Theme.Line; progressTrack.BorderThickness = new Thickness(1);
-        Grid tg = new Grid(); tg.HorizontalAlignment = HorizontalAlignment.Left;
-        progressFill = new Border(); progressFill.Height = 7; progressFill.CornerRadius = new CornerRadius(4);
-        progressFill.Background = Theme.Ok; progressFill.Width = 0;
-        tg.Children.Add(progressFill); progressTrack.Child = tg;
-        sp.Children.Add(progressTrack);
-        b.Child = sp;
+        b.Padding = new Thickness(16, 10, 16, 12);
+        glow = new GlowBar();
+        glow.Status("Ready");
+        b.Child = glow;
         return b;
     }
 
@@ -118,7 +125,7 @@ class RestoreWindow
 
     void LoadSets()
     {
-        progressText.Text = "Reading backup sets…";
+        glow.Status("Reading backup sets…");
         Thread t = new Thread(delegate ()
         {
             List<RestoreSet> sets = Engine.RestoreList();
@@ -136,7 +143,7 @@ class RestoreWindow
             if (!byDb.ContainsKey(r.Database)) { byDb[r.Database] = new List<RestoreSet>(); order.Add(r.Database); }
             byDb[r.Database].Add(r);
         }
-        progressText.Text = order.Count == 0 ? "No backup sets — run elevated to read a locked share, or open a .bak" : "Ready";
+        glow.Status(order.Count == 0 ? "No backup sets — run elevated to read a locked share, or open a .bak" : "Ready");
         foreach (string db in order)
         {
             tree.Children.Add(DbHeader(db));
@@ -160,15 +167,43 @@ class RestoreWindow
         Border b = new Border();
         b.Padding = new Thickness(24, 5, 8, 5); b.CornerRadius = new CornerRadius(5);
         b.Cursor = System.Windows.Input.Cursors.Hand;
+        Grid g = new Grid();
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         StackPanel sp = new StackPanel();
         sp.Children.Add(Ui.Text(LocalTime(r.TakenUtc), 12, Theme.Ink2));
         TextBlock sub = Ui.Text(r.Kind + " · " + (r.Bytes / 1048576) + " MB", 11, Theme.Ink3);
         sp.Children.Add(sub);
-        b.Child = sp;
+        g.Children.Add(sp);
+        // per-set log affordance; e.Handled stops it also selecting the row
+        TextBlock logHint = Ui.Text("log", 11, Theme.Ink3);
+        logHint.VerticalAlignment = VerticalAlignment.Center;
+        logHint.Margin = new Thickness(6, 0, 4, 0);
+        logHint.ToolTip = "View this database's backup log";
+        Grid.SetColumn(logHint, 1);
+        logHint.MouseEnter += delegate { logHint.Foreground = Theme.Accent; };
+        logHint.MouseLeave += delegate { logHint.Foreground = Theme.Ink3; };
+        logHint.MouseLeftButtonUp += delegate(object s, System.Windows.Input.MouseButtonEventArgs e) { e.Handled = true; ShowSetLog(r.Database); };
+        g.Children.Add(logHint);
+        b.Child = g;
         b.MouseEnter += delegate { if (current != r) b.Background = Theme.Sunken; };
         b.MouseLeave += delegate { if (current != r) b.Background = Brushes.Transparent; };
         b.MouseLeftButtonUp += delegate { Select(r, b); };
         return b;
+    }
+
+    // One click on a set's "log": show that database's recent backup log.
+    void ShowSetLog(string db)
+    {
+        logHost.Visibility = Visibility.Visible;
+        log.SetTitle(db + " — backup log");
+        log.SetLines(new string[] { "Reading " + db + " log…" });
+        Thread t = new Thread(delegate ()
+        {
+            List<string> ls = Engine.ReadLog(db, 400);
+            Dispatch(delegate { log.SetLines(ls); log.SetTitle(db + " — backup log (" + ls.Count + " lines)"); });
+        });
+        t.IsBackground = true; t.Start();
     }
 
     Border selectedRow;
@@ -242,7 +277,21 @@ class RestoreWindow
         startBtn = Ui.PrimaryButton("Start restore", delegate { StartRestore(db); });
         startBtn.Margin = new Thickness(0, 0, 8, 0);
         act.Children.Add(startBtn);
-        act.Children.Add(Ui.GhostButton("Verify media", delegate { VerifyMedia(); }));
+        Border verifyBtn = Ui.GhostButton("Verify media", delegate { VerifyMedia(); });
+        verifyBtn.Margin = new Thickness(0, 0, 8, 0);
+        act.Children.Add(verifyBtn);
+        // Copy the restore sequence as a template a DBA can paste into a ticket or SSMS.
+        string sqlText = "-- Restore template (fill in MOVE for each logical file)\r\n"
+            + "RESTORE DATABASE [" + TargetName(db) + "]\r\n"
+            + "  FROM DISK = '" + current.Path + "'\r\n"
+            + "  WITH MOVE '<logical>' TO '<path>', RECOVERY, CHECKSUM";
+        Border copyBtn = Ui.GhostButton("Copy SQL", delegate
+        {
+            try { Clipboard.SetText(sqlText); glow.Status("Restore SQL copied to clipboard"); } catch { }
+        });
+        copyBtn.Margin = new Thickness(0, 0, 8, 0);
+        act.Children.Add(copyBtn);
+        act.Children.Add(Ui.GhostButton("View log", delegate { ShowSetLog(db); }));
         detail.Children.Add(act);
 
         UpdateStart(db, readable);
@@ -309,11 +358,11 @@ class RestoreWindow
     void VerifyMedia()
     {
         if (current == null || busy) { return; }
-        progressText.Text = "Verifying media…";
+        glow.Status("Verifying media…");
         Thread t = new Thread(delegate ()
         {
             string err; bool ok = Engine.RestoreVerify(current.Path, out err);
-            Dispatch(delegate { progressText.Text = ok ? "Media verified — RESTORE VERIFYONLY passed WITH CHECKSUM" : ("Verify failed: " + err); });
+            Dispatch(delegate { glow.Status(ok ? "Media verified — RESTORE VERIFYONLY passed WITH CHECKSUM" : ("Verify failed: " + err)); });
         });
         t.IsBackground = true; t.Start();
     }
@@ -327,30 +376,33 @@ class RestoreWindow
         if (replaceBox.IsChecked == true) { args += " -RestoreReplace"; }
 
         busy = true; UpdateStart(db, true);
-        progressFill.Width = 0; progressFill.Background = Theme.Ok;
-        progressText.Text = "Restoring " + target + "…";
+        glow.Begin("Restoring " + target);
+        logHost.Visibility = Visibility.Visible;
+        log.SetTitle("Restore — activity");
+        log.Clear();
         Thread t = new Thread(delegate ()
         {
             int total = 1, index = 0; string stage = "starting"; int pct = -1;
             Engine.Run(args, delegate(string line)
             {
-                if (line.StartsWith("[JOB]")) { index = FieldInt(line, "index", index); total = FieldInt(line, "total", total); }
-                else if (line.StartsWith("[STAGE]")) { stage = FieldRest(line, "stage"); }
-                else if (line.StartsWith("[PROGRESS]")) { pct = FieldInt(line, "pct", pct); }
-                else { return; }
+                bool marker = false;
+                if (line.StartsWith("[JOB]")) { index = FieldInt(line, "index", index); total = FieldInt(line, "total", total); marker = true; }
+                else if (line.StartsWith("[STAGE]")) { stage = FieldRest(line, "stage"); marker = true; }
+                else if (line.StartsWith("[PROGRESS]")) { pct = FieldInt(line, "pct", pct); marker = true; }
                 double overall = Overall(index, total, stage, pct);
-                Dispatch(delegate { SetProgress(overall, "Restoring " + target + "  ·  " + stage); });
+                Dispatch(delegate
+                {
+                    if (marker) { glow.Update(overall, "Restoring " + target + "  ·  " + stage); }
+                    if (!line.StartsWith("[PROGRESS]")) { log.Append(line); }
+                });
             });
-            Dispatch(delegate { SetProgress(1.0, "Restore finished — " + target + " (source untouched)"); busy = false; UpdateStart(db, true); });
+            Dispatch(delegate
+            {
+                glow.Finish(true, "Restore finished — " + target + " (source untouched)");
+                busy = false; UpdateStart(db, true);
+            });
         });
         t.IsBackground = true; t.Start();
-    }
-
-    void SetProgress(double frac, string text)
-    {
-        if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-        progressFill.Width = Math.Max(0, (progressTrack.ActualWidth - 2) * frac);
-        progressText.Text = text;
     }
 
     // ---- small builders -----------------------------------------------------------
