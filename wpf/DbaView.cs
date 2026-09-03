@@ -71,7 +71,7 @@ class DbaView
         actions.Children.Add(Ui.GhostButton("View log", delegate { ShowLog(selected); }));
         Grid.SetRow(actions, 2); rg.Children.Add(actions);
 
-        log = new LogPane("Backup log", true, delegate { logHost.Visibility = Visibility.Collapsed; });
+        log = new LogPane("Backup log", true, delegate { logHost.Visibility = Visibility.Collapsed; }, true);
         log.Height = 150;
         logHost = new Border();
         logHost.Margin = new Thickness(0, 12, 0, 0);

@@ -143,7 +143,7 @@ class ModernView
         glow = new GlowBar();
         glow.Margin = new Thickness(0, 0, 0, 10);
         sp.Children.Add(glow);
-        log = new LogPane("Activity log", true, CloseActivity);
+        log = new LogPane("Activity log", true, CloseActivity, true);
         log.MaxHeight = 200;
         sp.Children.Add(log);
         Border wrap = new Border();

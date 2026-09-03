@@ -6,6 +6,11 @@
 //
 // Lines are tinted by level so an [ERROR]/[FAIL] jumps out and the noisy [PROGRESS]/
 // [STAGE]/[JOB] markers recede. Copy puts the whole buffer on the clipboard for a ticket.
+//
+// "Pop out" opens the log in its own standalone window - a real top-level Window with
+// minimize / maximize / resize, for reading a long log full-screen. A popped-out window
+// takes a snapshot of the current lines and then LIVE-MIRRORS any further streamed lines,
+// so popping out mid-backup keeps updating.
 
 using System;
 using System.Collections.Generic;
@@ -20,9 +25,15 @@ class LogPane : Border
     StackPanel lines;
     TextBlock title;
     readonly int max = 800;
+    readonly bool allowPopOut;
+    string lastTitle;
+    List<LogPane> mirrors = new List<LogPane>();
 
-    public LogPane(string heading, bool showClose, Action onClose)
+    public LogPane(string heading, bool showClose, Action onClose, bool allowPopOut)
     {
+        this.allowPopOut = allowPopOut;
+        lastTitle = heading;
+
         Background = Theme.Sunken;
         BorderBrush = Theme.Line;
         BorderThickness = new Thickness(1);
@@ -32,7 +43,7 @@ class LogPane : Border
         g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
 
-        // header: title + copy / clear / (close)
+        // header: title + pop-out / copy / clear / (close)
         Grid head = new Grid();
         head.Margin = new Thickness(12, 9, 10, 8);
         title = Ui.Eyebrow(heading);
@@ -42,6 +53,7 @@ class LogPane : Border
         StackPanel tools = new StackPanel();
         tools.Orientation = Orientation.Horizontal;
         tools.HorizontalAlignment = HorizontalAlignment.Right;
+        if (allowPopOut) { tools.Children.Add(MiniButton("Pop out", delegate { PopOut(); })); }
         tools.Children.Add(MiniButton("Copy", delegate { CopyAll(); }));
         tools.Children.Add(MiniButton("Clear", delegate { Clear(); }));
         if (showClose) { tools.Children.Add(MiniButton("Close", onClose)); }
@@ -76,7 +88,7 @@ class LogPane : Border
         return b;
     }
 
-    public void SetTitle(string t) { title.Text = t.ToUpperInvariant(); }
+    public void SetTitle(string t) { lastTitle = t; title.Text = t.ToUpperInvariant(); }
 
     public void Clear() { lines.Children.Clear(); }
 
@@ -89,11 +101,13 @@ class LogPane : Border
         sv.ScrollToEnd();
     }
 
-    // Append one line (live streaming).
+    // Append one line (live streaming). Forwarded to any popped-out mirror windows so
+    // they keep updating after being popped out mid-run.
     public void Append(string line)
     {
         AddLine(line);
         sv.ScrollToBottom();
+        for (int i = 0; i < mirrors.Count; i++) { mirrors[i].Append(line); }
     }
 
     void AddLine(string line)
@@ -118,14 +132,43 @@ class LogPane : Border
 
     static bool Has(string s, string sub) { return s.IndexOf(sub, StringComparison.OrdinalIgnoreCase) >= 0; }
 
-    void CopyAll()
+    List<string> Snapshot()
     {
-        StringBuilder sb = new StringBuilder();
+        List<string> r = new List<string>();
         foreach (object o in lines.Children)
         {
             TextBlock t = o as TextBlock;
-            if (t != null) { sb.AppendLine(t.Text); }
+            if (t != null) { r.Add(t.Text); }
         }
+        return r;
+    }
+
+    void CopyAll()
+    {
+        StringBuilder sb = new StringBuilder();
+        foreach (string s in Snapshot()) { sb.AppendLine(s); }
         try { Clipboard.SetText(sb.ToString()); } catch { }
+    }
+
+    // Open the log in its own resizable/maximizable/minimizable window. The new window
+    // starts from a snapshot of the current lines and is registered as a live mirror, so
+    // a job still running keeps streaming into it.
+    void PopOut()
+    {
+        List<string> snap = Snapshot();
+        Window w = new Window();
+        w.Title = lastTitle;
+        w.Width = 940; w.Height = 620; w.MinWidth = 480; w.MinHeight = 260;
+        w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        w.Background = Theme.Bg; w.FontFamily = Ui.Face;
+        // default WindowStyle already gives minimize / maximize / resize + a taskbar entry
+        LogPane child = new LogPane(lastTitle, true, delegate { w.Close(); }, false);
+        child.Margin = new Thickness(12);
+        w.Content = child;
+        child.SetLines(snap);
+        mirrors.Add(child);
+        w.Closed += delegate { mirrors.Remove(child); };
+        w.Show();
+        w.Activate();
     }
 }

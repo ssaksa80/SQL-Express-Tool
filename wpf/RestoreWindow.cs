@@ -78,7 +78,7 @@ class RestoreWindow
         Border b = new Border();
         b.Background = Theme.Surface; b.BorderBrush = Theme.Line; b.BorderThickness = new Thickness(0, 1, 0, 0);
         b.Padding = new Thickness(14, 10, 14, 10);
-        log = new LogPane("Log", true, delegate { logHost.Visibility = Visibility.Collapsed; });
+        log = new LogPane("Log", true, delegate { logHost.Visibility = Visibility.Collapsed; }, true);
         log.Height = 170;
         b.Child = log;
         return b;
