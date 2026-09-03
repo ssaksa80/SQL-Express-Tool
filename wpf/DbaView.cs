@@ -21,6 +21,8 @@ class DbaView
     TextBlock gridHeading;
     Dictionary<string, List<RestoreSet>> byDb = new Dictionary<string, List<RestoreSet>>();
     string selected;
+    LogPane log;
+    Border logHost;
 
     public DbaView(Action openRestore) { this.openRestore = openRestore; }
 
@@ -49,9 +51,10 @@ class DbaView
         // right: recovery points
         Grid rg = new Grid();
         rg.Margin = new Thickness(16, 14, 16, 14);
-        rg.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        rg.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        rg.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        rg.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // heading
+        rg.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // grid
+        rg.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // actions
+        rg.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // log pane
         gridHeading = Ui.Text("Select a database", 15, Theme.Ink, FontWeights.SemiBold);
         rg.Children.Add(gridHeading);
         ScrollViewer gsv = new ScrollViewer(); gsv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
@@ -62,8 +65,20 @@ class DbaView
         Border rest = Ui.PrimaryButton("Restore…", delegate { if (openRestore != null) openRestore(); });
         rest.Margin = new Thickness(0, 0, 8, 0);
         actions.Children.Add(rest);
-        actions.Children.Add(Ui.GhostButton("Verify", null));
+        Border verify = Ui.GhostButton("Verify", null);
+        verify.Margin = new Thickness(0, 0, 8, 0);
+        actions.Children.Add(verify);
+        actions.Children.Add(Ui.GhostButton("View log", delegate { ShowLog(selected); }));
         Grid.SetRow(actions, 2); rg.Children.Add(actions);
+
+        log = new LogPane("Backup log", true, delegate { logHost.Visibility = Visibility.Collapsed; });
+        log.Height = 150;
+        logHost = new Border();
+        logHost.Margin = new Thickness(0, 12, 0, 0);
+        logHost.Visibility = Visibility.Collapsed;
+        logHost.Child = log;
+        Grid.SetRow(logHost, 3); rg.Children.Add(logHost);
+
         Grid.SetColumn(rg, 1); root.Children.Add(rg);
 
         Load();
@@ -149,7 +164,7 @@ class DbaView
         Grid outer = new Grid(); outer.Children.Add(wrap); return outer;
     }
 
-    Grid GridRow(RestoreSet r)
+    Border GridRow(RestoreSet r)
     {
         Grid g = Cols();
         g.Margin = new Thickness(4, 6, 4, 6);
@@ -157,7 +172,30 @@ class DbaView
         g.Children.Add(Cell(Ui.Text(r.Kind, 12.5, Theme.Ink2), 1));
         g.Children.Add(Cell(Ui.Text((r.Bytes / 1048576) + " MB", 12.5, Theme.Ink2), 2));
         g.Children.Add(Cell(Ui.Text("✓", 12.5, Theme.Ok, FontWeights.SemiBold), 3));
-        return g;
+        Border b = new Border();
+        b.CornerRadius = new CornerRadius(5); b.Padding = new Thickness(2, 0, 2, 0);
+        b.Cursor = System.Windows.Input.Cursors.Hand;
+        b.ToolTip = "Click to view this database's backup log";
+        b.Child = g;
+        b.MouseEnter += delegate { b.Background = Theme.Sunken; };
+        b.MouseLeave += delegate { b.Background = Brushes.Transparent; };
+        b.MouseLeftButtonUp += delegate { ShowLog(selected); };
+        return b;
+    }
+
+    // One click on a recovery-point row: show the selected database's backup log.
+    void ShowLog(string db)
+    {
+        if (db == null || db.Length == 0) { return; }
+        logHost.Visibility = Visibility.Visible;
+        log.SetTitle(db + " — backup log");
+        log.SetLines(new string[] { "Reading " + db + " log…" });
+        Thread t = new Thread(delegate ()
+        {
+            List<string> ls = Engine.ReadLog(db, 400);
+            Dispatch(delegate { log.SetLines(ls); log.SetTitle(db + " — backup log (" + ls.Count + " lines)"); });
+        });
+        t.IsBackground = true; t.Start();
     }
 
     static Grid Cols()

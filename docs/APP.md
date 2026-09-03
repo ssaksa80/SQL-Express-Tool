@@ -136,6 +136,31 @@ database name to confirm, and the sequence renames rather than drops, so a wrong
 restore costs nothing. The full procedure — including the permission trap that makes a
 good backup look corrupt — is in [RESTORE.md](RESTORE.md).
 
+### Watching a job — progress and logs
+
+Every backup, restore, and self test shows a **glowing progress bar** that fills 0→100%
+with a sheen sweeping the filled portion while the work advances. The readout carries the
+percentage, the elapsed time, and an estimate of the time remaining. The glow is a
+liveness signal, not decoration: if progress stops moving for a few seconds the bar turns
+**amber and the glow freezes**, so a stalled job reads as stalled rather than sitting at a
+falsely reassuring percentage.
+
+Beside the bar is a **live activity log** — the engine's own output, streamed line by line
+as the job runs, so you watch each step (backing up, verifying, copying, pruning) as it
+happens. Lines are tinted by level: errors red, warnings amber, successes green.
+
+The same log is available on **one click**, without waiting for a job. Every database row
+in the Modern view, every backup set in the restore window, and every recovery point in
+the DBA view carries a **log** affordance; clicking it reads that database's recent
+history from the engine's log files (`%ProgramData%\SqlExpressBackup\logs`) and shows it
+in the pane. It reads the log shared, so a scheduled backup writing at that moment does
+not lock you out.
+
+From the restore window you can also **Copy SQL** — the restore sequence as a template to
+paste into a ticket or SSMS — and **Verify media** without starting a restore. The Modern
+view's **Refresh** re-reads status and the catalogue, and its **Activity** item opens the
+full recent log.
+
 ---
 
 ## Settings and persistence
@@ -211,8 +236,9 @@ window, so a broken layout fails a build check rather than an operator's first c
 The application is a front-end. Underneath it is `Invoke-SqlExpressBackup.ps1` — the
 same engine the PowerShell console uses, embedded in the executable and extracted on
 demand. It performs the backups, the retention, the verification, and the restores; the
-application reads its status and drives its modes, relaying the engine's progress
-markers into the progress bar.
+application reads its status and drives its modes, relaying the engine's progress markers
+into the glowing progress bar (which turns amber if a job stalls) and streaming its output
+into the activity log.
 
 This split is deliberate. The engine is tested and mutation-verified; a second
 implementation of the backup or restore logic inside the UI would be two things that
