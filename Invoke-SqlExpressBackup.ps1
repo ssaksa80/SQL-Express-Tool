@@ -73,6 +73,7 @@ param(
   [switch]$Run,
   [switch]$Loop,                  # service mode: keep running, one pass per interval
   [switch]$Status,
+  [switch]$Reschedule,            # change interval/retention in config and re-register the schedule
   [switch]$SelfTest,
   [switch]$RestoreList,
   [string]$RestoreInspect,
@@ -2522,6 +2523,30 @@ try {
     else {
       Install-SebService -ScriptPath $scriptPath -ConfigDirectory $script:SebConfigDir -Hours ([int]$config.IntervalHours) -Nssm (Resolve-SebNssm -Explicit $NssmPath)
     }
+  }
+  elseif ($Reschedule) {
+    # Change the interval and/or retention already configured, then re-register the
+    # schedule so a new interval takes effect. Only the values actually passed are
+    # changed; everything else in config is left as it is. Elevated: it rewrites the
+    # locked config and re-registers a SYSTEM task.
+    Assert-SebElevated -Mode 'Reschedule'
+    $config = Read-SebConfig
+    if ($PSBoundParameters.ContainsKey('IntervalHours')) { $config.IntervalHours = [int]$IntervalHours }
+    if ($PSBoundParameters.ContainsKey('HourlyKeep'))    { $config.HourlyKeep    = [int]$HourlyKeep }
+    if ($PSBoundParameters.ContainsKey('DailyKeepDays')) { $config.DailyKeepDays = [int]$DailyKeepDays }
+    Write-SebConfig -Config $config
+    $schedule = Get-SebScheduleState
+    $scriptPath = Get-SebScriptPath
+    if ($schedule.ServicePresent) {
+      Install-SebService -ScriptPath $scriptPath -ConfigDirectory $script:SebConfigDir -Hours ([int]$config.IntervalHours) -Nssm (Resolve-SebNssm -Explicit $NssmPath)
+    }
+    else {
+      if ($schedule.TaskPresent) {
+        try { Unregister-ScheduledTask -TaskName $script:SebTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+      }
+      Install-SebTask -ScriptPath $scriptPath -ConfigDirectory $script:SebConfigDir -Hours ([int]$config.IntervalHours)
+    }
+    Write-Host (ConvertTo-Json @{ Ok = $true; IntervalHours = [int]$config.IntervalHours; HourlyKeep = [int]$config.HourlyKeep; DailyKeepDays = [int]$config.DailyKeepDays } -Compress)
   }
   elseif ($RestoreList) {
     $config = Read-SebRestoreContext

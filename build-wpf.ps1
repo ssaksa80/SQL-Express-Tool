@@ -33,9 +33,11 @@ $sources = @(
   (Join-Path $here 'wpf\Engine.cs'),
   (Join-Path $here 'wpf\GlowBar.cs'),
   (Join-Path $here 'wpf\LogPane.cs'),
+  (Join-Path $here 'wpf\Elevate.cs'),
   (Join-Path $here 'wpf\ModernView.cs'),
   (Join-Path $here 'wpf\DbaView.cs'),
   (Join-Path $here 'wpf\RestoreWindow.cs'),
+  (Join-Path $here 'wpf\SetupWizard.cs'),
   (Join-Path $here 'wpf\Install.cs'),
   (Join-Path $here 'wpf\FirstRun.cs')
 )

@@ -29,6 +29,10 @@ class SebWpf
         bool selfTestOnLoad = false;
         bool doInstall = false, doUninstall = false, quiet = false;
         string portableTo = null;
+        // headless elevated jobs (spawned by the UI through UAC): each does its work and
+        // writes a "exit=N\n<output>" result file the non-elevated UI polls.
+        bool backupNow = false;
+        string rescheduleJson = null, applySetupJson = null, resultFile = null;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
@@ -38,6 +42,10 @@ class SebWpf
             if (args[i] == "--uninstall") { doUninstall = true; }
             if (args[i] == "--quiet") { quiet = true; }
             if (args[i] == "--portable" && i + 1 < args.Length) { portableTo = args[++i]; }
+            if (args[i] == "--backup-now") { backupNow = true; }
+            if (args[i] == "--reschedule" && i + 1 < args.Length) { rescheduleJson = args[++i]; }
+            if (args[i] == "--apply-setup" && i + 1 < args.Length) { applySetupJson = args[++i]; }
+            if (args[i] == "--result" && i + 1 < args.Length) { resultFile = args[++i]; }
         }
 
         // Silent portable setup: extract to a folder and launch it there. Also the path
@@ -65,8 +73,34 @@ class SebWpf
         if (doUninstall)
         {
             if (!Install.IsElevated()) { Install.Relaunch("--uninstall" + (quiet ? " --quiet" : ""), true); return 0; }
+            // Remove the SYSTEM schedule first so app uninstall does not orphan it. The
+            // engine inherits this process's elevation; config and backups are left alone
+            // (no -Purge) - only the scheduled task/service is removed.
+            try { AppSettings.Mode = Install.DetectMode(); Engine.Run("-Uninstall", null); } catch { }
             Install.DoUninstall();
             return 0;
+        }
+
+        // Headless elevated jobs, spawned by the UI through UAC. Each relaunches elevated
+        // if needed, runs the engine (which inherits this process's elevation), writes a
+        // result file the non-elevated UI polls, and exits without any window.
+        if (backupNow)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--backup-now" + ResultArg(resultFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return RunEngineHeadless("-Run", resultFile);
+        }
+        if (rescheduleJson != null)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--reschedule \"" + rescheduleJson + "\"" + ResultArg(resultFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return RunEngineHeadless(BuildRescheduleArgs(rescheduleJson), resultFile);
+        }
+        if (applySetupJson != null)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--apply-setup \"" + applySetupJson + "\"" + ResultArg(resultFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return ApplySetup(applySetupJson, resultFile);
         }
 
         AppMode mode = Install.DetectMode();
@@ -130,6 +164,86 @@ class SebWpf
         app.Run();
         return 0;
     }
+
+    static string ResultArg(string resultFile)
+    {
+        return resultFile != null ? (" --result \"" + resultFile + "\"") : "";
+    }
+
+    // Run one engine mode and write "exit=N" plus its output to the result file the UI
+    // polls across the UAC boundary. Returns the engine exit code.
+    static int RunEngineHeadless(string engineArgs, string resultFile)
+    {
+        System.Text.StringBuilder all = new System.Text.StringBuilder();
+        int code = 9;
+        try { code = Engine.Run(engineArgs, delegate(string line) { all.AppendLine(line); }); }
+        catch (Exception ex) { all.AppendLine("[ERROR] " + ex.Message); }
+        WriteResult(resultFile, code, all.ToString());
+        return code;
+    }
+
+    static void WriteResult(string resultFile, int code, string output)
+    {
+        if (resultFile == null) { return; }
+        try { File.WriteAllText(resultFile, "exit=" + code + "\n" + output); } catch { }
+    }
+
+    static System.Collections.Generic.Dictionary<string, object> ReadJson(string path)
+    {
+        try
+        {
+            System.Web.Script.Serialization.JavaScriptSerializer js = new System.Web.Script.Serialization.JavaScriptSerializer();
+            return js.Deserialize<System.Collections.Generic.Dictionary<string, object>>(File.ReadAllText(path));
+        }
+        catch { return null; }
+    }
+
+    static string BuildRescheduleArgs(string jsonPath)
+    {
+        System.Collections.Generic.Dictionary<string, object> d = ReadJson(jsonPath);
+        string a = "-Reschedule";
+        if (d != null)
+        {
+            if (d.ContainsKey("IntervalHours")) { a += " -IntervalHours " + ToInt(d["IntervalHours"]); }
+            if (d.ContainsKey("HourlyKeep")) { a += " -HourlyKeep " + ToInt(d["HourlyKeep"]); }
+            if (d.ContainsKey("DailyKeepDays")) { a += " -DailyKeepDays " + ToInt(d["DailyKeepDays"]); }
+        }
+        return a;
+    }
+
+    // Configure and schedule a backup non-interactively: engine -Setup (Windows auth)
+    // then -Reschedule to register the SYSTEM task from the new config. -Reschedule
+    // creates the task if none exists and re-registers it if one does, so this same path
+    // serves both a first setup and a later reconfigure. Both stream into one result file.
+    static int ApplySetup(string jsonPath, string resultFile)
+    {
+        System.Collections.Generic.Dictionary<string, object> d = ReadJson(jsonPath);
+        if (d == null) { WriteResult(resultFile, 9, "[ERROR] could not read the setup settings"); return 9; }
+        string setup = "-Setup -UseWindowsAuth";
+        if (d.ContainsKey("Instance") && Str(d["Instance"]).Length > 0) { setup += " -Instance \"" + Str(d["Instance"]) + "\""; }
+        if (d.ContainsKey("SharePath")) { setup += " -SharePath \"" + Str(d["SharePath"]) + "\""; }
+        if (d.ContainsKey("StagingPath") && Str(d["StagingPath"]).Length > 0) { setup += " -StagingPath \"" + Str(d["StagingPath"]) + "\""; }
+        if (d.ContainsKey("IntervalHours")) { setup += " -IntervalHours " + ToInt(d["IntervalHours"]); }
+        if (d.ContainsKey("HourlyKeep")) { setup += " -HourlyKeep " + ToInt(d["HourlyKeep"]); }
+        if (d.ContainsKey("DailyKeepDays")) { setup += " -DailyKeepDays " + ToInt(d["DailyKeepDays"]); }
+
+        System.Text.StringBuilder all = new System.Text.StringBuilder();
+        all.AppendLine("== configuring ==");
+        int code = 9;
+        try { code = Engine.Run(setup, delegate(string line) { all.AppendLine(line); }); }
+        catch (Exception ex) { all.AppendLine("[ERROR] " + ex.Message); }
+        if (code == 0)
+        {
+            all.AppendLine("== scheduling ==");
+            try { code = Engine.Run("-Reschedule", delegate(string line) { all.AppendLine(line); }); }
+            catch (Exception ex) { all.AppendLine("[ERROR] " + ex.Message); }
+        }
+        WriteResult(resultFile, code, all.ToString());
+        return code;
+    }
+
+    static int ToInt(object o) { try { return Convert.ToInt32(o); } catch { return 0; } }
+    static string Str(object o) { return o == null ? "" : Convert.ToString(o); }
 
     static void LogCrash(string where, Exception ex)
     {

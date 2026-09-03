@@ -23,6 +23,13 @@ class ModernView
     TextBlock lastRunVal, schedVal, dbCountVal, instVal;
     bool busy;
 
+    // schedule-window edit controls (built when the Schedule window is filled)
+    ComboBox schedIntervalBox;
+    TextBox schedHourlyBox, schedDailyBox;
+    TextBlock schedStatus;
+    Border schedApplyBtn;
+    static readonly int[] schedHrs = new int[] { 1, 2, 3, 4, 6, 8, 12, 24 };
+
     public ModernView(Action openRestore) { this.openRestore = openRestore; }
 
     public FrameworkElement Build()
@@ -118,8 +125,10 @@ class ModernView
         self.Margin = new Thickness(0, 0, 9, 0);
         Border rest = Ui.GhostButton("Restore…", delegate { if (openRestore != null) openRestore(); });
         rest.Margin = new Thickness(0, 0, 9, 0);
+        Border setup = Ui.GhostButton("Set up…", OpenSetup);
+        setup.Margin = new Thickness(0, 0, 9, 0);
         Border refresh = Ui.GhostButton("Refresh", delegate { Refresh(); });
-        actions.Children.Add(run); actions.Children.Add(self); actions.Children.Add(rest); actions.Children.Add(refresh);
+        actions.Children.Add(run); actions.Children.Add(self); actions.Children.Add(rest); actions.Children.Add(setup); actions.Children.Add(refresh);
         Grid.SetRow(actions, 3); g.Children.Add(actions);
 
         activityArea = ActivityArea();
@@ -236,11 +245,82 @@ class ModernView
         ScheduleRow(sp, "Instance", st.Instance == "" ? "—" : st.Instance);
         ScheduleRow(sp, "Share", st.SharePath == "" ? "—" : st.SharePath);
 
-        sp.Children.Add(Gap(14));
-        TextBlock note = Ui.Text("The scheduled task runs as SYSTEM every " + st.IntervalHours
-            + " hours. To change the interval, re-run setup and re-install the task.", 12, Theme.Ink3);
-        note.TextWrapping = TextWrapping.Wrap;
-        sp.Children.Add(note);
+        sp.Children.Add(Gap(16));
+        sp.Children.Add(Ui.Text("Change schedule", 13, Theme.Ink, FontWeights.SemiBold));
+        TextBlock hint = Ui.Text("Applies to the SYSTEM scheduled task. Needs administrator.", 11.5, Theme.Ink3);
+        hint.Margin = new Thickness(0, 2, 0, 8); sp.Children.Add(hint);
+
+        sp.Children.Add(ScheduleEditRow("Interval", BuildInterval(st)));
+        sp.Children.Add(ScheduleEditRow("Keep hourly", BuildRetention(out schedHourlyBox)));
+        sp.Children.Add(ScheduleEditRow("Keep daily (days)", BuildRetention(out schedDailyBox)));
+
+        schedApplyBtn = Ui.PrimaryButton("Apply", ApplyReschedule);
+        schedApplyBtn.Margin = new Thickness(0, 12, 0, 0); schedApplyBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        sp.Children.Add(schedApplyBtn);
+        schedStatus = Ui.Text("", 12, Theme.Ink3); schedStatus.TextWrapping = TextWrapping.Wrap; schedStatus.Margin = new Thickness(0, 8, 0, 0);
+        sp.Children.Add(schedStatus);
+    }
+
+    FrameworkElement BuildInterval(BackupStatus st)
+    {
+        schedIntervalBox = new ComboBox(); schedIntervalBox.Width = 150; schedIntervalBox.FontSize = 12.5;
+        schedIntervalBox.HorizontalAlignment = HorizontalAlignment.Left;
+        int sel = 4;
+        for (int k = 0; k < schedHrs.Length; k++)
+        {
+            schedIntervalBox.Items.Add("every " + schedHrs[k] + "h");
+            if (schedHrs[k] == st.IntervalHours) { sel = k; }
+        }
+        schedIntervalBox.SelectedIndex = sel;
+        return schedIntervalBox;
+    }
+    FrameworkElement BuildRetention(out TextBox box)
+    {
+        box = new TextBox(); box.Width = 100; box.FontSize = 12.5; box.FontFamily = Ui.Face;
+        box.HorizontalAlignment = HorizontalAlignment.Left;
+        box.ToolTip = "Leave blank to keep the current value.";
+        return box;
+    }
+    Grid ScheduleEditRow(string label, FrameworkElement input)
+    {
+        Grid g = new Grid(); g.Margin = new Thickness(0, 4, 0, 0);
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(135) });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        TextBlock l = Ui.Text(label, 12.5, Theme.Ink2); l.VerticalAlignment = VerticalAlignment.Center; g.Children.Add(l);
+        Grid.SetColumn(input, 1); g.Children.Add(input);
+        return g;
+    }
+
+    void ApplyReschedule()
+    {
+        int interval = schedHrs[schedIntervalBox.SelectedIndex < 0 ? 4 : schedIntervalBox.SelectedIndex];
+        System.Collections.Generic.Dictionary<string, object> d = new System.Collections.Generic.Dictionary<string, object>();
+        d["IntervalHours"] = interval;
+        int hv; if (int.TryParse(schedHourlyBox.Text.Trim(), out hv) && hv > 0) { d["HourlyKeep"] = hv; }
+        int dv; if (int.TryParse(schedDailyBox.Text.Trim(), out dv) && dv > 0) { d["DailyKeepDays"] = dv; }
+        string json = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(d);
+        string tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "seb-resched-" + Guid.NewGuid().ToString("N") + ".json");
+        try { System.IO.File.WriteAllText(tmp, json); }
+        catch (Exception ex) { schedStatus.Foreground = Theme.Bad; schedStatus.Text = "Could not write: " + ex.Message; return; }
+
+        schedApplyBtn.IsHitTestVisible = false; schedApplyBtn.Opacity = 0.5;
+        schedStatus.Foreground = Theme.Ink3;
+        schedStatus.Text = "Approve the elevation prompt to apply…";
+        Elevate.Run("--reschedule \"" + tmp + "\"", 90, delegate(bool ok, string output)
+        {
+            try { System.IO.File.Delete(tmp); } catch { }
+            schedApplyBtn.IsHitTestVisible = true; schedApplyBtn.Opacity = 1.0;
+            schedStatus.Foreground = ok ? Theme.Ok : Theme.Bad;
+            schedStatus.Text = ok ? ("Schedule updated — every " + interval + " hours.") : ("Failed: " + FirstLine(output));
+            if (ok) { Refresh(); }
+        });
+    }
+
+    static string FirstLine(string s)
+    {
+        if (s == null) { return ""; }
+        s = s.Replace("\r\n", "\n"); int i = s.IndexOf('\n');
+        return i >= 0 ? s.Substring(0, i) : s;
     }
 
     void ScheduleRow(StackPanel sp, string label, string value)
@@ -368,7 +448,34 @@ class ModernView
 
     public void StartSelfTest() { RunMode("-SelfTest", "Self test"); }
     void SelfTest() { RunMode("-SelfTest", "Self test"); }
-    void RunBackup() { RunMode("-Run", "Backup"); }
+
+    void RunBackup()
+    {
+        // A backup pass reads the SYSTEM-only sealed credential, so the engine requires
+        // administrator. When already elevated, stream it live; otherwise run it as an
+        // elevated job and show its output when it returns.
+        if (Install.IsElevated()) { RunMode("-Run", "Backup"); return; }
+        if (busy) { return; }
+        busy = true;
+        activityArea.Visibility = Visibility.Visible;
+        glow.Visibility = Visibility.Collapsed;
+        log.SetTitle("Backup — elevated");
+        log.SetLines(new string[] { "Approve the Windows elevation prompt to run the backup as SYSTEM…" });
+        Elevate.Run("--backup-now", 600, delegate(bool ok, string output)
+        {
+            log.SetTitle(ok ? "Backup finished" : "Backup failed");
+            log.SetLines(SplitLines(output));
+            busy = false; Refresh();
+        });
+    }
+
+    void OpenSetup()
+    {
+        SetupWizard w = new SetupWizard();
+        w.Show(Application.Current != null ? Application.Current.MainWindow : null, delegate { Refresh(); });
+    }
+
+    static string[] SplitLines(string s) { return (s == null ? "" : s).Replace("\r\n", "\n").Split('\n'); }
 
     void RunMode(string args, string label)
     {
