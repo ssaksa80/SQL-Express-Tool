@@ -65,8 +65,9 @@ class DbaView
         Border rest = Ui.PrimaryButton("Restore…", delegate { if (openRestore != null) openRestore(); });
         rest.Margin = new Thickness(0, 0, 8, 0);
         actions.Children.Add(rest);
-        Border verify = Ui.GhostButton("Verify", null);
+        Border verify = Ui.GhostButton("Verify…", delegate { if (openRestore != null) openRestore(); });
         verify.Margin = new Thickness(0, 0, 8, 0);
+        verify.ToolTip = "Opens the restore window, where a set can be verified with a dry run";
         actions.Children.Add(verify);
         actions.Children.Add(Ui.GhostButton("View log", delegate { ShowLog(selected); }));
         Grid.SetRow(actions, 2); rg.Children.Add(actions);

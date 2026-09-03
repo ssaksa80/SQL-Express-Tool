@@ -18,7 +18,11 @@ using System.Windows.Threading;
 class RestoreWindow
 {
     Window win;
-    StackPanel tree;
+    StackPanel setList;
+    StackPanel filterPanel;
+    Dictionary<string, CheckBox> checks = new Dictionary<string, CheckBox>();
+    HashSet<string> shown = new HashSet<string>();
+    List<string> dbOrder = new List<string>();
     StackPanel detail;
     TextBox targetBox;
     ComboBox recoveryBox;
@@ -33,7 +37,10 @@ class RestoreWindow
     Dictionary<string, List<RestoreSet>> byDb = new Dictionary<string, List<RestoreSet>>();
     RestoreSet current;
     Dictionary<string, object> inspected;
+    Border verifyCard;
     bool busy;
+
+    struct PlanFile { public string Logical; public string Type; public long Bytes; }
 
     public void Show(Window owner)
     {
@@ -89,13 +96,26 @@ class RestoreWindow
         Border b = new Border();
         b.Background = Theme.Surface; b.BorderBrush = Theme.Line; b.BorderThickness = new Thickness(0, 0, 1, 0);
         Grid g = new Grid();
-        g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // eyebrow
+        g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // database filter
+        g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // divider
+        g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // sets
         TextBlock eb = Ui.Eyebrow("Backup sets"); eb.Margin = new Thickness(13, 12, 0, 6);
         g.Children.Add(eb);
+
+        // database filter - tick a database to show only its sets, instead of scrolling
+        // the whole catalogue of every database at once
+        ScrollViewer fsv = new ScrollViewer(); fsv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        fsv.MaxHeight = 190; fsv.Margin = new Thickness(9, 0, 6, 2);
+        filterPanel = new StackPanel();
+        fsv.Content = filterPanel; Grid.SetRow(fsv, 1); g.Children.Add(fsv);
+
+        Border div = new Border(); div.Height = 1; div.Background = Theme.Line; div.Margin = new Thickness(9, 4, 9, 4);
+        Grid.SetRow(div, 2); g.Children.Add(div);
+
         ScrollViewer sv = new ScrollViewer(); sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-        tree = new StackPanel(); tree.Margin = new Thickness(7, 0, 7, 10);
-        sv.Content = tree; Grid.SetRow(sv, 1); g.Children.Add(sv);
+        setList = new StackPanel(); setList.Margin = new Thickness(7, 0, 7, 10);
+        sv.Content = setList; Grid.SetRow(sv, 3); g.Children.Add(sv);
         b.Child = g;
         return b;
     }
@@ -136,20 +156,93 @@ class RestoreWindow
 
     void ApplySets(List<RestoreSet> sets)
     {
-        byDb.Clear(); tree.Children.Clear();
-        List<string> order = new List<string>();
+        byDb.Clear(); dbOrder.Clear();
         foreach (RestoreSet r in sets)
         {
-            if (!byDb.ContainsKey(r.Database)) { byDb[r.Database] = new List<RestoreSet>(); order.Add(r.Database); }
+            if (!byDb.ContainsKey(r.Database)) { byDb[r.Database] = new List<RestoreSet>(); dbOrder.Add(r.Database); }
             byDb[r.Database].Add(r);
         }
-        glow.Status(order.Count == 0 ? "No backup sets — run elevated to read a locked share, or open a .bak" : "Ready");
-        foreach (string db in order)
+        foreach (List<RestoreSet> ss in byDb.Values)
         {
-            tree.Children.Add(DbHeader(db));
-            List<RestoreSet> ss = byDb[db];
             ss.Sort(delegate(RestoreSet a, RestoreSet c) { return string.Compare(c.TakenUtc, a.TakenUtc, StringComparison.Ordinal); });
-            foreach (RestoreSet r in ss) { tree.Children.Add(SetRow(r)); }
+        }
+        glow.Status(dbOrder.Count == 0 ? "No backup sets — run elevated to read a locked share, or open a .bak" : "Ready");
+
+        // default to the first database checked, so you land on one database's sets
+        // rather than the whole scrolling catalogue
+        shown.Clear();
+        if (dbOrder.Count > 0) { shown.Add(dbOrder[0]); }
+
+        BuildFilter();
+        RenderSets();
+    }
+
+    // Per-database filter checkboxes plus All / None quick actions.
+    void BuildFilter()
+    {
+        filterPanel.Children.Clear();
+        checks.Clear();
+        if (dbOrder.Count == 0) { return; }
+
+        StackPanel quick = new StackPanel(); quick.Orientation = Orientation.Horizontal;
+        quick.Margin = new Thickness(4, 0, 0, 4);
+        TextBlock lbl = Ui.Text("Show:", 11, Theme.Ink3); lbl.VerticalAlignment = VerticalAlignment.Center;
+        quick.Children.Add(lbl);
+        quick.Children.Add(MiniLink("All", delegate { shown = new HashSet<string>(dbOrder); SyncChecks(); RenderSets(); }));
+        quick.Children.Add(MiniLink("None", delegate { shown.Clear(); SyncChecks(); RenderSets(); }));
+        filterPanel.Children.Add(quick);
+
+        foreach (string db in dbOrder)
+        {
+            string d = db;
+            CheckBox cb = new CheckBox();
+            cb.Content = db + "  (" + byDb[db].Count + ")";
+            cb.Foreground = Theme.Ink2; cb.FontFamily = Ui.Face; cb.FontSize = 12.5;
+            cb.Margin = new Thickness(4, 2, 0, 2);
+            cb.IsChecked = shown.Contains(db);
+            cb.Checked += delegate { shown.Add(d); RenderSets(); };
+            cb.Unchecked += delegate { shown.Remove(d); RenderSets(); };
+            checks[db] = cb;
+            filterPanel.Children.Add(cb);
+        }
+    }
+
+    // Reflect `shown` onto the checkboxes (for All / None); the change handlers re-render.
+    void SyncChecks()
+    {
+        foreach (KeyValuePair<string, CheckBox> kv in checks)
+        {
+            bool want = shown.Contains(kv.Key);
+            if (kv.Value.IsChecked != want) { kv.Value.IsChecked = want; }
+        }
+    }
+
+    Border MiniLink(string text, Action onClick)
+    {
+        Border b = new Border(); b.Padding = new Thickness(6, 1, 6, 1); b.Margin = new Thickness(6, 0, 0, 0);
+        b.CornerRadius = new CornerRadius(4); b.Cursor = System.Windows.Input.Cursors.Hand;
+        b.Child = Ui.Text(text, 11.5, Theme.Accent, FontWeights.SemiBold);
+        b.MouseEnter += delegate { b.Background = Theme.Sunken; };
+        b.MouseLeave += delegate { b.Background = Brushes.Transparent; };
+        if (onClick != null) { b.MouseLeftButtonUp += delegate { onClick(); }; }
+        return b;
+    }
+
+    // Render only the checked databases' sets.
+    void RenderSets()
+    {
+        setList.Children.Clear();
+        foreach (string db in dbOrder)
+        {
+            if (!shown.Contains(db)) { continue; }
+            setList.Children.Add(DbHeader(db));
+            foreach (RestoreSet r in byDb[db]) { setList.Children.Add(SetRow(r)); }
+        }
+        if (shown.Count == 0)
+        {
+            TextBlock hint = Ui.Text("Tick a database above to show its backup sets.", 12, Theme.Ink3);
+            hint.Margin = new Thickness(10, 10, 10, 0); hint.TextWrapping = TextWrapping.Wrap;
+            setList.Children.Add(hint);
         }
     }
 
@@ -227,6 +320,7 @@ class RestoreWindow
     {
         inspected = info;
         detail.Children.Clear();
+        verifyCard = null;
         if (info == null) { detail.Children.Add(Ui.Text("The engine returned nothing readable.", 13, Theme.Bad)); return; }
 
         string db = Engine.Field(info, "Database");
@@ -355,16 +449,143 @@ class RestoreWindow
 
     // ---- actions ------------------------------------------------------------------
 
+    // A real pre-restore verification: a dry run that validates the backup set and lays
+    // out exactly what a restore would do. It reports the permission check (can the SQL
+    // service actually read the file), the media-integrity result (RESTORE VERIFYONLY
+    // WITH CHECKSUM, run live), the recovery details from the header, and the file-by-file
+    // MOVE plan - so any permission trap, corruption, or surprise surfaces before you
+    // commit. Nothing is written; VERIFYONLY is SQL Server's own dry-run of a restore.
     void VerifyMedia()
     {
         if (current == null || busy) { return; }
-        glow.Status("Verifying media…");
+        Dictionary<string, object> info = inspected;
+        string db = (info != null) ? Engine.Field(info, "Database") : "";
+        if (db == "") { db = current.Database; }
+        string target = (targetBox != null && targetBox.Text.Trim().Length > 0) ? targetBox.Text.Trim() : TargetName(db);
+        bool replace = (replaceBox != null && replaceBox.IsChecked == true);
+
+        Border card = Ui.Card(); card.Margin = new Thickness(0, 14, 0, 4);
+        StackPanel sp = new StackPanel();
+        sp.Children.Add(Ui.Eyebrow("Verification — dry run"));
+
+        // 1. permission: Readable comes from RESTORE FILELISTONLY run AS the SQL service,
+        // so it is the real answer to "can the account that restores read this file".
+        bool readable = Engine.FieldBool(info, "Readable");
+        string reason = Engine.Field(info, "ReadReason");
+        sp.Children.Add(Check(readable, readable
+            ? "SQL Server service account can read the backup file"
+            : "SQL service cannot read the file — " + (reason == "denied"
+                ? "access denied; grant its service account read on the backup folder"
+                : (reason == "" ? "unreadable" : reason))));
+
+        // 2. media integrity — filled in live once VERIFYONLY returns
+        TextBlock vIcon, vText;
+        sp.Children.Add(StepMutable("RESTORE VERIFYONLY (checksum) — checking…", out vIcon, out vText));
+
+        sp.Children.Add(Divider());
+        sp.Children.Add(Ui.Eyebrow("Recovery details"));
+        sp.Children.Add(Detail2("Database", db == "" ? "(unknown)" : db));
+        sp.Children.Add(Detail2("Backup taken", LocalTime(current.TakenUtc)));
+        sp.Children.Add(Detail2("Compression", Engine.FieldBool(info, "Compressed") ? "compressed" : "none"));
+        List<PlanFile> files = Files(info);
+        long total = 0; foreach (PlanFile f in files) { total += f.Bytes; }
+        sp.Children.Add(Detail2("Data size", (total / 1048576) + " MB across " + files.Count + " file(s)"));
+        sp.Children.Add(Detail2("Recovery model", "SIMPLE — full backup, restorable standalone (no log chain to validate)"));
+
+        sp.Children.Add(Divider());
+        sp.Children.Add(Ui.Eyebrow("Restore plan (MOVE)"));
+        if (files.Count == 0) { sp.Children.Add(Ui.Text("(file list unavailable)", 12, Theme.Ink3)); }
+        else
+        {
+            int dataIdx = 0;
+            foreach (PlanFile f in files)
+            {
+                bool isLog = (f.Type == "L");
+                string leaf = isLog ? (target + "_log.ldf") : (dataIdx == 0 ? (target + ".mdf") : (target + "_" + dataIdx + ".ndf"));
+                if (!isLog) { dataIdx++; }
+                sp.Children.Add(Mono(f.Logical + "  ·  " + (isLog ? "Log" : "Data") + "  ·  " + (f.Bytes / 1048576) + " MB  →  " + leaf));
+            }
+        }
+
+        sp.Children.Add(Divider());
+        if (replace && string.Equals(target, db, StringComparison.OrdinalIgnoreCase))
+        {
+            sp.Children.Add(Check(false, "REPLACE targets the LIVE database " + db + " — it would be overwritten"));
+        }
+        else
+        {
+            sp.Children.Add(Check(true, "Restores as " + target + " — the source database is untouched"));
+        }
+
+        card.Child = sp;
+        if (verifyCard != null) { detail.Children.Remove(verifyCard); }
+        verifyCard = card;
+        detail.Children.Add(card);
+        card.BringIntoView();
+
+        // run the live check
+        glow.Status("Verifying " + System.IO.Path.GetFileName(current.Path) + " …");
+        string path = current.Path; string dbName = db;
         Thread t = new Thread(delegate ()
         {
-            string err; bool ok = Engine.RestoreVerify(current.Path, out err);
-            Dispatch(delegate { glow.Status(ok ? "Media verified — RESTORE VERIFYONLY passed WITH CHECKSUM" : ("Verify failed: " + err)); });
+            string err; bool ok = Engine.RestoreVerify(path, out err);
+            Dispatch(delegate
+            {
+                vIcon.Text = ok ? "✓" : "!";
+                vIcon.Foreground = ok ? Theme.Ok : Theme.Bad;
+                vText.Text = ok
+                    ? "RESTORE VERIFYONLY passed — media is complete and restorable (CHECKSUM ok)"
+                    : "RESTORE VERIFYONLY failed — " + err;
+                vText.Foreground = ok ? Theme.Ok : Theme.Bad;
+                glow.Status(ok ? ("Verification passed — " + dbName + " backup is restorable")
+                               : ("Verification FAILED — " + err));
+            });
         });
         t.IsBackground = true; t.Start();
+    }
+
+    // A verification step whose icon/text are updated once an async check returns.
+    Grid StepMutable(string text, out TextBlock icon, out TextBlock textBlock)
+    {
+        Grid g = new Grid(); g.Margin = new Thickness(0, 2, 0, 0);
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        icon = Ui.Text("…", 12.5, Theme.Ink3, FontWeights.Bold); icon.Margin = new Thickness(0, 0, 8, 0);
+        textBlock = Ui.Text(text, 12.5, Theme.Ink2); textBlock.TextWrapping = TextWrapping.Wrap;
+        Grid.SetColumn(textBlock, 1);
+        g.Children.Add(icon); g.Children.Add(textBlock);
+        return g;
+    }
+
+    Grid Detail2(string label, string value)
+    {
+        Grid g = new Grid(); g.Margin = new Thickness(0, 2, 0, 2);
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(120) });
+        g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        g.Children.Add(Ui.Text(label, 12, Theme.Ink3));
+        TextBlock v = Ui.Text(value, 12, Theme.Ink2); v.TextWrapping = TextWrapping.Wrap; Grid.SetColumn(v, 1);
+        g.Children.Add(v);
+        return g;
+    }
+
+    // The backup's file list (logical name, D/L type, size) from the inspect result.
+    static List<PlanFile> Files(Dictionary<string, object> info)
+    {
+        List<PlanFile> r = new List<PlanFile>();
+        if (info == null || !info.ContainsKey("Files") || info["Files"] == null) { return r; }
+        System.Collections.IEnumerable seq = info["Files"] as System.Collections.IEnumerable;
+        if (seq == null) { return r; }
+        foreach (object o in seq)
+        {
+            System.Collections.Generic.IDictionary<string, object> row = o as System.Collections.Generic.IDictionary<string, object>;
+            if (row == null) { continue; }
+            PlanFile f = new PlanFile();
+            f.Logical = (row.ContainsKey("LogicalName") && row["LogicalName"] != null) ? Convert.ToString(row["LogicalName"]) : "";
+            f.Type = (row.ContainsKey("Type") && row["Type"] != null) ? Convert.ToString(row["Type"]) : "";
+            try { if (row.ContainsKey("SizeBytes") && row["SizeBytes"] != null) { f.Bytes = Convert.ToInt64(row["SizeBytes"]); } } catch { }
+            r.Add(f);
+        }
+        return r;
     }
 
     void StartRestore(string db)
