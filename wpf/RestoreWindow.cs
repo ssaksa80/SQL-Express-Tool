@@ -27,6 +27,8 @@ class RestoreWindow
     TextBox targetBox;
     ComboBox recoveryBox;
     CheckBox replaceBox;
+    TextBox dataDirBox, logDirBox;
+    CheckBox closeConnBox, restrictedBox;
     StackPanel confirmRow;
     TextBox confirmBox;
     Border startBtn;
@@ -345,6 +347,12 @@ class RestoreWindow
         detail.Children.Add(Ui.Eyebrow("Restore options"));
         detail.Children.Add(Margin(OptionRow("Restore as", TargetInput(db)), 0, 8, 0, 8));
         detail.Children.Add(OptionRow("Recovery state", RecoveryInput()));
+        detail.Children.Add(Margin(OptionRow("Data files to", DataDirInput()), 0, 8, 0, 0));
+        detail.Children.Add(Margin(OptionRow("Log files to", LogDirInput()), 0, 8, 0, 0));
+        closeConnBox = OptionCheck("Close active connections first (SET SINGLE_USER — needed to REPLACE a live database)");
+        detail.Children.Add(Margin(closeConnBox, 0, 10, 0, 0));
+        restrictedBox = OptionCheck("Bring back as RESTRICTED_USER (owners / dbcreator / sysadmin only)");
+        detail.Children.Add(Margin(restrictedBox, 0, 6, 0, 0));
         replaceBox = new CheckBox();
         replaceBox.Content = "Overwrite the existing database  (REPLACE)";
         replaceBox.Foreground = Theme.Ink2; replaceBox.FontFamily = Ui.Face; replaceBox.FontSize = 12.5;
@@ -409,6 +417,26 @@ class RestoreWindow
         recoveryBox.Items.Add("RECOVERY"); recoveryBox.Items.Add("NORECOVERY"); recoveryBox.Items.Add("STANDBY");
         recoveryBox.SelectedIndex = 0;
         return recoveryBox;
+    }
+    FrameworkElement DataDirInput()
+    {
+        dataDirBox = new TextBox(); dataDirBox.Width = 320; dataDirBox.FontSize = 12.5; dataDirBox.FontFamily = Ui.Face;
+        dataDirBox.HorizontalAlignment = HorizontalAlignment.Left;
+        dataDirBox.ToolTip = "Folder for the restored .mdf/.ndf files. Blank = the instance default data path.";
+        return dataDirBox;
+    }
+    FrameworkElement LogDirInput()
+    {
+        logDirBox = new TextBox(); logDirBox.Width = 320; logDirBox.FontSize = 12.5; logDirBox.FontFamily = Ui.Face;
+        logDirBox.HorizontalAlignment = HorizontalAlignment.Left;
+        logDirBox.ToolTip = "Folder for the restored .ldf log file. Blank = the same folder as the data files.";
+        return logDirBox;
+    }
+    CheckBox OptionCheck(string text)
+    {
+        CheckBox c = new CheckBox(); c.Content = text;
+        c.Foreground = Theme.Ink2; c.FontFamily = Ui.Face; c.FontSize = 12.5;
+        return c;
     }
     static string TargetName(string db) { return (db == "" ? "Restored" : db) + "_Restore"; }
 
@@ -595,6 +623,10 @@ class RestoreWindow
         string recovery = recoveryBox.SelectedItem == null ? "RECOVERY" : recoveryBox.SelectedItem.ToString();
         string args = "-RestoreRun -RestoreFrom \"" + current.Path + "\" -RestoreAs \"" + target + "\" -RestoreRecoveryState " + recovery;
         if (replaceBox.IsChecked == true) { args += " -RestoreReplace"; }
+        if (dataDirBox != null && dataDirBox.Text.Trim().Length > 0) { args += " -RestoreDataDir \"" + dataDirBox.Text.Trim() + "\""; }
+        if (logDirBox != null && logDirBox.Text.Trim().Length > 0) { args += " -RestoreLogDir \"" + logDirBox.Text.Trim() + "\""; }
+        if (closeConnBox != null && closeConnBox.IsChecked == true) { args += " -RestoreCloseConnections"; }
+        if (restrictedBox != null && restrictedBox.IsChecked == true) { args += " -RestoreRestrictedUser"; }
 
         busy = true; UpdateStart(db, true);
         glow.Begin("Restoring " + target);

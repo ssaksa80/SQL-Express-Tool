@@ -2223,12 +2223,16 @@ function Get-SebRestoreInspect {
   return $result
 }
 
-# The MOVE clauses. Two folders is the common case - all data files to one, the log
-# to another - which is how NetWorker frames it and is markedly better than editing
-# one row per file. Per-file override sits on top of that, not instead of it.
-function Get-SebRestoreMoveClauses {
+# The physical target paths a restore would write, one per file in Files order: the
+# .mdf / .ndf / .ldf leaves under the chosen data and log directories. Both the MOVE
+# clauses and the pre-restore clobber check derive from THIS single source, so the
+# clobber check tests the exact paths the restore will write. It used to re-parse the
+# path back out of the generated 'MOVE x TO ''path''' T-SQL, which mangled any path
+# containing a quote (the doubled '' survived) or the literal ' TO ' (split wrongly) -
+# so the check could look at the wrong file and let RESTORE overwrite a real database.
+function Get-SebRestoreTargets {
   param($Files, [string]$TargetName, [string]$DataDir, [string]$LogDir)
-  $moves = @()
+  $targets = @()
   $dataIndex = 0
   foreach ($f in @($Files)) {
     $isLog = ([string]$f.Type -eq 'L')
@@ -2243,7 +2247,22 @@ function Get-SebRestoreMoveClauses {
     # and the machine building the statement is not necessarily the one that will run
     # it. Restoring to another instance is a first-class case; failing because the
     # console cannot see the target's drive letters would be absurd.
-    $moves += ('MOVE {0} TO {1}' -f (Get-SebSqlLiteral ([string]$f.LogicalName)), (Get-SebSqlLiteral ([System.IO.Path]::Combine($dir, $leaf))))
+    $targets += [System.IO.Path]::Combine($dir, $leaf)
+  }
+  return $targets
+}
+
+# The MOVE clauses. Two folders is the common case - all data files to one, the log
+# to another - which is how NetWorker frames it and is markedly better than editing
+# one row per file. Per-file override sits on top of that, not instead of it.
+function Get-SebRestoreMoveClauses {
+  param($Files, [string]$TargetName, [string]$DataDir, [string]$LogDir)
+  $targets = @(Get-SebRestoreTargets -Files $Files -TargetName $TargetName -DataDir $DataDir -LogDir $LogDir)
+  $moves = @()
+  $i = 0
+  foreach ($f in @($Files)) {
+    $moves += ('MOVE {0} TO {1}' -f (Get-SebSqlLiteral ([string]$f.LogicalName)), (Get-SebSqlLiteral ([string]$targets[$i])))
+    $i++
   }
   return $moves
 }
@@ -2551,15 +2570,19 @@ try {
       $dataDir = $RestoreDataDir
       if ([string]::IsNullOrWhiteSpace($dataDir)) {
         $rows = Invoke-SebSqlTable -Connection $connection -Sql "SELECT CAST(SERVERPROPERTY('InstanceDefaultDataPath') AS nvarchar(400)) AS p"
+        if (@($rows).Count -eq 0 -or [string]::IsNullOrWhiteSpace([string](Get-SebValue $rows[0].p))) {
+          throw 'could not determine the instance default data path; pass -RestoreDataDir <folder> explicitly'
+        }
         $dataDir = [string](Get-SebValue $rows[0].p)
       }
       $logDir = $RestoreLogDir
       if ([string]::IsNullOrWhiteSpace($logDir)) { $logDir = $dataDir }
 
       # Refuse to clobber a file already on disk. RESTORE overwrites without asking,
-      # and the file it overwrites may belong to a database nobody mentioned here.
-      foreach ($clause in (Get-SebRestoreMoveClauses -Files $info.Files -TargetName $RestoreAs -DataDir $dataDir -LogDir $logDir)) {
-        $target = ($clause -split ' TO ')[1].Trim().Trim("'")
+      # and the file it overwrites may belong to a database nobody mentioned here. The
+      # paths come straight from Get-SebRestoreTargets - the same source the MOVE clauses
+      # use - so the check tests the exact files the restore will write.
+      foreach ($target in @(Get-SebRestoreTargets -Files $info.Files -TargetName $RestoreAs -DataDir $dataDir -LogDir $logDir)) {
         if ((Test-Path -LiteralPath $target) -and -not $RestoreReplace) {
           throw ('{0} already exists. Restoring would overwrite a file that may belong to another database. Choose a different name, or move that file first.' -f $target)
         }

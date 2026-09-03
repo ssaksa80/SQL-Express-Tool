@@ -223,10 +223,16 @@ static class Engine
             List<string> filtered = all;
             if (!string.IsNullOrEmpty(dbFilter))
             {
+                // Word-boundary match, not a raw substring: filtering "APPDB" must not also
+                // pull in "APPDB_Restore" lines. \b treats the underscore as a word character,
+                // so the boundary falls only at real edges (space, backslash, end).
+                System.Text.RegularExpressions.Regex rx = new System.Text.RegularExpressions.Regex(
+                    "\\b" + System.Text.RegularExpressions.Regex.Escape(dbFilter) + "\\b",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
                 List<string> hit = new List<string>();
                 foreach (string ln in all)
                 {
-                    if (ln.IndexOf(dbFilter, StringComparison.OrdinalIgnoreCase) >= 0) { hit.Add(ln); }
+                    if (rx.IsMatch(ln)) { hit.Add(ln); }
                 }
                 if (hit.Count > 0) { filtered = hit; }
             }
