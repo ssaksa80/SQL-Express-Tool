@@ -158,6 +158,10 @@ history from the engine's log files (`%ProgramData%\SqlExpressBackup\logs`) and 
 in the pane. It reads the log shared, so a scheduled backup writing at that moment does
 not lock you out.
 
+Any log pane can be **popped out** into its own resizable window — minimize, maximize,
+free resize — for reading a long log full-screen; a pane popped out mid-job keeps
+streaming new lines into it.
+
 From the restore window you can also **Copy SQL** — the restore sequence as a template to
 paste into a ticket or SSMS — and **Verify media** without starting a restore. The Modern
 view's **Refresh** re-reads status and the catalogue, and its **Activity** item opens the
