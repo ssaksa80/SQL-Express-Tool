@@ -2446,7 +2446,7 @@ function Get-SebHeaderFactsFromRow {
 # FirstLSN/LastLSN/DatabaseBackupLSN/CheckpointLSN/BackupFinishDate row per backup set.
 function Get-SebRestoreHeaderFacts {
   param($Connection, [string]$File, [string]$Kind)
-  $rows = @(Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE HEADERONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $File)))
+  $rows = Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE HEADERONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $File))
   if ($rows.Count -eq 0) { return $null }
   return Get-SebHeaderFactsFromRow -Row $rows[0] -File $File -Kind $Kind
 }

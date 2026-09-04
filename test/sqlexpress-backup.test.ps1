@@ -1087,4 +1087,24 @@ Assert ($null -eq (Get-SebHeaderFactsFromRow -Row $null -File 'Z.bak' -Kind 'ful
 Assert ((Get-Command Get-SebRestoreHeaderFacts -ErrorAction SilentlyContinue) -ne $null) 'Get-SebRestoreHeaderFacts is defined'
 Assert ((Get-Command Get-SebPointCatalogue -ErrorAction SilentlyContinue) -ne $null) 'Get-SebPointCatalogue is defined'
 
+# Get-SebRestoreHeaderFacts must honour Invoke-SebSqlTable's unary-comma contract
+# (rows returned AS ONE object). A double-@() wrap made 0 rows look like 1 and N rows
+# crash the cast; shadow the SQL call to prove 0/1/N are handled. Restore it after.
+$realInvoke = ${function:Invoke-SebSqlTable}
+try {
+  function Invoke-SebSqlTable { param($Connection, [string]$Sql, [int]$TimeoutSec = 60) return , @($script:SebFakeRows) }
+  $script:SebFakeRows = @()
+  Assert ($null -eq (Get-SebRestoreHeaderFacts -Connection 'x' -File 'e.bak' -Kind 'full')) 'zero header rows yields null (the double-wrap had made it look like one row)'
+  $script:SebFakeRows = @([pscustomobject]@{ FirstLSN=[decimal]1; LastLSN=[decimal]2; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]3; BackupFinishDate=[datetime]'2026-09-04 08:00:00' })
+  $one = Get-SebRestoreHeaderFacts -Connection 'x' -File 'e.bak' -Kind 'full'
+  Assert ($one.CheckpointLSN -eq 3 -and $one.File -eq 'e.bak' -and $one.Kind -eq 'full') 'one header row maps to facts'
+  $script:SebFakeRows = @(
+    [pscustomobject]@{ FirstLSN=[decimal]1; LastLSN=[decimal]2; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]3; BackupFinishDate=[datetime]'2026-09-04 08:00:00' },
+    [pscustomobject]@{ FirstLSN=[decimal]9; LastLSN=[decimal]9; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]9; BackupFinishDate=[datetime]'2026-09-04 09:00:00' }
+  )
+  $multi = Get-SebRestoreHeaderFacts -Connection 'x' -File 'e.bak' -Kind 'full'
+  Assert ($multi.CheckpointLSN -eq 3) 'multiple header rows use the first backup set without a cast crash'
+}
+finally { ${function:Invoke-SebSqlTable} = $realInvoke }
+
 Write-Host 'ALL PASS'
