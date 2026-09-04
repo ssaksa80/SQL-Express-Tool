@@ -2424,6 +2424,50 @@ function Get-SebRestoreSql {
     (Get-SebQuotedName $TargetName), (Get-SebSqlLiteral $Path), ($with -join ', '))
 }
 
+# Pure. Map one RESTORE HEADERONLY row to a catalogue fact. Every field goes through
+# Get-SebValue so a NULL column arrives as $null (not DBNull, which [decimal] throws on).
+# CheckpointLSN is what a differential's DatabaseBackupLSN points at, so the restore
+# planner needs it to match a diff to its base full.
+function Get-SebHeaderFactsFromRow {
+  param($Row, [string]$File, [string]$Kind)
+  if ($null -eq $Row) { return $null }
+  return [pscustomobject]@{
+    Kind = $Kind
+    File = $File
+    FirstLSN = [decimal](Get-SebValue $Row.FirstLSN)
+    LastLSN = [decimal](Get-SebValue $Row.LastLSN)
+    DatabaseBackupLSN = [decimal](Get-SebValue $Row.DatabaseBackupLSN)
+    CheckpointLSN = [decimal](Get-SebValue $Row.CheckpointLSN)
+    Finish = [datetime](Get-SebValue $Row.BackupFinishDate)
+  }
+}
+
+# Impure. Read one backup file's header and map it. RESTORE HEADERONLY returns a
+# FirstLSN/LastLSN/DatabaseBackupLSN/CheckpointLSN/BackupFinishDate row per backup set.
+function Get-SebRestoreHeaderFacts {
+  param($Connection, [string]$File, [string]$Kind)
+  $rows = @(Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE HEADERONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $File)))
+  if ($rows.Count -eq 0) { return $null }
+  return Get-SebHeaderFactsFromRow -Row $rows[0] -File $File -Kind $Kind
+}
+
+# Impure. Enumerate a database's backup folders on the share and read each file's header
+# into a catalogue for Get-SebRestorePlan. Fulls live in hourly/ and daily/, diffs in
+# diff/, logs in log/.
+function Get-SebPointCatalogue {
+  param($Connection, [string]$Root, [string]$HostName, [string]$InstanceLabel, [string]$Database)
+  $cat = New-Object System.Collections.ArrayList
+  $map = @{ hourly = 'full'; daily = 'full'; diff = 'diff'; log = 'log' }
+  foreach ($folderKind in $map.Keys) {
+    $dir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database -Kind $folderKind
+    foreach ($fact in @(Get-SebFolderFacts -Directory $dir)) {
+      $h = Get-SebRestoreHeaderFacts -Connection $Connection -File $fact.FullName -Kind $map[$folderKind]
+      if ($null -ne $h) { [void]$cat.Add($h) }
+    }
+  }
+  return @($cat.ToArray())
+}
+
 # Pure. Given a catalogue for ONE database and a target time, return the ordered
 # restore steps (full -> optional diff -> contiguous logs, last one STOPAT+RECOVERY),
 # or an { Error } describing why the target is not recoverable. LSNs are decimals.

@@ -1069,4 +1069,22 @@ $catGap = @(
 $pg = Get-SebRestorePlan -Catalogue $catGap -StopAt ($b.AddHours(5))
 Assert ($pg.Error -match 'gap|chain') 'a break in the LSN chain is reported as a gap'
 
+# ---- C2. header facts map DBNull-safely and carry CheckpointLSN ----------------------
+$fakeRow = [pscustomobject]@{ FirstLSN = [decimal]1000; LastLSN = [decimal]1200; DatabaseBackupLSN = [decimal]0; CheckpointLSN = [decimal]1100; BackupFinishDate = [datetime]'2026-09-04 08:00:00' }
+$hf = Get-SebHeaderFactsFromRow -Row $fakeRow -File 'X.bak' -Kind 'full'
+Assert ($hf.Kind -eq 'full' -and $hf.File -eq 'X.bak') 'header facts carry the kind and file'
+Assert ($hf.FirstLSN -eq 1000 -and $hf.LastLSN -eq 1200) 'first/last LSN are mapped as decimals'
+Assert ($hf.CheckpointLSN -eq 1100 -and $hf.CheckpointLSN -ne $hf.FirstLSN) 'CheckpointLSN is mapped and is distinct from FirstLSN (the field a diff matches on)'
+Assert ($hf.Finish -eq ([datetime]'2026-09-04 08:00:00')) 'the backup finish time is mapped'
+
+# A NULL header column arrives as DBNull; it must map to 0, not throw a cast error
+# (the suite header warns: NULL from SQL is DBNull, and [decimal]DBNull throws).
+$nullRow = [pscustomobject]@{ FirstLSN = [System.DBNull]::Value; LastLSN = [decimal]5; DatabaseBackupLSN = [decimal]0; CheckpointLSN = [decimal]0; BackupFinishDate = [datetime]'2026-09-04 09:00:00' }
+$hn = Get-SebHeaderFactsFromRow -Row $nullRow -File 'Y.trn' -Kind 'log'
+Assert ($hn.FirstLSN -eq 0) 'a DBNull LSN maps to 0, not a thrown cast'
+Assert ($null -eq (Get-SebHeaderFactsFromRow -Row $null -File 'Z.bak' -Kind 'full')) 'a null row yields null facts'
+
+Assert ((Get-Command Get-SebRestoreHeaderFacts -ErrorAction SilentlyContinue) -ne $null) 'Get-SebRestoreHeaderFacts is defined'
+Assert ((Get-Command Get-SebPointCatalogue -ErrorAction SilentlyContinue) -ne $null) 'Get-SebPointCatalogue is defined'
+
 Write-Host 'ALL PASS'
