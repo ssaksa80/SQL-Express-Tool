@@ -973,4 +973,40 @@ Assert ($threw -and $pc.Added -eq 1 -and $pc.Removed -eq 1) "the seam unsubscrib
 
 $script:SebCompression = $savedCompression
 
+# ---- B1. chain-safe retention never strands a needed segment ------------------------
+function New-Seg([string]$n, [datetime]$t, [decimal]$first, [decimal]$last) {
+  return [pscustomobject]@{ Name = $n; Timestamp = $t; FirstLSN = $first; LastLSN = $last }
+}
+$nowB = [datetime]'2026-09-04 12:00:00'
+# One full today + three logs after it. Horizon 7 days keeps everything.
+$fullsB = @( (New-Seg 'F-today' $nowB 1000 1000) )
+$logsB  = @(
+  (New-Seg 'L1' $nowB.AddMinutes(15) 1000 1100),
+  (New-Seg 'L2' $nowB.AddMinutes(30) 1100 1200),
+  (New-Seg 'L3' $nowB.AddMinutes(45) 1200 1300)
+)
+$planB = Get-SebChainRetentionPlan -Fulls $fullsB -Diffs @() -Logs $logsB -Now $nowB -DailyKeepDays 7
+Assert ($planB.FullDelete.Count -eq 0 -and $planB.LogDelete.Count -eq 0) 'a single in-horizon chain prunes nothing'
+
+# Add an OLD full (10 days) with its own two logs, all before the retained full's LSN.
+$fullsB2 = $fullsB + @( (New-Seg 'F-old' $nowB.AddDays(-10) 10 10) )
+$logsB2  = $logsB + @(
+  (New-Seg 'Lold1' $nowB.AddDays(-10).AddMinutes(15) 10 20),
+  (New-Seg 'Lold2' $nowB.AddDays(-10).AddMinutes(30) 20 30)
+)
+$planB2 = Get-SebChainRetentionPlan -Fulls $fullsB2 -Diffs @() -Logs $logsB2 -Now $nowB -DailyKeepDays 7
+Assert ($planB2.FullDelete -contains 'F-old') 'the out-of-horizon full is pruned (positive control: pruning does happen)'
+Assert ($planB2.LogDelete -contains 'Lold1' -and $planB2.LogDelete -contains 'Lold2') 'logs belonging only to the pruned full are pruned'
+Assert ($planB2.FullDelete -notcontains 'F-today') 'the retained full is never pruned'
+Assert ($planB2.LogDelete -notcontains 'L2') 'a log needed to roll the retained full forward is never pruned'
+
+# Safety: if the ONLY full is out of horizon, it is still kept - deleting it would
+# leave nothing to restore from.
+$planB3 = Get-SebChainRetentionPlan -Fulls @((New-Seg 'F-lonely' $nowB.AddDays(-30) 5 5)) -Diffs @() -Logs @() -Now $nowB -DailyKeepDays 7
+Assert ($planB3.FullDelete.Count -eq 0) 'the last surviving full is kept even past the horizon (never leave zero fulls)'
+
+# Empty inputs are safe.
+$planB4 = Get-SebChainRetentionPlan -Fulls @() -Diffs @() -Logs @() -Now $nowB -DailyKeepDays 7
+Assert ($planB4.FullDelete.Count -eq 0 -and $planB4.DiffDelete.Count -eq 0 -and $planB4.LogDelete.Count -eq 0) 'empty folders prune nothing and do not error'
+
 Write-Host 'ALL PASS'

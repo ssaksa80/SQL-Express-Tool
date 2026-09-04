@@ -315,6 +315,48 @@ function Get-SebRetentionPlan {
   }
 }
 
+# Chain-safe retention for FULL-recovery databases. Keep the oldest full that is still
+# newer than the horizon (that is the base a restore to the oldest recoverable point
+# needs) and every full newer than it; keep every diff/log whose LastLSN reaches into or
+# past that retained full (i.e. still needed to roll it forward). Prune only segments
+# that end strictly before the retained full begins. If every full is already at or
+# before the horizon, keep the single newest one instead - never leave zero fulls. GFS
+# (a later feature) layers extra "keep" rules on top of this floor.
+function Get-SebChainRetentionPlan {
+  param(
+    [object[]]$Fulls = @(),
+    [object[]]$Diffs = @(),
+    [object[]]$Logs = @(),
+    [datetime]$Now,
+    [int]$DailyKeepDays = 7
+  )
+  if ($DailyKeepDays -lt 1) { $DailyKeepDays = 1 }
+  $result = [pscustomobject]@{ FullDelete = @(); DiffDelete = @(); LogDelete = @() }
+  $fullsSorted = @($Fulls | Sort-Object -Property Timestamp)   # oldest first
+  if ($fullsSorted.Count -eq 0) { return $result }
+
+  $horizon = $Now.AddDays(-1 * $DailyKeepDays)
+  # The oldest full we must keep: the OLDEST full that is still newer than the horizon
+  # anchors the window - it is the base a restore to the oldest recoverable point needs,
+  # so it and every full newer than it are kept, and every full older than it is
+  # prunable. If every full is already at or before the horizon, keep the single newest
+  # one instead - never leave zero fulls.
+  $inHorizon = @($fullsSorted | Where-Object { $_.Timestamp -gt $horizon })
+  if ($inHorizon.Count -gt 0) {
+    $anchor = $inHorizon[0]
+  }
+  else {
+    $anchor = $fullsSorted[$fullsSorted.Count - 1]
+  }
+  $anchorLsn = [decimal]$anchor.FirstLSN
+
+  $result.FullDelete = @($fullsSorted | Where-Object { [decimal]$_.FirstLSN -lt $anchorLsn } | ForEach-Object { $_.Name })
+  # A diff/log is prunable only if it ends before the anchor begins.
+  $result.DiffDelete = @($Diffs | Where-Object { [decimal]$_.LastLSN -lt $anchorLsn } | ForEach-Object { $_.Name })
+  $result.LogDelete  = @($Logs  | Where-Object { [decimal]$_.LastLSN -lt $anchorLsn } | ForEach-Object { $_.Name })
+  return $result
+}
+
 # Render a config object for human eyes. Allow-list only; see $SebShowKeys.
 function Format-SebConfigFacts {
   param($Config)
