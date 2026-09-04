@@ -79,7 +79,7 @@ class SebWpf
             if (!Install.IsElevated()) { Install.Relaunch("--uninstall" + (quiet ? " --quiet" : ""), true); return 0; }
             // DoUninstallSteps removes the SYSTEM scheduled task first (no -Purge, so config
             // and backups are kept), then the registry entry, shortcut and program files.
-            if (quiet) { Install.DoUninstallSteps(null); return 0; }   // Add/Remove QuietUninstallString
+            if (quiet) { Install.DoUninstallSteps(null); Install.ScheduleInstallDirRemoval(); return 0; }   // Add/Remove QuietUninstallString
             // Interactive (Add/Remove Programs -> Uninstall): show progress with steps.
             Theme.Load("system");
             Application ua = new Application();

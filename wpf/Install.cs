@@ -242,20 +242,25 @@ static class Install
         onStep(0.45, "Removing the Add / Remove Programs entry…");
         try { Microsoft.Win32.Registry.LocalMachine.DeleteSubKeyTree(UninstallKey, false); } catch { }
 
-        onStep(0.60, "Removing the Start-menu shortcut…");
+        onStep(0.75, "Removing the Start-menu shortcut…");
         try { string lnk = AllUsersStartMenu(); if (File.Exists(lnk)) { File.Delete(lnk); } } catch { }
 
-        onStep(0.80, "Removing the program files…");
+        // NOTE: the program files are NOT removed here. This process is running from the
+        // installed exe and keeps it locked while the progress window is open, so a delete
+        // now would fail. ScheduleInstallDirRemoval() is called instead as the process is
+        // about to exit (window close, or right before return on --quiet).
+        onStep(1.0, "Uninstalled. The program folder is removed as this window closes.");
+    }
+
+    // Schedule removal of the install folder by a detached, retried cmd. The running exe
+    // cannot delete its own folder, so this MUST fire just before the process exits: the
+    // --quiet path calls it right before returning; the progress window calls it as it
+    // closes. Retries clear the brief handle race after the exe is released.
+    public static void ScheduleInstallDirRemoval()
+    {
         string dir = InstallDir();
         try
         {
-            // A detached cmd waits for this process to exit, then removes the folder -
-            // with RETRIES. The first rmdir can clear the contents yet fail to drop the
-            // now-empty directory when a handle to it is briefly still open (the exiting
-            // exe, antivirus, an open Explorer window), leaving an empty shell behind.
-            // Three attempts spaced ~2s apart clear that race. `rmdir /S /Q` on an
-            // already-empty or already-gone dir is harmless, so the extra passes cost
-            // nothing when the first one succeeds.
             string q = "\"" + dir + "\"";
             string wait = "ping 127.0.0.1 -n 3 >nul";
             string rm = "rmdir /S /Q " + q + " 2>nul";
@@ -265,8 +270,6 @@ static class Install
             Process.Start(psi);
         }
         catch { }
-
-        onStep(1.0, "Uninstalled. The program folder finishes removing after this window closes.");
     }
 
     // ---- portable ----------------------------------------------------------------

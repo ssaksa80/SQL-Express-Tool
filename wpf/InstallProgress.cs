@@ -60,6 +60,10 @@ class InstallProgress : Window
 
         Content = g;
         Loaded += delegate { Start(); };
+        // The install folder can only be deleted once this process releases the exe it is
+        // running from - i.e. as this window closes and the process exits. (The silent
+        // --quiet path schedules this itself right before returning.)
+        if (uninstall) { Closed += delegate { try { Install.ScheduleInstallDirRemoval(); } catch { } }; }
     }
 
     void Start()
