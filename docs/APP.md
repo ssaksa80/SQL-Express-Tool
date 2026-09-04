@@ -39,7 +39,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build-wpf.ps1 -SelfSign
 `-SelfSign` creates a self-signed certificate and signs the output. On an estate that
 runs CrowdStrike Falcon this is what lets the binary launch rather than be quarantined
 — measured, not assumed (see [Signing](#signing-and-endpoint-protection)). The result
-is `dist-wpf\SqlExpressBackup.exe`.
+is `dist\SqlExpressBackup.exe`.
 
 ---
 
@@ -266,7 +266,7 @@ embedded as a resource at build time.
 | Switch | Effect |
 |---|---|
 | `-SelfSign` | Create/reuse a self-signed certificate and sign the output. |
-| `-OutDir <dir>` | Write the build somewhere other than `dist-wpf`. |
+| `-OutDir <dir>` | Write the build somewhere other than `dist`. |
 | `-Quiet` | Suppress progress output. |
 
 The `--check` smoke mode constructs every view and the restore window without showing a

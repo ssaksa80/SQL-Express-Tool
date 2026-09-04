@@ -6,7 +6,7 @@
 # blocked (measured: unsigned 0/3, self-signed 3/3). A CA certificate is still the
 # answer for distribution beyond the build host.
 param(
-  [string]$OutDir = 'dist-wpf',
+  [string]$OutDir = 'dist',
   [switch]$SelfSign,
   [switch]$Quiet
 )
