@@ -1379,35 +1379,72 @@ function Get-SebBackupKindDue {
 # The -BackupLog task: one transaction-log backup of every FULL-recovery user database,
 # staged locally then copied to the share's log/ folder. If a database has no base yet
 # (SEB_LOG_NO_BASE), anchor it with a full first, then retry the log.
+#
+# One database's failure does not abort the rest of the pass (mirrors Invoke-SebPass's
+# per-database isolation via $succeeded/$failed), and a failed database's staged file is
+# left in place rather than deleted - this pass gets no drain-and-retry of its own (that
+# is tracked separately), so removing it on failure would make the loss silent instead
+# of just loud. Only the success path cleans up the files it already copied and verified.
 function Invoke-SebBackupLogPass {
-  param($Connection, [string]$Root, [string]$HostName, [string]$InstanceLabel, [string]$StagingPath)
+  param(
+    $Connection,
+    [string]$Root,
+    [string]$HostName,
+    [string]$InstanceLabel,
+    [string]$StagingPath,
+    [string]$OnlyDatabase = '',
+    [switch]$NoHash
+  )
   $rows = Invoke-SebSqlTable -Connection $Connection -Sql @'
 SELECT d.name, d.state, d.source_database_id, d.is_in_standby
 FROM sys.databases AS d
 '@
-  foreach ($db in @(Select-SebDatabase -Rows $rows)) {
-    $modelRows = Invoke-SebSqlTable -Connection $Connection -Sql (Get-SebRecoveryModelSql -Database $db)
-    if ((Get-SebRecoveryModelFromRows -Rows $modelRows) -ne 'FULL') { continue }
-    $stamp = Get-Date
-    $logName = Get-SebFileName -Database $db -Stamp $stamp -Extension 'trn'
-    $logStaged = Join-Path $StagingPath $logName
-    try { Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged }
-    catch {
-      if ("$_" -notmatch 'SEB_LOG_NO_BASE') { throw }
-      Write-SebLog ('anchoring {0} with a full before its first log backup' -f $db) 'INFO'
-      $anchorName = Get-SebFileName -Database $db -Stamp $stamp
-      $anchorStaged = Join-Path $StagingPath $anchorName
-      Invoke-SebBackupDatabase -Connection $Connection -Database $db -TargetFile $anchorStaged -Kind 'full'
-      $anchorDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'hourly') $anchorName
-      Copy-SebVerified -Source $anchorStaged -Destination $anchorDest
-      Remove-Item -LiteralPath $anchorStaged -Force -ErrorAction SilentlyContinue
-      Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged
-    }
-    $logDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'log') $logName
-    Copy-SebVerified -Source $logStaged -Destination $logDest
-    Remove-Item -LiteralPath $logStaged -Force -ErrorAction SilentlyContinue
-    Write-SebLog ('log backup of {0} taken and copied' -f $db) 'INFO'
+  $databases = @(Select-SebDatabase -Rows $rows)
+  if (-not [string]::IsNullOrWhiteSpace($OnlyDatabase)) {
+    $databases = @($databases | Where-Object { $_ -eq $OnlyDatabase })
+    if ($databases.Count -eq 0) { throw ("database '$OnlyDatabase' is not on this instance, or is not eligible for backup") }
   }
+
+  $succeeded = 0
+  $failed = 0
+  foreach ($db in $databases) {
+    try {
+      $modelRows = Invoke-SebSqlTable -Connection $Connection -Sql (Get-SebRecoveryModelSql -Database $db)
+      # Get-SebRecoveryModelFromRows defaults an unreadable/offline database to 'FULL' -
+      # correct for Set-SebRecoveryFull (nothing to change if we cannot see it), wrong
+      # here: it would send an unreadable database into a doomed backup attempt instead
+      # of just skipping it. Read the raw value and require a confirmed FULL.
+      $raw = if (@($modelRows).Count -gt 0) { Get-SebValue $modelRows[0].m } else { $null }
+      if ($null -eq $raw -or [string]$raw -ne 'FULL') { continue }
+
+      $stamp = Get-Date
+      $logName = Get-SebFileName -Database $db -Stamp $stamp -Extension 'trn'
+      $logStaged = Join-Path $StagingPath $logName
+      try { Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged }
+      catch {
+        if ("$_" -notmatch 'SEB_LOG_NO_BASE') { throw }
+        Write-SebLog ('anchoring {0} with a full before its first log backup' -f $db) 'INFO'
+        $anchorName = Get-SebFileName -Database $db -Stamp $stamp
+        $anchorStaged = Join-Path $StagingPath $anchorName
+        Invoke-SebBackupDatabase -Connection $Connection -Database $db -TargetFile $anchorStaged -Kind 'full'
+        Test-SebBackupFile -Connection $Connection -TargetFile $anchorStaged
+        $anchorDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'hourly') $anchorName
+        Copy-SebVerified -Source $anchorStaged -Destination $anchorDest -NoHash:$NoHash
+        Remove-Item -LiteralPath $anchorStaged -Force -ErrorAction SilentlyContinue
+        Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged
+      }
+      $logDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'log') $logName
+      Copy-SebVerified -Source $logStaged -Destination $logDest -NoHash:$NoHash
+      Remove-Item -LiteralPath $logStaged -Force -ErrorAction SilentlyContinue
+      Write-SebLog ('log backup of {0} taken and copied' -f $db) 'INFO'
+      $succeeded++
+    }
+    catch {
+      $failed++
+      Write-SebLog ('{0} FAILED: {1}' -f $db, $_.Exception.Message) 'ERROR'
+    }
+  }
+  return [pscustomobject]@{ Succeeded = $succeeded; Failed = $failed }
 }
 
 function Invoke-SebPass {
@@ -3126,9 +3163,20 @@ try {
   elseif ($BackupLog) {
     # Mirrors -Run/Invoke-SebPass's own setup/teardown: same elevation gate (this reads
     # the same locked config, and the SQL-auth branch reads the sealed credential too),
-    # same Windows-vs-SQL-auth connection pattern, same dispose-in-finally shape.
+    # same shared mutex (the anchor path writes a .bak into the same hourly/ folder
+    # -Run uses, so the two passes must not run at once - one stands down instead), same
+    # Windows-vs-SQL-auth connection pattern, same dispose-in-finally shape.
     Assert-SebElevated -Mode 'BackupLog'
     $config = Read-SebConfig
+    $mutex = Get-SebMutex
+    if ($null -eq $mutex) {
+      Write-SebLog 'another backup pass is already running - this one is standing down' 'WARN'
+      exit 0
+    }
+    $only = ''
+    if ($config.PSObject.Properties['OnlyDatabase']) { $only = [string]$config.OnlyDatabase }
+    $noHash = [bool]$config.NoHashVerify
+
     $password = $null
     $connection = $null
     try {
@@ -3146,8 +3194,18 @@ try {
       }
       Write-SebLog ('connected to {0}' -f $config.DataSource)
 
-      Invoke-SebBackupLogPass -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath
-      Write-Host (ConvertTo-Json @{ Ok = $true; Mode = 'BackupLog' } -Compress)
+      $result = Invoke-SebBackupLogPass -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME `
+        -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath -OnlyDatabase $only -NoHash:$noHash
+      Write-SebLog ('log pass finished: {0} succeeded, {1} failed' -f $result.Succeeded, $result.Failed)
+
+      # Mirror -Run/Invoke-SebPass's ok/partial/failed -> exit-code mapping: nothing
+      # succeeded although something was attempted is a total failure (2); some failed
+      # alongside a success is partial (1); zero failures - including "nothing was FULL
+      # recovery this cycle" - is ok (0, the $exitCode default).
+      $ok = ($result.Failed -eq 0)
+      Write-Host (ConvertTo-Json @{ Ok = $ok; Mode = 'BackupLog'; Succeeded = $result.Succeeded; Failed = $result.Failed } -Compress)
+      if ($result.Succeeded -eq 0 -and $result.Failed -gt 0) { $exitCode = 2 }
+      elseif ($result.Failed -gt 0) { $exitCode = 1 }
     }
     finally {
       if ($null -ne $connection) { $connection.Dispose() }
@@ -3180,7 +3238,7 @@ catch {
   # guessing which of staging, the share, the config folder or the key file was
   # refused - they are four different problems with four different fixes.
   $failedMode = 'Run'
-  foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest')) {
+  foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest', 'BackupLog')) {
     $v = Get-Variable -Name $m -ValueOnly -ErrorAction SilentlyContinue
     if ($v) { $failedMode = $m; break }
   }

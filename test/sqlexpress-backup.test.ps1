@@ -1145,4 +1145,11 @@ Assert ((Get-SebBackupKindDue -HoursSinceFull ([double]::PositiveInfinity) -Full
 Assert ((Get-SebBackupKindDue -HoursSinceFull 24 -FullEveryHours 24) -eq 'full') 'exactly at the interval -> a full is due'
 Assert ((Get-Command Invoke-SebBackupLogPass -ErrorAction SilentlyContinue) -ne $null) 'Invoke-SebBackupLogPass is defined'
 
+# ---- D1a code-review fixes: -BackupLog honours the same knobs -Run does -------------
+# A live SQL seam for this pass is tracked separately, so these stay structural: they
+# guard the parameter surface the dispatch now depends on, without driving the pass.
+$logPassParams = (Get-Command Invoke-SebBackupLogPass).Parameters
+Assert ($logPassParams.ContainsKey('OnlyDatabase')) 'Invoke-SebBackupLogPass accepts -OnlyDatabase, mirroring Invoke-SebPass'
+Assert ($logPassParams.ContainsKey('NoHash')) 'Invoke-SebBackupLogPass accepts -NoHash, mirroring Copy-SebVerified callers'
+
 Write-Host 'ALL PASS'
