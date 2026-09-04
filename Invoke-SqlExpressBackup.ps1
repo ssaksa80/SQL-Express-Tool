@@ -1368,6 +1368,17 @@ function Get-SebMutex {
   return $null
 }
 
+# How many hours old the newest full backup in a folder's facts is, as of Now. Infinity
+# when there is no full yet, so Get-SebBackupKindDue always reads that as "a full is due."
+# Only .bak entries count - a .dif or .trn sitting in the same folder facts is not a base.
+function Get-SebHoursSinceNewestFull {
+  param([object[]]$Facts = @(), [datetime]$Now)
+  $fulls = @($Facts | Where-Object { $_.Name -like '*.bak' })
+  if ($fulls.Count -eq 0) { return [double]::PositiveInfinity }
+  $newest = @($fulls | Sort-Object Timestamp)[-1]
+  return ($Now - $newest.Timestamp).TotalHours
+}
+
 # Which kind of backup a data pass should take: a full when the newest full is at least
 # FullEveryHours old (or none exists), otherwise a differential off that full.
 function Get-SebBackupKindDue {
@@ -1575,25 +1586,21 @@ GROUP BY database_id
     $dbIndex = 0
     foreach ($database in $databases) {
       $dbIndex++
-      $kind = 'full'
-      if ($isFullMode) {
-        $justSwitched = Set-SebRecoveryFull -Connection $connection -Database $database
-        $fullDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
-        $existingFulls = @(Get-SebFolderFacts -Directory $fullDir | Where-Object { $_.Name -like '*.bak' })
-        $hoursSinceFull = [double]::PositiveInfinity
-        if ($existingFulls.Count -gt 0) {
-          $newestFull = @($existingFulls | Sort-Object Timestamp)[-1]
-          $hoursSinceFull = ((Get-Date) - $newestFull.Timestamp).TotalHours
-        }
-        $kind = Get-SebBackupKindDue -HoursSinceFull $hoursSinceFull -FullEveryHours $fullEveryHours
-        # A database only just switched to FULL has no base for a differential yet - anchor with a full.
-        if ($justSwitched) { $kind = 'full' }
-      }
-      $ext = 'bak'
-      if ($kind -eq 'diff') { $ext = 'dif' }
-      $fileName = Get-SebFileName -Database $database -Stamp $stamp -Extension $ext
-      $staged = Join-Path $staging $fileName
+      $staged = $null
       try {
+        $kind = 'full'
+        if ($isFullMode) {
+          $justSwitched = Set-SebRecoveryFull -Connection $connection -Database $database
+          $fullDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
+          $hoursSinceFull = Get-SebHoursSinceNewestFull -Facts @(Get-SebFolderFacts -Directory $fullDir) -Now $stamp
+          $kind = Get-SebBackupKindDue -HoursSinceFull $hoursSinceFull -FullEveryHours $fullEveryHours
+          # A database only just switched to FULL has no base for a differential yet - anchor with a full.
+          if ($justSwitched) { $kind = 'full' }
+        }
+        $ext = 'bak'
+        if ($kind -eq 'diff') { $ext = 'dif' }
+        $fileName = Get-SebFileName -Database $database -Stamp $stamp -Extension $ext
+        $staged = Join-Path $staging $fileName
         Write-SebJob -Index $dbIndex -Total $databases.Count -Database $database
         Write-SebLog ('backing up {0}' -f $database)
         Write-SebStage -Database $database -Stage 'backup'
@@ -1615,7 +1622,12 @@ GROUP BY database_id
           try {
             Copy-SebVerified -Source $staged -Destination $dest -NoHash:$noHash
             Write-SebLog ('copied to {0}' -f $dest)
-            Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            if (Test-SebStagedStillNeeded -Staged $staged -Pending @($pendingList.ToArray())) {
+              Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $staged)
+            }
+            else {
+              Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            }
           }
           catch {
             Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
@@ -1668,7 +1680,7 @@ GROUP BY database_id
       catch {
         $failed++
         Write-SebLog ('{0} FAILED: {1}' -f $database, $_.Exception.Message) 'ERROR'
-        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        if ($staged) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
       }
     }
 

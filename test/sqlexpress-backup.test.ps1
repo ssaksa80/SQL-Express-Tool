@@ -1172,4 +1172,15 @@ $d1bStamp = [datetime]'2026-09-04 12:00:00'
 Assert ((Get-SebFileName -Database 'APPDB' -Stamp $d1bStamp) -eq (Get-SebFileName -Database 'APPDB' -Stamp $d1bStamp -Extension 'bak')) `
   'RecoveryMode=Simple computes the same file name as today (no-Extension == -Extension bak)'
 
+# Get-SebHoursSinceNewestFull: the age rule the per-database loop now calls instead of
+# inlining, so it can be pinned without a SQL connection.
+$nowHS = [datetime]'2026-09-05 12:00:00'
+Assert ((Get-SebHoursSinceNewestFull -Facts @() -Now $nowHS) -eq [double]::PositiveInfinity) 'no fulls -> infinite age (forces a full)'
+$hsFacts = @(
+  [pscustomobject]@{ Name='X_20260905-000000.bak'; Timestamp=[datetime]'2026-09-05 00:00:00' },
+  [pscustomobject]@{ Name='X_20260905-060000.bak'; Timestamp=[datetime]'2026-09-05 06:00:00' },
+  [pscustomobject]@{ Name='X_20260905-030000.trn'; Timestamp=[datetime]'2026-09-05 03:00:00' }
+)
+Assert ((Get-SebHoursSinceNewestFull -Facts $hsFacts -Now $nowHS) -eq 6) 'age is from the newest .bak (6h), ignoring .trn'
+
 Write-Host 'ALL PASS'
