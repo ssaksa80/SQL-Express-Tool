@@ -68,7 +68,7 @@ class ModernView
         sp.Children.Add(brand);
 
         sp.Children.Add(Ui.NavItem("", "Overview", true, null));
-        sp.Children.Add(Ui.NavItem("", "Databases", false, null));
+        sp.Children.Add(Ui.NavItem("", "Databases", false, ShowDatabases));
         sp.Children.Add(Ui.NavItem("", "Restore", false, openRestore));
         sp.Children.Add(Ui.NavItem("", "Schedule", false, ShowSchedule));
         sp.Children.Add(Ui.NavItem("", "Activity", false, ShowFullLog));
@@ -363,6 +363,69 @@ class ModernView
             return d.ToLocalTime().ToString("d MMM HH:mm", CultureInfo.CurrentCulture);
         }
         return utc;
+    }
+
+    // The Databases nav item: a window listing each protected database with its recovery
+    // points, latest backup and total size. Reads the same catalogue the Overview list uses.
+    void ShowDatabases()
+    {
+        Window w = new Window();
+        w.Title = "Databases";
+        w.Width = 560; w.Height = 520; w.MinWidth = 420; w.MinHeight = 300;
+        w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        w.Background = Theme.Bg; w.FontFamily = Ui.Face;
+        ScrollViewer sv = new ScrollViewer(); sv.Padding = new Thickness(20, 18, 20, 18);
+        StackPanel sp = new StackPanel();
+        sp.Children.Add(Ui.Text("Reading databases…", 13, Theme.Ink3));
+        sv.Content = sp; w.Content = sv;
+        w.Show(); w.Activate();
+        Thread t = new Thread(delegate ()
+        {
+            List<RestoreSet> sets = Engine.RestoreList();
+            Dispatch(delegate { FillDatabases(sp, sets); });
+        });
+        t.IsBackground = true; t.Start();
+    }
+
+    void FillDatabases(StackPanel sp, List<RestoreSet> sets)
+    {
+        sp.Children.Clear();
+        sp.Children.Add(Ui.Text("Databases", 18, Theme.Ink, FontWeights.SemiBold));
+        sp.Children.Add(Gap(10));
+
+        Dictionary<string, List<RestoreSet>> byDb = new Dictionary<string, List<RestoreSet>>();
+        List<string> order = new List<string>();
+        foreach (RestoreSet r in sets)
+        {
+            if (!byDb.ContainsKey(r.Database)) { byDb[r.Database] = new List<RestoreSet>(); order.Add(r.Database); }
+            byDb[r.Database].Add(r);
+        }
+        if (order.Count == 0)
+        {
+            TextBlock none = Ui.Text("No databases visible. Run a backup, or start elevated to read a locked share.", 12.5, Theme.Ink3);
+            none.TextWrapping = TextWrapping.Wrap; sp.Children.Add(none);
+            return;
+        }
+        sp.Children.Add(Ui.Text(order.Count + " database" + (order.Count == 1 ? "" : "s") + " protected", 12, Theme.Ink3));
+        sp.Children.Add(Gap(8));
+        foreach (string db in order)
+        {
+            List<RestoreSet> ss = byDb[db];
+            string latest = ""; long total = 0;
+            foreach (RestoreSet r in ss)
+            {
+                total += r.Bytes;
+                if (string.Compare(r.TakenUtc, latest, StringComparison.Ordinal) > 0) { latest = r.TakenUtc; }
+            }
+            Border card = Ui.Card(); card.Margin = new Thickness(0, 0, 0, 8); card.Padding = new Thickness(14, 11, 14, 11);
+            StackPanel cs = new StackPanel();
+            cs.Children.Add(Ui.Text(db, 14, Theme.Ink, FontWeights.SemiBold));
+            TextBlock meta = Ui.Text(ss.Count + " recovery point" + (ss.Count == 1 ? "" : "s")
+                + "   ·   latest " + LocalTime(latest) + "   ·   " + (total / 1048576) + " MB total", 12, Theme.Ink3);
+            meta.Margin = new Thickness(0, 3, 0, 0); meta.TextWrapping = TextWrapping.Wrap;
+            cs.Children.Add(meta);
+            card.Child = cs; sp.Children.Add(card);
+        }
     }
 
     // ---- data ---------------------------------------------------------------------
