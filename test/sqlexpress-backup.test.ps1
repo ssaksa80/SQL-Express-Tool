@@ -847,4 +847,9 @@ $q = Get-SebBackupSql -Kind 'full' -Database "we'ird" -TargetFile "D:\a'b.bak" -
 Assert ($q -match "\[we'ird\]") 'the database name is bracket-quoted'
 Assert ($q -match "D:\\a''b\.bak") 'the target path is SQL-literal-escaped (single quote doubled)'
 
+Assert (Test-SebLogNeedsBase -Numbers @(4214)) 'error 4214 means the log chain has no base yet'
+Assert (Test-SebLogNeedsBase -Numbers @(3013,4214)) 'a 4214 among other numbers is still detected'
+Assert (-not (Test-SebLogNeedsBase -Numbers @(3201))) 'an unrelated SQL error is not a missing-base signal'
+Assert (-not (Test-SebLogNeedsBase -Numbers @())) 'no error numbers is not a missing-base signal'
+
 Write-Host 'ALL PASS'

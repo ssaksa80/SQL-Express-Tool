@@ -1049,6 +1049,13 @@ function Test-SebCompressionUnsupported {
   return $false
 }
 
+# 4214 = no current full backup: the log chain has no base yet. A pure predicate,
+# mirroring Test-SebCompressionUnsupported, so the decision is testable without SQL.
+function Test-SebLogNeedsBase {
+  param([int[]]$Numbers = @())
+  return ($Numbers -contains 4214)
+}
+
 # Probe the edition up front so the first backup of a pass is not a guaranteed
 # failure. EngineEdition 4 is Express, which has no backup compression at all.
 function Get-SebEngineEdition {
@@ -1129,7 +1136,13 @@ function Invoke-SebBackupLog {
   $sql = Get-SebBackupSql -Kind 'log' -Database $Database -TargetFile $TargetFile -Compress $false
   try { Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql }
   catch {
-    if ((Get-SebSqlErrorNumbers $_) -contains 4214) { throw 'SEB_LOG_NO_BASE' }
+    $numbers = Get-SebSqlErrorNumbers $_
+    if (Test-SebLogNeedsBase -Numbers $numbers) {
+      # 4214 = no current full backup: the log chain has no base yet. Signal the caller
+      # (by string - one internal signal needs no custom exception type) to anchor + retry.
+      Write-SebLog ('a log backup found no base backup - the caller will anchor with a full') 'INFO'
+      throw 'SEB_LOG_NO_BASE'
+    }
     throw
   }
 }
