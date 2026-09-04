@@ -2424,6 +2424,49 @@ function Get-SebRestoreSql {
     (Get-SebQuotedName $TargetName), (Get-SebSqlLiteral $Path), ($with -join ', '))
 }
 
+# Pure. Given a catalogue for ONE database and a target time, return the ordered
+# restore steps (full -> optional diff -> contiguous logs, last one STOPAT+RECOVERY),
+# or an { Error } describing why the target is not recoverable. LSNs are decimals.
+function Get-SebRestorePlan {
+  param([object[]]$Catalogue = @(), [datetime]$StopAt)
+  $fulls = @($Catalogue | Where-Object { $_.Kind -eq 'full' } | Sort-Object Finish)
+  $eligible = @($fulls | Where-Object { $_.Finish -le $StopAt })
+  if ($eligible.Count -eq 0) {
+    return [pscustomobject]@{ Error = 'target is before the earliest full backup' }
+  }
+  $base = $eligible[$eligible.Count - 1]
+  $steps = New-Object System.Collections.ArrayList
+  [void]$steps.Add([pscustomobject]@{ Kind = 'full'; File = $base.File; Recovery = $false; StopAt = $null })
+
+  $chainLsn = [decimal]$base.LastLSN
+  $diffs = @($Catalogue | Where-Object {
+      $_.Kind -eq 'diff' -and [decimal]$_.DatabaseBackupLSN -eq [decimal]$base.FirstLSN -and $_.Finish -le $StopAt
+    } | Sort-Object Finish)
+  if ($diffs.Count -gt 0) {
+    $diff = $diffs[$diffs.Count - 1]
+    [void]$steps.Add([pscustomobject]@{ Kind = 'diff'; File = $diff.File; Recovery = $false; StopAt = $null })
+    $chainLsn = [decimal]$diff.LastLSN
+  }
+
+  $logs = @($Catalogue | Where-Object { $_.Kind -eq 'log' -and [decimal]$_.LastLSN -gt $chainLsn } | Sort-Object { [decimal]$_.FirstLSN })
+  $spanning = $null
+  $prevLast = $chainLsn
+  foreach ($log in $logs) {
+    if ([decimal]$log.FirstLSN -gt $prevLast) {
+      return [pscustomobject]@{ Error = ('gap in the log chain before LSN {0} - the backup chain is broken' -f $log.FirstLSN) }
+    }
+    if ($log.Finish -ge $StopAt) { $spanning = $log; break }
+    [void]$steps.Add([pscustomobject]@{ Kind = 'log'; File = $log.File; Recovery = $false; StopAt = $null })
+    $prevLast = [decimal]$log.LastLSN
+  }
+  if ($null -eq $spanning) {
+    $latest = if ($logs.Count -gt 0) { $logs[$logs.Count - 1].Finish } else { $base.Finish }
+    return [pscustomobject]@{ Error = ('target is after the newest log backup (latest recoverable: {0:yyyy-MM-dd HH:mm:ss})' -f $latest) }
+  }
+  [void]$steps.Add([pscustomobject]@{ Kind = 'log'; File = $spanning.File; Recovery = $true; StopAt = $StopAt })
+  return [pscustomobject]@{ Steps = @($steps.ToArray()) }
+}
+
 function Invoke-SebSelfTest {
   param([string]$PinnedInstance, [string]$WorkRoot)
 

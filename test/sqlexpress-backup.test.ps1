@@ -1013,4 +1013,46 @@ Assert ($planB3.FullDelete.Count -eq 0) 'the last surviving full is kept even pa
 $planB4 = Get-SebChainRetentionPlan -Fulls @() -Diffs @() -Logs @() -Now $nowB -DailyKeepDays 7
 Assert ($planB4.FullDelete.Count -eq 0 -and $planB4.DiffDelete.Count -eq 0 -and $planB4.LogDelete.Count -eq 0) 'empty folders prune nothing and do not error'
 
+# ---- C1. the point-in-time restore planner -----------------------------------------
+function New-Cat([string]$kind, [string]$file, [decimal]$first, [decimal]$last, [decimal]$dbb, [datetime]$finish) {
+  return [pscustomobject]@{ Kind = $kind; File = $file; FirstLSN = $first; LastLSN = $last; DatabaseBackupLSN = $dbb; Finish = $finish }
+}
+$b = [datetime]'2026-09-04 08:00:00'
+$cat = @(
+  (New-Cat 'full' 'F.bak' 100 100 0   $b),
+  (New-Cat 'diff' 'D.dif' 150 150 100 $b.AddHours(2)),
+  (New-Cat 'log'  'L1.trn' 100 160 0  $b.AddHours(1)),
+  (New-Cat 'log'  'L2.trn' 160 220 0  $b.AddHours(3)),
+  (New-Cat 'log'  'L3.trn' 220 280 0  $b.AddHours(5))
+)
+# Target at 02:30 -> full, then the diff (finished 02:00, based on the full), then the
+# log that spans 02:30 (L2) with STOPAT.
+$p = Get-SebRestorePlan -Catalogue $cat -StopAt ($b.AddHours(2).AddMinutes(30))
+Assert (-not $p.Error) 'a target inside the chain plans without error'
+Assert ($p.Steps[0].File -eq 'F.bak' -and $p.Steps[0].Kind -eq 'full') 'the plan starts with the newest full at or before the target'
+Assert (@($p.Steps | Where-Object { $_.Kind -eq 'diff' }).Count -eq 1) 'the differential based on that full is included'
+$last = $p.Steps[$p.Steps.Count - 1]
+Assert ($last.Kind -eq 'log' -and $last.File -eq 'L2.trn') 'the final step is the log that spans the target'
+Assert ($last.StopAt -eq ($b.AddHours(2).AddMinutes(30))) 'the final log carries STOPAT = the target'
+Assert ($last.Recovery -eq $true) 'the final step recovers the database'
+Assert (@($p.Steps | Where-Object { $_.Recovery -eq $true }).Count -eq 1) 'exactly one step recovers (all prior are NORECOVERY)'
+Assert (@($p.Steps | Where-Object { $_.File -eq 'L3.trn' }).Count -eq 0) 'a log entirely after the target is not restored'
+
+# Target before the earliest full -> a clear error, not a broken plan.
+$pe = Get-SebRestorePlan -Catalogue $cat -StopAt ($b.AddHours(-1))
+Assert ($pe.Error -match 'earliest') 'a target before the first full is a bounded-range error'
+
+# Target after the newest log -> bounded error naming the latest recoverable time.
+$pl = Get-SebRestorePlan -Catalogue $cat -StopAt ($b.AddHours(9))
+Assert ($pl.Error -match 'newest|latest') 'a target after the last log is a bounded-range error'
+
+# A gap in the log chain (missing 160->220) is detected, not silently skipped.
+$catGap = @(
+  (New-Cat 'full' 'F.bak' 100 100 0 $b),
+  (New-Cat 'log'  'L1.trn' 100 160 0 $b.AddHours(1)),
+  (New-Cat 'log'  'L3.trn' 220 280 0 $b.AddHours(5))
+)
+$pg = Get-SebRestorePlan -Catalogue $catGap -StopAt ($b.AddHours(5))
+Assert ($pg.Error -match 'gap|chain') 'a break in the LSN chain is reported as a gap'
+
 Write-Host 'ALL PASS'
