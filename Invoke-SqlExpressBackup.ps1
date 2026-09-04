@@ -1175,16 +1175,30 @@ function Test-SebNeedsRecoveryFull {
   return ($Model -ne 'FULL')
 }
 
+function Get-SebRecoveryModelSql {
+  param([string]$Database)
+  return ('SELECT recovery_model_desc AS m FROM sys.databases WHERE name = {0}' -f (Get-SebSqlLiteral $Database))
+}
+
+# No rows, or a row whose model is NULL (offline/inaccessible), both mean "we cannot see
+# it," which must read the same as already-FULL: do nothing to it. Get-SebValue turns
+# DBNull into $null so the [string] cast below never sees DBNull (which stringifies to '').
+function Get-SebRecoveryModelFromRows {
+  param([object[]]$Rows = @())
+  $raw = if (@($Rows).Count -gt 0) { Get-SebValue $Rows[0].m } else { $null }
+  if ($null -eq $raw) { return 'FULL' }
+  return [string]$raw
+}
+
 # Idempotent. Reads the model, changes it only if needed, and returns $true when it
 # changed (so the caller knows a fresh anchoring full is now required).
 function Set-SebRecoveryFull {
   param($Connection, [string]$Database)
-  $rows = Invoke-SebSqlTable -Connection $Connection -Sql (
-    "SELECT recovery_model_desc AS m FROM sys.databases WHERE name = " + (Get-SebSqlLiteral $Database))
-  $model = if (@($rows).Count -gt 0) { [string]$rows[0].m } else { 'FULL' }
+  $rows = Invoke-SebSqlTable -Connection $Connection -Sql (Get-SebRecoveryModelSql -Database $Database)
+  $model = Get-SebRecoveryModelFromRows -Rows $rows
   if (-not (Test-SebNeedsRecoveryFull -Model $model)) { return $false }
   Invoke-SebSqlNonQuery -Connection $Connection -Sql (Get-SebRecoveryFullSql -Database $Database)
-  Write-SebLog ('recovery model of a database set to FULL') 'INFO'
+  Write-SebLog ('recovery model of {0} set to FULL' -f $Database) 'INFO'
   return $true
 }
 

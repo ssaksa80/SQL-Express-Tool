@@ -858,6 +858,10 @@ Assert ((Get-SebRecoveryFullSql -Database "we'ird") -eq "ALTER DATABASE [we'ird]
 Assert (-not (Test-SebNeedsRecoveryFull -Model 'FULL')) 'a database already in FULL needs no change'
 Assert (Test-SebNeedsRecoveryFull -Model 'SIMPLE') 'a SIMPLE database needs the change'
 Assert (Test-SebNeedsRecoveryFull -Model 'BULK_LOGGED') 'a BULK_LOGGED database needs the change'
+Assert ((Get-SebRecoveryModelFromRows -Rows @()) -eq 'FULL') 'no row reads as already-FULL - nothing to ALTER'
+Assert ((Get-SebRecoveryModelFromRows -Rows @([pscustomobject]@{ m = [System.DBNull]::Value })) -eq 'FULL') 'an unreadable model (offline/inaccessible db) reads as already-FULL, not as needing a change'
+Assert ((Get-SebRecoveryModelFromRows -Rows @([pscustomobject]@{ m = 'SIMPLE' })) -eq 'SIMPLE') 'a readable model passes through unchanged'
+Assert ((Get-SebRecoveryModelSql -Database 'APPDB') -match "WHERE name = 'APPDB'") 'the model query literal-escapes the database name'
 
 # ---- A4. the SQL InfoMessage handler is unsubscribed on every exit path -------------
 # Regression for a delegate leak. The progress handler was subscribed once up front but
