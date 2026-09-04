@@ -1152,4 +1152,24 @@ $logPassParams = (Get-Command Invoke-SebBackupLogPass).Parameters
 Assert ($logPassParams.ContainsKey('OnlyDatabase')) 'Invoke-SebBackupLogPass accepts -OnlyDatabase, mirroring Invoke-SebPass'
 Assert ($logPassParams.ContainsKey('NoHash')) 'Invoke-SebBackupLogPass accepts -NoHash, mirroring Copy-SebVerified callers'
 
+# ---- D1b. RecoveryMode=Full enrolls + takes full/diff; RecoveryMode=Simple is untouched --
+# The enrollment/kind wiring inside Invoke-SebPass needs a live SQL connection to drive
+# end to end (that is Phase E's job). What a pure assert CAN pin here is the two things
+# Simple-mode backward compatibility actually rests on.
+Assert ((Get-Command Invoke-SebPass -ErrorAction SilentlyContinue) -ne $null) 'Invoke-SebPass is defined and the file still parses with the D1b changes in it'
+
+# Every existing install's config.json has no RecoveryMode key at all. Read-SebConfig
+# hands back a plain PSCustomObject, and PowerShell reads a missing property on one of
+# those as $null rather than throwing - so the [string]$Config.RecoveryMode -eq 'Full'
+# test Invoke-SebPass uses reads a config with no such key as Simple, not as a crash.
+Assert (([string]([pscustomobject]@{}).RecoveryMode -eq 'Full') -eq $false) 'a config with no RecoveryMode property (every existing install) reads as Simple, not Full'
+Assert (([string]([pscustomobject]@{ RecoveryMode = 'Full' }).RecoveryMode -eq 'Full') -eq $true) 'a config with RecoveryMode = Full is detected as Full mode'
+
+# The Simple branch now sits behind "if ($isFullMode) {...} else {...}" instead of running
+# unconditionally, but it still names its file exactly as before: no -Extension argument
+# and -Extension 'bak' must be the same string, since Simple mode never sets $kind to 'diff'.
+$d1bStamp = [datetime]'2026-09-04 12:00:00'
+Assert ((Get-SebFileName -Database 'APPDB' -Stamp $d1bStamp) -eq (Get-SebFileName -Database 'APPDB' -Stamp $d1bStamp -Extension 'bak')) `
+  'RecoveryMode=Simple computes the same file name as today (no-Extension == -Extension bak)'
+
 Write-Host 'ALL PASS'

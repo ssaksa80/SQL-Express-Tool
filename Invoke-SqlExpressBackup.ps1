@@ -1450,6 +1450,10 @@ FROM sys.databases AS d
 function Invoke-SebPass {
   param($Config)
 
+  $isFullMode = ([string]$Config.RecoveryMode -eq 'Full')
+  $fullEveryHours = 24
+  if ($Config.PSObject.Properties['FullEveryHours']) { $fullEveryHours = [int]$Config.FullEveryHours }
+
   $staging = $Config.StagingPath
   if (-not (Test-Path -LiteralPath $staging)) {
     [void](New-Item -ItemType Directory -Path $staging -Force)
@@ -1571,55 +1575,92 @@ GROUP BY database_id
     $dbIndex = 0
     foreach ($database in $databases) {
       $dbIndex++
-      $fileName = Get-SebFileName -Database $database -Stamp $stamp
+      $kind = 'full'
+      if ($isFullMode) {
+        $justSwitched = Set-SebRecoveryFull -Connection $connection -Database $database
+        $fullDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
+        $existingFulls = @(Get-SebFolderFacts -Directory $fullDir | Where-Object { $_.Name -like '*.bak' })
+        $hoursSinceFull = [double]::PositiveInfinity
+        if ($existingFulls.Count -gt 0) {
+          $newestFull = @($existingFulls | Sort-Object Timestamp)[-1]
+          $hoursSinceFull = ((Get-Date) - $newestFull.Timestamp).TotalHours
+        }
+        $kind = Get-SebBackupKindDue -HoursSinceFull $hoursSinceFull -FullEveryHours $fullEveryHours
+        # A database only just switched to FULL has no base for a differential yet - anchor with a full.
+        if ($justSwitched) { $kind = 'full' }
+      }
+      $ext = 'bak'
+      if ($kind -eq 'diff') { $ext = 'dif' }
+      $fileName = Get-SebFileName -Database $database -Stamp $stamp -Extension $ext
       $staged = Join-Path $staging $fileName
       try {
         Write-SebJob -Index $dbIndex -Total $databases.Count -Database $database
         Write-SebLog ('backing up {0}' -f $database)
         Write-SebStage -Database $database -Stage 'backup'
-        Invoke-SebBackupDatabase -Connection $connection -Database $database -TargetFile $staged
+        Invoke-SebBackupDatabase -Connection $connection -Database $database -TargetFile $staged -Kind $kind
         Write-SebStage -Database $database -Stage 'verify'
         Test-SebBackupFile -Connection $connection -TargetFile $staged
         $sizeMb = [long]((Get-Item -LiteralPath $staged).Length / 1MB)
         Write-SebLog ('{0} backed up and verified ({1} MB)' -f $database, $sizeMb)
 
-        $hourlyDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
-        $dailyDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'daily'
-
-        $hourlyFacts = @(Get-SebFolderFacts -Directory $hourlyDir)
-        $hourlyFacts += [pscustomobject]@{ Name = $fileName; FullName = (Join-Path $hourlyDir $fileName); Timestamp = $stamp }
-        $dailyFacts = @(Get-SebFolderFacts -Directory $dailyDir)
-        $plan = Get-SebRetentionPlan -HourlyFiles $hourlyFacts -DailyFiles $dailyFacts -Now $stamp `
-          -HourlyKeep ([int]$Config.HourlyKeep) -DailyKeepDays ([int]$Config.DailyKeepDays)
-
-        Write-SebStage -Database $database -Stage 'copy'
-        $targets = @(@{ Dir = $hourlyDir; Kind = 'hourly' })
-        if ($plan.PromoteToDaily) { $targets += @{ Dir = $dailyDir; Kind = 'daily' } }
-
-        $copiedAll = $true
-        foreach ($target in $targets) {
-          $dest = Join-Path $target.Dir $fileName
+        if ($isFullMode) {
+          # Full mode: route a full to hourly/, a diff to diff/. NO count-based pruning here -
+          # chain-safe retention over full+diff+log is a separate task (D1c); until then these
+          # accumulate rather than risk a prune that strands a log the chain still needs.
+          $destKind = 'hourly'
+          if ($kind -eq 'diff') { $destKind = 'diff' }
+          $destDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind $destKind
+          $dest = Join-Path $destDir $fileName
+          Write-SebStage -Database $database -Stage ('copy-' + $kind)
           try {
             Copy-SebVerified -Source $staged -Destination $dest -NoHash:$noHash
             Write-SebLog ('copied to {0}' -f $dest)
+            Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
           }
           catch {
-            $copiedAll = $false
             Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
-            [void]$pendingList.Add([pscustomobject]@{
-                Staged = $staged; Dest = $dest; Database = $database; Kind = $target.Kind
-              })
+            [void]$pendingList.Add([pscustomobject]@{ Staged = $staged; Dest = $dest; Database = $database; Kind = $destKind })
           }
         }
+        else {
+          $hourlyDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
+          $dailyDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'daily'
 
-        if ($copiedAll) {
-          Remove-SebNamed -Directory $hourlyDir -Names $plan.HourlyDelete
-          Remove-SebNamed -Directory $dailyDir -Names $plan.DailyDelete
-          if (Test-SebStagedStillNeeded -Staged $staged -Pending @($pendingList.ToArray())) {
-            Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $staged)
+          $hourlyFacts = @(Get-SebFolderFacts -Directory $hourlyDir)
+          $hourlyFacts += [pscustomobject]@{ Name = $fileName; FullName = (Join-Path $hourlyDir $fileName); Timestamp = $stamp }
+          $dailyFacts = @(Get-SebFolderFacts -Directory $dailyDir)
+          $plan = Get-SebRetentionPlan -HourlyFiles $hourlyFacts -DailyFiles $dailyFacts -Now $stamp `
+            -HourlyKeep ([int]$Config.HourlyKeep) -DailyKeepDays ([int]$Config.DailyKeepDays)
+
+          Write-SebStage -Database $database -Stage 'copy'
+          $targets = @(@{ Dir = $hourlyDir; Kind = 'hourly' })
+          if ($plan.PromoteToDaily) { $targets += @{ Dir = $dailyDir; Kind = 'daily' } }
+
+          $copiedAll = $true
+          foreach ($target in $targets) {
+            $dest = Join-Path $target.Dir $fileName
+            try {
+              Copy-SebVerified -Source $staged -Destination $dest -NoHash:$noHash
+              Write-SebLog ('copied to {0}' -f $dest)
+            }
+            catch {
+              $copiedAll = $false
+              Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
+              [void]$pendingList.Add([pscustomobject]@{
+                  Staged = $staged; Dest = $dest; Database = $database; Kind = $target.Kind
+                })
+            }
           }
-          else {
-            Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+
+          if ($copiedAll) {
+            Remove-SebNamed -Directory $hourlyDir -Names $plan.HourlyDelete
+            Remove-SebNamed -Directory $dailyDir -Names $plan.DailyDelete
+            if (Test-SebStagedStillNeeded -Staged $staged -Pending @($pendingList.ToArray())) {
+              Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $staged)
+            }
+            else {
+              Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            }
           }
         }
         $succeeded++
