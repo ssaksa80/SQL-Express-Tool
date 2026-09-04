@@ -1060,25 +1060,41 @@ function Get-SebEngineEdition {
   return [int]$value
 }
 
-function Invoke-SebBackupDatabase {
-  param($Connection, [string]$Database, [string]$TargetFile)
+# The BACKUP statement as a pure string, so the exact WITH clause is unit-testable.
+# Kind: full | diff | log. Compress adds COMPRESSION (callers turn it off and retry
+# on editions - like Express - that reject it).
+function Get-SebBackupSql {
+  param(
+    [ValidateSet('full', 'diff', 'log')]
+    [string]$Kind,
+    [string]$Database,
+    [string]$TargetFile,
+    [bool]$Compress = $false
+  )
   $quoted = Get-SebQuotedName $Database
   $literal = Get-SebSqlLiteral $TargetFile
-  $name = Get-SebSqlLiteral ($Database + ' full backup')
+  $label = Get-SebSqlLiteral ($Database + ' ' + $Kind + ' backup')
   # STATS makes SQL emit a percentage as it goes; without it the connection stays
   # silent until the backup finishes and there is nothing to show.
-  $base = @('INIT', 'FORMAT', 'CHECKSUM', 'STATS = 5', ('NAME = ' + $name))
+  $with = @('INIT', 'FORMAT', 'CHECKSUM', 'STATS = 5', ('NAME = ' + $label))
+  if ($Kind -eq 'diff') { $with = @('DIFFERENTIAL') + $with }
+  if ($Compress) { $with = $with + @('COMPRESSION') }
+  $verb = 'BACKUP DATABASE'
+  if ($Kind -eq 'log') { $verb = 'BACKUP LOG' }
+  return ('{0} {1} TO DISK = {2} WITH {3}' -f $verb, $quoted, $literal, ($with -join ', '))
+}
 
-  $withParts = $base
-  if ($script:SebCompression -ne 'off') { $withParts = $base + @('COMPRESSION') }
-  $sql = 'BACKUP DATABASE {0} TO DISK = {1} WITH {2}' -f $quoted, $literal, ($withParts -join ', ')
-
+function Invoke-SebBackupDatabase {
+  param($Connection, [string]$Database, [string]$TargetFile, [ValidateSet('full','diff')][string]$Kind = 'full')
+  $compress = ($script:SebCompression -ne 'off')
+  $sql = Get-SebBackupSql -Kind $Kind -Database $Database -TargetFile $TargetFile -Compress $compress
   $handler = [System.Data.SqlClient.SqlInfoMessageEventHandler] {
     param($eventSender, $eventArgs)
     $pct = Get-SebPercentFromMessage $eventArgs.Message
-    if ($pct -ge 0) { Write-SebProgress -Database $script:SebProgressDb -Percent $pct -Stage 'backup' }
+    if ($pct -ge 0) { Write-SebProgress -Database $script:SebProgressDb -Percent $pct -Stage ('backup-' + $script:SebProgressKind) }
   }
   $script:SebProgressDb = $Database
+  $script:SebProgressKind = $Kind
   $Connection.add_InfoMessage($handler)
   try {
     Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
@@ -1101,11 +1117,21 @@ function Invoke-SebBackupDatabase {
     $script:SebCompression = 'off'
     Write-SebLog 'this edition has no backup compression - continuing uncompressed' 'INFO'
   }
-  finally { }
-
-  $sql = 'BACKUP DATABASE {0} TO DISK = {1} WITH {2}' -f $quoted, $literal, ($base -join ', ')
+  $sql = Get-SebBackupSql -Kind $Kind -Database $Database -TargetFile $TargetFile -Compress $false
   try { Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql }
   finally { $Connection.remove_InfoMessage($handler) }
+}
+
+# BACKUP LOG. Error 4214 ("no current database backup") means the log chain has no
+# base yet - the caller anchors with a full and retries. Everything else propagates.
+function Invoke-SebBackupLog {
+  param($Connection, [string]$Database, [string]$TargetFile)
+  $sql = Get-SebBackupSql -Kind 'log' -Database $Database -TargetFile $TargetFile -Compress $false
+  try { Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql }
+  catch {
+    if ((Get-SebSqlErrorNumbers $_) -contains 4214) { throw 'SEB_LOG_NO_BASE' }
+    throw
+  }
 }
 
 function Test-SebBackupFile {

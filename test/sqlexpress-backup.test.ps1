@@ -825,4 +825,26 @@ try {
 }
 finally { Remove-Item -LiteralPath $tmpA -Recurse -Force -ErrorAction SilentlyContinue }
 
+# ---- A2. the BACKUP T-SQL builder ---------------------------------------------------
+$full = Get-SebBackupSql -Kind 'full' -Database 'APPDB' -TargetFile 'D:\stg\APPDB.bak' -Compress $false
+Assert ($full -match 'BACKUP DATABASE \[APPDB\] TO DISK') 'full backup is BACKUP DATABASE'
+Assert ($full -match 'CHECKSUM') 'full backup asks for CHECKSUM'
+Assert ($full -notmatch 'DIFFERENTIAL') 'a full backup is not a differential'
+Assert ($full -notmatch 'COMPRESSION') 'compression is omitted when Compress is false'
+
+$fullC = Get-SebBackupSql -Kind 'full' -Database 'APPDB' -TargetFile 'D:\stg\APPDB.bak' -Compress $true
+Assert ($fullC -match 'COMPRESSION') 'compression is included when Compress is true'
+
+$diff = Get-SebBackupSql -Kind 'diff' -Database 'APPDB' -TargetFile 'D:\stg\APPDB.dif' -Compress $false
+Assert ($diff -match 'BACKUP DATABASE \[APPDB\] TO DISK') 'a differential is still BACKUP DATABASE'
+Assert ($diff -match 'DIFFERENTIAL') 'a differential says DIFFERENTIAL'
+
+$log = Get-SebBackupSql -Kind 'log' -Database 'APPDB' -TargetFile 'D:\stg\APPDB.trn' -Compress $false
+Assert ($log -match 'BACKUP LOG \[APPDB\] TO DISK') 'a log backup is BACKUP LOG'
+Assert ($log -notmatch 'DIFFERENTIAL') 'a log backup is not a differential'
+
+$q = Get-SebBackupSql -Kind 'full' -Database "we'ird" -TargetFile "D:\a'b.bak" -Compress $false
+Assert ($q -match "\[we'ird\]") 'the database name is bracket-quoted'
+Assert ($q -match "D:\\a''b\.bak") 'the target path is SQL-literal-escaped (single quote doubled)'
+
 Write-Host 'ALL PASS'
