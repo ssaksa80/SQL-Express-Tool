@@ -1014,16 +1014,20 @@ $planB4 = Get-SebChainRetentionPlan -Fulls @() -Diffs @() -Logs @() -Now $nowB -
 Assert ($planB4.FullDelete.Count -eq 0 -and $planB4.DiffDelete.Count -eq 0 -and $planB4.LogDelete.Count -eq 0) 'empty folders prune nothing and do not error'
 
 # ---- C1. the point-in-time restore planner -----------------------------------------
-function New-Cat([string]$kind, [string]$file, [decimal]$first, [decimal]$last, [decimal]$dbb, [datetime]$finish) {
-  return [pscustomobject]@{ Kind = $kind; File = $file; FirstLSN = $first; LastLSN = $last; DatabaseBackupLSN = $dbb; Finish = $finish }
+function New-Cat([string]$kind, [string]$file, [decimal]$first, [decimal]$last, [decimal]$dbb, [decimal]$chk, [datetime]$finish) {
+  return [pscustomobject]@{ Kind = $kind; File = $file; FirstLSN = $first; LastLSN = $last; DatabaseBackupLSN = $dbb; CheckpointLSN = $chk; Finish = $finish }
 }
 $b = [datetime]'2026-09-04 08:00:00'
 $cat = @(
-  (New-Cat 'full' 'F.bak' 100 100 0   $b),
-  (New-Cat 'diff' 'D.dif' 150 150 100 $b.AddHours(2)),
-  (New-Cat 'log'  'L1.trn' 100 160 0  $b.AddHours(1)),
-  (New-Cat 'log'  'L2.trn' 160 220 0  $b.AddHours(3)),
-  (New-Cat 'log'  'L3.trn' 220 280 0  $b.AddHours(5))
+  # The full's CheckpointLSN (105) deliberately differs from its FirstLSN (100) - a
+  # database taking writes during the full ends its checkpoint after the backup
+  # started. The diff below records DatabaseBackupLSN = 105, so the match only works
+  # if the planner keys off CheckpointLSN rather than FirstLSN.
+  (New-Cat 'full' 'F.bak' 100 100 0   105 $b),
+  (New-Cat 'diff' 'D.dif' 150 150 105 0   $b.AddHours(2)),
+  (New-Cat 'log'  'L1.trn' 100 160 0  0   $b.AddHours(1)),
+  (New-Cat 'log'  'L2.trn' 160 220 0  0   $b.AddHours(3)),
+  (New-Cat 'log'  'L3.trn' 220 280 0  0   $b.AddHours(5))
 )
 # Target at 02:30 -> full, then the diff (finished 02:00, based on the full), then the
 # log that spans 02:30 (L2) with STOPAT.
@@ -1048,9 +1052,9 @@ Assert ($pl.Error -match 'newest|latest') 'a target after the last log is a boun
 
 # A gap in the log chain (missing 160->220) is detected, not silently skipped.
 $catGap = @(
-  (New-Cat 'full' 'F.bak' 100 100 0 $b),
-  (New-Cat 'log'  'L1.trn' 100 160 0 $b.AddHours(1)),
-  (New-Cat 'log'  'L3.trn' 220 280 0 $b.AddHours(5))
+  (New-Cat 'full' 'F.bak' 100 100 0 105 $b),
+  (New-Cat 'log'  'L1.trn' 100 160 0 0 $b.AddHours(1)),
+  (New-Cat 'log'  'L3.trn' 220 280 0 0 $b.AddHours(5))
 )
 $pg = Get-SebRestorePlan -Catalogue $catGap -StopAt ($b.AddHours(5))
 Assert ($pg.Error -match 'gap|chain') 'a break in the LSN chain is reported as a gap'

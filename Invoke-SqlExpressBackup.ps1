@@ -2439,8 +2439,12 @@ function Get-SebRestorePlan {
   [void]$steps.Add([pscustomobject]@{ Kind = 'full'; File = $base.File; Recovery = $false; StopAt = $null })
 
   $chainLsn = [decimal]$base.LastLSN
+  # A differential's database_backup_lsn records its base full's CHECKPOINT LSN, not
+  # the full's first LSN - those two only coincide when the database was idle for the
+  # whole full backup. Matching on FirstLSN silently drops every diff for a database
+  # that took writes during its full.
   $diffs = @($Catalogue | Where-Object {
-      $_.Kind -eq 'diff' -and [decimal]$_.DatabaseBackupLSN -eq [decimal]$base.FirstLSN -and $_.Finish -le $StopAt
+      $_.Kind -eq 'diff' -and [decimal]$_.DatabaseBackupLSN -eq [decimal]$base.CheckpointLSN -and $_.Finish -le $StopAt
     } | Sort-Object Finish)
   if ($diffs.Count -gt 0) {
     $diff = $diffs[$diffs.Count - 1]
