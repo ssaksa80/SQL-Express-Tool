@@ -990,15 +990,19 @@ Assert ($planB.FullDelete.Count -eq 0 -and $planB.LogDelete.Count -eq 0) 'a sing
 
 # Add an OLD full (10 days) with its own two logs, all before the retained full's LSN.
 $fullsB2 = $fullsB + @( (New-Seg 'F-old' $nowB.AddDays(-10) 10 10) )
+$diffsB2 = @( (New-Seg 'Dold' $nowB.AddDays(-10).AddMinutes(20) 10 25) )
 $logsB2  = $logsB + @(
   (New-Seg 'Lold1' $nowB.AddDays(-10).AddMinutes(15) 10 20),
-  (New-Seg 'Lold2' $nowB.AddDays(-10).AddMinutes(30) 20 30)
+  (New-Seg 'Lold2' $nowB.AddDays(-10).AddMinutes(30) 20 30),
+  (New-Seg 'L-boundary' $nowB.AddMinutes(1) 990 1000)
 )
-$planB2 = Get-SebChainRetentionPlan -Fulls $fullsB2 -Diffs @() -Logs $logsB2 -Now $nowB -DailyKeepDays 7
+$planB2 = Get-SebChainRetentionPlan -Fulls $fullsB2 -Diffs $diffsB2 -Logs $logsB2 -Now $nowB -DailyKeepDays 7
 Assert ($planB2.FullDelete -contains 'F-old') 'the out-of-horizon full is pruned (positive control: pruning does happen)'
 Assert ($planB2.LogDelete -contains 'Lold1' -and $planB2.LogDelete -contains 'Lold2') 'logs belonging only to the pruned full are pruned'
 Assert ($planB2.FullDelete -notcontains 'F-today') 'the retained full is never pruned'
 Assert ($planB2.LogDelete -notcontains 'L2') 'a log needed to roll the retained full forward is never pruned'
+Assert ($planB2.DiffDelete -contains 'Dold') 'a diff belonging only to the pruned full is pruned'
+Assert ($planB2.LogDelete -notcontains 'L-boundary') 'a log ending exactly at the anchor LSN still reaches it and must be kept'
 
 # Safety: if the ONLY full is out of horizon, it is still kept - deleting it would
 # leave nothing to restore from.

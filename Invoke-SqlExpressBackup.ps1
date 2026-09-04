@@ -332,7 +332,7 @@ function Get-SebChainRetentionPlan {
   )
   if ($DailyKeepDays -lt 1) { $DailyKeepDays = 1 }
   $result = [pscustomobject]@{ FullDelete = @(); DiffDelete = @(); LogDelete = @() }
-  $fullsSorted = @($Fulls | Sort-Object -Property Timestamp)   # oldest first
+  $fullsSorted = @($Fulls | Sort-Object -Property Timestamp, FirstLSN)   # oldest first
   if ($fullsSorted.Count -eq 0) { return $result }
 
   $horizon = $Now.AddDays(-1 * $DailyKeepDays)
