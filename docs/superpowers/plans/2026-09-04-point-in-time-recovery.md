@@ -405,7 +405,7 @@ git commit -m "feat(engine): chain-safe retention that never strands a needed se
 - Modify: `Invoke-SqlExpressBackup.ps1` (new `Get-SebRestorePlan`)
 - Test: `test/sqlexpress-backup.test.ps1`
 
-- [ ] **Step 1: Write the failing tests.** Append. A catalogue entry is `{ Kind; File; FirstLSN; LastLSN; DatabaseBackupLSN; Finish }`. The planner returns either `{ Steps = @(...) }` or `{ Error = '...' }`.
+- [ ] **Step 1: Write the failing tests.** Append. A catalogue entry is `{ Kind; File; FirstLSN; LastLSN; DatabaseBackupLSN; CheckpointLSN; Finish }`. The planner returns either `{ Steps = @(...) }` or `{ Error = '...' }`. (A differential is matched to its base full by the base's `CheckpointLSN`, since a diff's `database_backup_lsn` is the base's checkpoint LSN — equal to `FirstLSN` only when the DB was idle during the full.)
 
 ```powershell
 # ---- C1. the point-in-time restore planner -----------------------------------------
@@ -520,13 +520,17 @@ function Get-SebRestoreHeaderFacts {
   $rows = @(Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE HEADERONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $File)))
   if ($rows.Count -eq 0) { return $null }
   $r = $rows[0]
+  # Wrap every column in Get-SebValue so a NULL header field arrives as $null, never a
+  # DBNull (which [decimal] throws on). CheckpointLSN is what a diff's DatabaseBackupLSN
+  # points at, so Get-SebRestorePlan needs it to match a diff to its base full.
   return [pscustomobject]@{
     Kind = $Kind
     File = $File
-    FirstLSN = [decimal]$r.FirstLSN
-    LastLSN = [decimal]$r.LastLSN
-    DatabaseBackupLSN = [decimal]$r.DatabaseBackupLSN
-    Finish = [datetime]$r.BackupFinishDate
+    FirstLSN = [decimal](Get-SebValue $r.FirstLSN)
+    LastLSN = [decimal](Get-SebValue $r.LastLSN)
+    DatabaseBackupLSN = [decimal](Get-SebValue $r.DatabaseBackupLSN)
+    CheckpointLSN = [decimal](Get-SebValue $r.CheckpointLSN)
+    Finish = [datetime](Get-SebValue $r.BackupFinishDate)
   }
 }
 ```
