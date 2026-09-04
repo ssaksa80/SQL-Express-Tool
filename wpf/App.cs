@@ -65,20 +65,27 @@ class SebWpf
         // elevated, relaunch with the same verb and let UAC prompt.
         if (doInstall)
         {
-            if (!Install.IsElevated()) { Install.Relaunch("--install", true); return 0; }
-            string installedExe = Install.DoInstall();
-            Install.Relaunch("", false, installedExe); // launch the installed copy
-            return 0;
+            if (!Install.IsElevated()) { Install.Relaunch("--install" + (quiet ? " --quiet" : ""), true); return 0; }
+            if (quiet) { Install.DoInstall(); return 0; }   // scripted silent install
+            // Interactive: show a real installer progress window (steps + bar + Launch).
+            Theme.Load("system");
+            Application ia = new Application();
+            InstallProgress iw = new InstallProgress(false);
+            ia.Run(iw);
+            return iw.ExitCode;
         }
         if (doUninstall)
         {
             if (!Install.IsElevated()) { Install.Relaunch("--uninstall" + (quiet ? " --quiet" : ""), true); return 0; }
-            // Remove the SYSTEM schedule first so app uninstall does not orphan it. The
-            // engine inherits this process's elevation; config and backups are left alone
-            // (no -Purge) - only the scheduled task/service is removed.
-            try { AppSettings.Mode = Install.DetectMode(); Engine.Run("-Uninstall", null); } catch { }
-            Install.DoUninstall();
-            return 0;
+            // DoUninstallSteps removes the SYSTEM scheduled task first (no -Purge, so config
+            // and backups are kept), then the registry entry, shortcut and program files.
+            if (quiet) { Install.DoUninstallSteps(null); return 0; }   // Add/Remove QuietUninstallString
+            // Interactive (Add/Remove Programs -> Uninstall): show progress with steps.
+            Theme.Load("system");
+            Application ua = new Application();
+            InstallProgress uw = new InstallProgress(true);
+            ua.Run(uw);
+            return uw.ExitCode;
         }
 
         // Headless elevated jobs, spawned by the UI through UAC. Each relaunches elevated

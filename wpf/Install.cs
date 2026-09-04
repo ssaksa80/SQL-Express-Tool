@@ -139,23 +139,36 @@ static class Install
 
     // Copy into Program Files, extract the engine, register uninstall, drop a shortcut.
     // Must run elevated (Program Files and HKLM). Returns the installed exe path.
-    public static string DoInstall()
+    public static string DoInstall() { return DoInstall(null); }
+
+    // Install, reporting each step to onStep(fraction 0..1, message) so a progress window
+    // can show what is happening. onStep may be null for a silent (--quiet) install.
+    public static string DoInstall(Action<double, string> onStep)
     {
+        if (onStep == null) { onStep = delegate { }; }
+        onStep(0.05, "Preparing the installation folder…");
         string dir = InstallDir();
         Directory.CreateDirectory(dir);
         string destExe = Path.Combine(dir, "SqlExpressBackup.exe");
 
-        // Copy the running exe in (skip if we are already it).
+        onStep(0.20, "Copying the application to Program Files…");
         string src = ExePath();
         if (!string.Equals(src.TrimEnd('\\'), destExe, StringComparison.OrdinalIgnoreCase))
         {
             File.Copy(src, destExe, true);
         }
         File.WriteAllText(Path.Combine(dir, InstalledMarker), Version);
+
+        onStep(0.50, "Extracting the backup engine…");
         ExtractEngine(dir);
 
+        onStep(0.75, "Registering with Add / Remove Programs…");
         WriteUninstallEntry(dir, destExe);
+
+        onStep(0.90, "Creating the Start-menu shortcut…");
         CreateShortcut(AllUsersStartMenu(), destExe);
+
+        onStep(1.0, "Installation complete.");
         return destExe;
     }
 
@@ -211,11 +224,28 @@ static class Install
     // Remove the registry entry, the shortcut, and the install directory. Backups on
     // the share are never touched. Runs elevated. The exe cannot delete itself while
     // running, so it schedules the directory removal via a detached command.
-    public static void DoUninstall()
+    public static void DoUninstall() { DoUninstallSteps(null); }
+
+    // Uninstall, reporting each step to onStep(fraction 0..1, message) for the progress
+    // window. Removes the SYSTEM scheduled task first (engine -Uninstall, NO -Purge - so
+    // config, credential and the backups on the share are kept), then the Add/Remove
+    // Programs entry, the Start-menu shortcut, then the program files. The exe cannot
+    // delete its own folder while running, so the folder removal is a detached, retried
+    // cmd that completes once this process exits. onStep may be null for --quiet.
+    public static void DoUninstallSteps(Action<double, string> onStep)
     {
+        if (onStep == null) { onStep = delegate { }; }
+
+        onStep(0.10, "Stopping and removing the scheduled backup task…");
+        try { AppSettings.Mode = DetectMode(); Engine.Run("-Uninstall", null); } catch { }
+
+        onStep(0.45, "Removing the Add / Remove Programs entry…");
         try { Microsoft.Win32.Registry.LocalMachine.DeleteSubKeyTree(UninstallKey, false); } catch { }
+
+        onStep(0.60, "Removing the Start-menu shortcut…");
         try { string lnk = AllUsersStartMenu(); if (File.Exists(lnk)) { File.Delete(lnk); } } catch { }
 
+        onStep(0.80, "Removing the program files…");
         string dir = InstallDir();
         try
         {
@@ -235,6 +265,8 @@ static class Install
             Process.Start(psi);
         }
         catch { }
+
+        onStep(1.0, "Uninstalled. The program folder finishes removing after this window closes.");
     }
 
     // ---- portable ----------------------------------------------------------------
