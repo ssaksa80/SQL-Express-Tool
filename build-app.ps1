@@ -1,8 +1,9 @@
 #requires -version 5.1
 <#
 .SYNOPSIS
-  Builds dist/SqlExpressBackup.exe - the portable operator console for the
-  SQL Express backup.
+  Builds dist-winforms/SqlExpressBackup.exe - the portable operator console for the
+  SQL Express backup. (The modern WPF app builds to dist/ via build-wpf.ps1; the two
+  are kept in separate folders so neither clobbers the other's SqlExpressBackup.exe.)
 
 .DESCRIPTION
   Uses csc.exe from the .NET Framework, which is present on every Windows install
@@ -15,7 +16,7 @@
   install. The exe embeds the backup engine itself and needs nothing beside it.
 
   THE OUTPUT IS NOT COMMITTED
-  dist/ is gitignored. The source and this script are the reviewable
+  dist-winforms/ is gitignored. The source and this script are the reviewable
   artifacts; a binary in the tree is neither reviewable nor trustworthy. Rebuild it
   whenever you need it - this takes about a second.
 
@@ -42,7 +43,7 @@ function Say([string]$t) { if (-not $Quiet) { Write-Host $t } }
 
 $root = $PSScriptRoot
 $appDir = Join-Path $root 'app'
-if (-not $OutDir) { $OutDir = Join-Path $root 'dist' }
+if (-not $OutDir) { $OutDir = Join-Path $root 'dist-winforms' }
 
 # Newest first: a machine with 4.8 installed still reports the v4.0.30319 folder,
 # which is the compiler we want. v3.5 cannot compile this and is filtered out.

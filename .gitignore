@@ -1,12 +1,13 @@
-# Built by build-app.ps1. The source and the build script are the reviewable
-# artifacts; a binary in the tree is neither reviewable nor trustworthy.
+# Build outputs are NOT committed - the source and the build scripts are the
+# reviewable artifacts, and a binary in the tree is neither reviewable nor
+# trustworthy. Rebuild whenever needed.
+#   dist/          - the WPF app (build-wpf.ps1): installs, sets up, uninstalls
+#   dist-winforms/ - the legacy WinForms console (build-app.ps1)
 dist/
+dist-winforms/
+dist-wpf*/
 
 # Local run transcripts - may contain real host/account/DB names, never commit
 *-last-run.log
 
-# WPF shell build output
-dist-wpf/
-dist-wpf-b/
 wpf/_probe.*
-dist-wpf-fix/
