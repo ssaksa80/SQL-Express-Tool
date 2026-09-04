@@ -1114,10 +1114,12 @@ finally { ${function:Invoke-SebSqlTable} = $realInvoke; $script:SebFakeRows = $n
 
 # ---- C3. per-step RESTORE SQL builder ----------------------------------------------
 $sFull = [pscustomobject]@{ Kind='full'; File='D:\s\F.bak'; Recovery=$false; StopAt=$null }
-$sqlF = Get-SebRestoreStepSql -Step $sFull -RestoreAs 'RestoreDemo' -MoveClauses @("MOVE 'd' TO 'X'", "MOVE 'l' TO 'Y'")
+$sqlF = Get-SebRestoreStepSql -Step $sFull -RestoreAs 'RestoreDemo' -Replace $true -MoveClauses @("MOVE 'd' TO 'X'", "MOVE 'l' TO 'Y'")
 Assert ($sqlF -match 'RESTORE DATABASE \[RestoreDemo\] FROM DISK') 'a full step is RESTORE DATABASE into the target name'
-Assert ($sqlF -match 'NORECOVERY' -and $sqlF -match 'REPLACE') 'a full step restores WITH NORECOVERY, REPLACE'
+Assert ($sqlF -match 'NORECOVERY') 'a full step restores WITH NORECOVERY'
+Assert ($sqlF -match 'REPLACE') 'a full step restores WITH REPLACE only when replace is requested'
 Assert ($sqlF -match "MOVE 'd' TO 'X'" -and $sqlF -match "MOVE 'l' TO 'Y'") 'a full step carries the MOVE clauses that relocate its files'
+Assert ((Get-SebRestoreStepSql -Step $sFull -RestoreAs 'RestoreDemo') -notmatch 'REPLACE') 'a full step omits REPLACE by default (no silent overwrite)'
 
 $sDiff = [pscustomobject]@{ Kind='diff'; File='D:\s\D.dif'; Recovery=$false; StopAt=$null }
 $sqlD = Get-SebRestoreStepSql -Step $sDiff -RestoreAs 'RestoreDemo'

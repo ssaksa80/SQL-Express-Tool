@@ -2530,16 +2530,21 @@ function Get-SebRestorePlan {
   return [pscustomobject]@{ Steps = @($steps.ToArray()) }
 }
 
-# Pure. The RESTORE T-SQL for one plan step. Full carries WITH NORECOVERY, REPLACE and
-# the MOVE clauses that relocate the files to the new name; diff/log continue the chain;
-# the final (Recovery) log recovers WITH STOPAT at the target instant. ISO 8601 STOPAT
-# so SQL parses it unambiguously regardless of server locale.
+# Pure. The RESTORE T-SQL for one plan step. Full carries WITH NORECOVERY, plus REPLACE
+# only when the caller asks for it - a fresh restore-as-new-name has no files of its own
+# to overwrite, but a re-run (e.g. after a corrected -StopAt) does, and must not
+# silently replace them without -Replace - plus the MOVE clauses that relocate the files
+# to the new name; diff/log continue the chain; the final (Recovery) log recovers WITH
+# STOPAT at the target instant. ISO 8601 STOPAT so SQL parses it unambiguously
+# regardless of server locale.
 function Get-SebRestoreStepSql {
-  param($Step, [string]$RestoreAs, [string[]]$MoveClauses = @())
+  param($Step, [string]$RestoreAs, [bool]$Replace = $false, [string[]]$MoveClauses = @())
   $target = Get-SebQuotedName $RestoreAs
   $literal = Get-SebSqlLiteral $Step.File
   if ($Step.Kind -eq 'full') {
-    $with = @('NORECOVERY', 'REPLACE') + $MoveClauses
+    $with = @('NORECOVERY')
+    if ($Replace) { $with += 'REPLACE' }
+    $with += $MoveClauses
     return ('RESTORE DATABASE {0} FROM DISK = {1} WITH {2}' -f $target, $literal, ($with -join ', '))
   }
   if ($Step.Kind -eq 'diff') {
@@ -2555,35 +2560,55 @@ function Get-SebRestoreStepSql {
 # Impure. Build the catalogue, plan the point-in-time restore, and run each step. The
 # catalogue call is @()-wrapped so a single-fact catalogue is not collapsed to a scalar.
 #
-# Only the full step needs MOVE clauses: it is the one restoring WITH REPLACE into a
-# name that never had files of its own, so its physical files must be relocated; the
-# diff/log steps that follow apply to files already sitting at those relocated paths.
-# The file list comes from Get-SebRestoreInspect (RESTORE FILELISTONLY) against THAT
-# STEP's own backup file - the same call the -RestoreRun dispatch makes against
-# -RestoreFrom. An unreadable file or an empty file list must stop the restore here
-# rather than issue a REPLACE with no MOVE clauses, which would restore data/log files
-# back onto their ORIGINAL paths - silently overwriting whatever already lives there.
+# The file list for the full step comes from Get-SebRestoreInspect (RESTORE
+# FILELISTONLY) against that step's OWN backup file - the same call the -RestoreRun
+# dispatch makes against -RestoreFrom - fetched ONCE and reused both for the
+# pre-existence guard below and for the full step's MOVE clauses, so the guard checks
+# the exact files the restore is about to write. An unreadable file or an empty file
+# list must stop the restore here rather than issue a REPLACE with no MOVE clauses,
+# which would restore data/log files back onto their ORIGINAL paths - silently
+# overwriting whatever already lives there.
+#
+# Before any step runs: refuse to clobber a file already on disk unless -Replace says
+# to - the same guard -RestoreRun runs, over the same Get-SebRestoreTargets paths. This
+# is what makes a re-run with a corrected -StopAt fail loudly instead of silently
+# overwriting the first attempt's files. -CloseConnections runs the same SINGLE_USER
+# WITH ROLLBACK IMMEDIATE -RestoreRun runs, for the same reason: an open connection to
+# the target name blocks the restore outright.
 function Invoke-SebRestoreToPoint {
   param($Connection, [string]$Root, [string]$HostName, [string]$InstanceLabel,
         [string]$Database, [string]$RestoreAs, [datetime]$StopAt,
-        [string]$DataDir, [string]$LogDir)
+        [string]$DataDir, [string]$LogDir,
+        [bool]$Replace = $false, [bool]$CloseConnections = $false)
   $cat = @(Get-SebPointCatalogue -Connection $Connection -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database)
   $plan = Get-SebRestorePlan -Catalogue $cat -StopAt $StopAt
   if ($plan.Error) { throw ('cannot restore to that point in time: ' + $plan.Error) }
+
+  $fullStep = $plan.Steps | Where-Object { $_.Kind -eq 'full' } | Select-Object -First 1
+  $fullInfo = Get-SebRestoreInspect -Connection $Connection -Path $fullStep.File
+  if (-not $fullInfo.Readable -or @($fullInfo.Files).Count -eq 0) {
+    throw ('cannot read the file list for {0}: {1}' -f $fullStep.File, $fullInfo.ReadReason)
+  }
+
+  foreach ($target in @(Get-SebRestoreTargets -Files $fullInfo.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir)) {
+    if ((Test-Path -LiteralPath $target) -and -not $Replace) {
+      throw ('{0} already exists. Restoring would overwrite a file that may belong to another database. Choose a different name, or move that file first.' -f $target)
+    }
+  }
+
+  if ($CloseConnections) {
+    try { Invoke-SebSqlNonQuery -Connection $Connection -Sql ('ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE' -f (Get-SebQuotedName $RestoreAs)) }
+    catch { }
+  }
+
   $total = $plan.Steps.Count
   $i = 0
   foreach ($step in $plan.Steps) {
     $i++
     Write-SebStage -Database $RestoreAs -Stage ('restore ' + $step.Kind + ' ' + $i + '/' + $total)
     $moves = @()
-    if ($step.Kind -eq 'full') {
-      $info = Get-SebRestoreInspect -Connection $Connection -Path $step.File
-      if (-not $info.Readable -or @($info.Files).Count -eq 0) {
-        throw ('cannot read the file list for {0}: {1}' -f $step.File, $info.ReadReason)
-      }
-      $moves = @(Get-SebRestoreMoveClauses -Files $info.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir)
-    }
-    $sql = Get-SebRestoreStepSql -Step $step -RestoreAs $RestoreAs -MoveClauses $moves
+    if ($step.Kind -eq 'full') { $moves = @(Get-SebRestoreMoveClauses -Files $fullInfo.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir) }
+    $sql = Get-SebRestoreStepSql -Step $step -RestoreAs $RestoreAs -Replace $Replace -MoveClauses $moves
     Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
   }
   Write-SebStage -Database $RestoreAs -Stage 'restore complete'
@@ -2955,6 +2980,7 @@ try {
   elseif ($RestoreToPoint) {
     if ([string]::IsNullOrWhiteSpace($Database)) { throw '-RestoreToPoint needs -Database <name>' }
     if ([string]::IsNullOrWhiteSpace($RestoreAs)) { throw '-RestoreToPoint needs -RestoreAs <database name>' }
+    if ($StopAt -eq [datetime]::MinValue) { throw '-RestoreToPoint requires -StopAt <datetime>' }
     $config = Read-SebRestoreContext
     $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
     try {
@@ -2981,10 +3007,11 @@ try {
 
       Write-SebJob -Index 1 -Total 1 -Database $RestoreAs
       Invoke-SebRestoreToPoint -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $chosen.InstanceName `
-        -Database $Database -RestoreAs $RestoreAs -StopAt $StopAt -DataDir $dataDir -LogDir $logDir
+        -Database $Database -RestoreAs $RestoreAs -StopAt $StopAt -DataDir $dataDir -LogDir $logDir `
+        -Replace:([bool]$RestoreReplace) -CloseConnections:([bool]$RestoreCloseConnections)
 
       Write-SebLog ('point-in-time restore finished: {0} -> {1} @ {2}' -f $Database, $RestoreAs, $StopAt)
-      Write-Host (ConvertTo-Json @{ Ok = $true; Database = $RestoreAs; Check = '' } -Compress)
+      Write-Host (ConvertTo-Json @{ Ok = $true; Database = $RestoreAs; Check = 'not verified by the engine - run DBCC CHECKDB separately' } -Compress)
     }
     finally { $connection.Close() }
   }
