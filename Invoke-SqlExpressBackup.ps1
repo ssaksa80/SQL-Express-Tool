@@ -2431,6 +2431,10 @@ function Get-SebRestoreSql {
 function Get-SebHeaderFactsFromRow {
   param($Row, [string]$File, [string]$Kind)
   if ($null -eq $Row) { return $null }
+  $finish = Get-SebValue $Row.BackupFinishDate
+  # A header with no finish time cannot be placed on the restore timeline - treat it as
+  # unusable (corrupt/truncated header) and skip it, rather than crash the [datetime] cast.
+  if ($null -eq $finish) { return $null }
   return [pscustomobject]@{
     Kind = $Kind
     File = $File
@@ -2438,7 +2442,7 @@ function Get-SebHeaderFactsFromRow {
     LastLSN = [decimal](Get-SebValue $Row.LastLSN)
     DatabaseBackupLSN = [decimal](Get-SebValue $Row.DatabaseBackupLSN)
     CheckpointLSN = [decimal](Get-SebValue $Row.CheckpointLSN)
-    Finish = [datetime](Get-SebValue $Row.BackupFinishDate)
+    Finish = [datetime]$finish
   }
 }
 
@@ -2461,8 +2465,13 @@ function Get-SebPointCatalogue {
   foreach ($folderKind in $map.Keys) {
     $dir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database -Kind $folderKind
     foreach ($fact in @(Get-SebFolderFacts -Directory $dir)) {
-      $h = Get-SebRestoreHeaderFacts -Connection $Connection -File $fact.FullName -Kind $map[$folderKind]
-      if ($null -ne $h) { [void]$cat.Add($h) }
+      try {
+        $h = Get-SebRestoreHeaderFacts -Connection $Connection -File $fact.FullName -Kind $map[$folderKind]
+        if ($null -ne $h) { [void]$cat.Add($h) }
+      }
+      catch {
+        Write-SebLog ('skipping an unreadable backup header in the ' + $folderKind + ' folder') 'WARN'
+      }
     }
   }
   return @($cat.ToArray())

@@ -1084,6 +1084,11 @@ $hn = Get-SebHeaderFactsFromRow -Row $nullRow -File 'Y.trn' -Kind 'log'
 Assert ($hn.FirstLSN -eq 0) 'a DBNull LSN maps to 0, not a thrown cast'
 Assert ($null -eq (Get-SebHeaderFactsFromRow -Row $null -File 'Z.bak' -Kind 'full')) 'a null row yields null facts'
 
+# A NULL finish date cannot be placed on the restore timeline - [datetime]$null throws
+# (unlike [decimal]$null, which is 0), so this must be skipped, not crash the cast.
+$noFinishRow = [pscustomobject]@{ FirstLSN=[decimal]1; LastLSN=[decimal]2; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]3; BackupFinishDate=[System.DBNull]::Value }
+Assert ($null -eq (Get-SebHeaderFactsFromRow -Row $noFinishRow -File 'bad.bak' -Kind 'full')) 'a header with no finish time is skipped (unusable), not a thrown datetime cast'
+
 Assert ((Get-Command Get-SebRestoreHeaderFacts -ErrorAction SilentlyContinue) -ne $null) 'Get-SebRestoreHeaderFacts is defined'
 Assert ((Get-Command Get-SebPointCatalogue -ErrorAction SilentlyContinue) -ne $null) 'Get-SebPointCatalogue is defined'
 
@@ -1105,6 +1110,6 @@ try {
   $multi = Get-SebRestoreHeaderFacts -Connection 'x' -File 'e.bak' -Kind 'full'
   Assert ($multi.CheckpointLSN -eq 3) 'multiple header rows use the first backup set without a cast crash'
 }
-finally { ${function:Invoke-SebSqlTable} = $realInvoke }
+finally { ${function:Invoke-SebSqlTable} = $realInvoke; $script:SebFakeRows = $null }
 
 Write-Host 'ALL PASS'
