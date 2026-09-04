@@ -1112,4 +1112,28 @@ try {
 }
 finally { ${function:Invoke-SebSqlTable} = $realInvoke; $script:SebFakeRows = $null }
 
+# ---- C3. per-step RESTORE SQL builder ----------------------------------------------
+$sFull = [pscustomobject]@{ Kind='full'; File='D:\s\F.bak'; Recovery=$false; StopAt=$null }
+$sqlF = Get-SebRestoreStepSql -Step $sFull -RestoreAs 'RestoreDemo' -MoveClauses @("MOVE 'd' TO 'X'", "MOVE 'l' TO 'Y'")
+Assert ($sqlF -match 'RESTORE DATABASE \[RestoreDemo\] FROM DISK') 'a full step is RESTORE DATABASE into the target name'
+Assert ($sqlF -match 'NORECOVERY' -and $sqlF -match 'REPLACE') 'a full step restores WITH NORECOVERY, REPLACE'
+Assert ($sqlF -match "MOVE 'd' TO 'X'" -and $sqlF -match "MOVE 'l' TO 'Y'") 'a full step carries the MOVE clauses that relocate its files'
+
+$sDiff = [pscustomobject]@{ Kind='diff'; File='D:\s\D.dif'; Recovery=$false; StopAt=$null }
+$sqlD = Get-SebRestoreStepSql -Step $sDiff -RestoreAs 'RestoreDemo'
+Assert ($sqlD -match 'RESTORE DATABASE \[RestoreDemo\] FROM DISK') 'a diff step is RESTORE DATABASE'
+Assert ($sqlD -match 'NORECOVERY') 'a diff step restores WITH NORECOVERY'
+
+$sLog = [pscustomobject]@{ Kind='log'; File='D:\s\L.trn'; Recovery=$false; StopAt=$null }
+$sqlL = Get-SebRestoreStepSql -Step $sLog -RestoreAs 'RestoreDemo'
+Assert ($sqlL -match 'RESTORE LOG \[RestoreDemo\] FROM DISK') 'a non-final log step is RESTORE LOG'
+Assert ($sqlL -match 'NORECOVERY') 'a non-final log step is WITH NORECOVERY'
+
+$sLogR = [pscustomobject]@{ Kind='log'; File='D:\s\L2.trn'; Recovery=$true; StopAt=[datetime]'2026-09-04 10:30:00' }
+$sqlLR = Get-SebRestoreStepSql -Step $sLogR -RestoreAs 'RestoreDemo'
+Assert ($sqlLR -match "STOPAT = '2026-09-04T10:30:00'") 'the final log step carries STOPAT = the target time (ISO 8601)'
+Assert ($sqlLR -match 'RECOVERY' -and $sqlLR -notmatch 'NORECOVERY') 'the final log step recovers the database'
+
+Assert ((Get-Command Invoke-SebRestoreToPoint -ErrorAction SilentlyContinue) -ne $null) 'Invoke-SebRestoreToPoint is defined'
+
 Write-Host 'ALL PASS'

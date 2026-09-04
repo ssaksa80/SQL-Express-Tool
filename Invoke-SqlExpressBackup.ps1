@@ -87,6 +87,9 @@ param(
   [switch]$RestoreRestrictedUser,
   [switch]$RestoreCloseConnections,
   [string]$RestoreRecoveryState = 'RECOVERY',
+  [switch]$RestoreToPoint,
+  [string]$Database,
+  [datetime]$StopAt,
   [switch]$FullInstall,
   [string]$ShareName = 'SqlBackups',
   [string]$ShareFolder = 'C:\SqlBackups',
@@ -2527,6 +2530,65 @@ function Get-SebRestorePlan {
   return [pscustomobject]@{ Steps = @($steps.ToArray()) }
 }
 
+# Pure. The RESTORE T-SQL for one plan step. Full carries WITH NORECOVERY, REPLACE and
+# the MOVE clauses that relocate the files to the new name; diff/log continue the chain;
+# the final (Recovery) log recovers WITH STOPAT at the target instant. ISO 8601 STOPAT
+# so SQL parses it unambiguously regardless of server locale.
+function Get-SebRestoreStepSql {
+  param($Step, [string]$RestoreAs, [string[]]$MoveClauses = @())
+  $target = Get-SebQuotedName $RestoreAs
+  $literal = Get-SebSqlLiteral $Step.File
+  if ($Step.Kind -eq 'full') {
+    $with = @('NORECOVERY', 'REPLACE') + $MoveClauses
+    return ('RESTORE DATABASE {0} FROM DISK = {1} WITH {2}' -f $target, $literal, ($with -join ', '))
+  }
+  if ($Step.Kind -eq 'diff') {
+    return ('RESTORE DATABASE {0} FROM DISK = {1} WITH NORECOVERY' -f $target, $literal)
+  }
+  if ($Step.Recovery) {
+    $stop = Get-SebSqlLiteral ($Step.StopAt.ToString('yyyy-MM-ddTHH:mm:ss'))
+    return ('RESTORE LOG {0} FROM DISK = {1} WITH STOPAT = {2}, RECOVERY' -f $target, $literal, $stop)
+  }
+  return ('RESTORE LOG {0} FROM DISK = {1} WITH NORECOVERY' -f $target, $literal)
+}
+
+# Impure. Build the catalogue, plan the point-in-time restore, and run each step. The
+# catalogue call is @()-wrapped so a single-fact catalogue is not collapsed to a scalar.
+#
+# Only the full step needs MOVE clauses: it is the one restoring WITH REPLACE into a
+# name that never had files of its own, so its physical files must be relocated; the
+# diff/log steps that follow apply to files already sitting at those relocated paths.
+# The file list comes from Get-SebRestoreInspect (RESTORE FILELISTONLY) against THAT
+# STEP's own backup file - the same call the -RestoreRun dispatch makes against
+# -RestoreFrom. An unreadable file or an empty file list must stop the restore here
+# rather than issue a REPLACE with no MOVE clauses, which would restore data/log files
+# back onto their ORIGINAL paths - silently overwriting whatever already lives there.
+function Invoke-SebRestoreToPoint {
+  param($Connection, [string]$Root, [string]$HostName, [string]$InstanceLabel,
+        [string]$Database, [string]$RestoreAs, [datetime]$StopAt,
+        [string]$DataDir, [string]$LogDir)
+  $cat = @(Get-SebPointCatalogue -Connection $Connection -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database)
+  $plan = Get-SebRestorePlan -Catalogue $cat -StopAt $StopAt
+  if ($plan.Error) { throw ('cannot restore to that point in time: ' + $plan.Error) }
+  $total = $plan.Steps.Count
+  $i = 0
+  foreach ($step in $plan.Steps) {
+    $i++
+    Write-SebStage -Database $RestoreAs -Stage ('restore ' + $step.Kind + ' ' + $i + '/' + $total)
+    $moves = @()
+    if ($step.Kind -eq 'full') {
+      $info = Get-SebRestoreInspect -Connection $Connection -Path $step.File
+      if (-not $info.Readable -or @($info.Files).Count -eq 0) {
+        throw ('cannot read the file list for {0}: {1}' -f $step.File, $info.ReadReason)
+      }
+      $moves = @(Get-SebRestoreMoveClauses -Files $info.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir)
+    }
+    $sql = Get-SebRestoreStepSql -Step $step -RestoreAs $RestoreAs -MoveClauses $moves
+    Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
+  }
+  Write-SebStage -Database $RestoreAs -Stage 'restore complete'
+}
+
 function Invoke-SebSelfTest {
   param([string]$PinnedInstance, [string]$WorkRoot)
 
@@ -2887,6 +2949,42 @@ try {
       Write-SebLog ('restore finished: {0}' -f $RestoreAs)
       Write-Host (ConvertTo-Json @{ Ok = $ok; Database = $RestoreAs; Check = $checkMessage } -Compress)
       if (-not $ok) { $exitCode = 1 }
+    }
+    finally { $connection.Close() }
+  }
+  elseif ($RestoreToPoint) {
+    if ([string]::IsNullOrWhiteSpace($Database)) { throw '-RestoreToPoint needs -Database <name>' }
+    if ([string]::IsNullOrWhiteSpace($RestoreAs)) { throw '-RestoreToPoint needs -RestoreAs <database name>' }
+    $config = Read-SebRestoreContext
+    $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
+    try {
+      # Read-SebRestoreContext is unelevated and exposes only DataSource/SharePath - it
+      # does not carry the instance's folder label (the InstanceName the backup cycle
+      # used to build the share path via Get-SebBackupPath). Get-SebInstanceList maps
+      # DataSource back to that InstanceName; it is the same registry-backed lookup
+      # -Setup and -SelfTest already use to choose an instance, and it needs no
+      # elevation, so this stays consistent with every other -Restore* mode.
+      $instances = @(Get-SebInstanceList)
+      $chosen = $instances | Where-Object { $_.DataSource -eq $config.DataSource } | Select-Object -First 1
+      if (-not $chosen) { throw ('could not resolve the SQL instance for {0} - is it registered on this host?' -f $config.DataSource) }
+
+      $dataDir = $RestoreDataDir
+      if ([string]::IsNullOrWhiteSpace($dataDir)) {
+        $rows = Invoke-SebSqlTable -Connection $connection -Sql "SELECT CAST(SERVERPROPERTY('InstanceDefaultDataPath') AS nvarchar(400)) AS p"
+        if (@($rows).Count -eq 0 -or [string]::IsNullOrWhiteSpace([string](Get-SebValue $rows[0].p))) {
+          throw 'could not determine the instance default data path; pass -RestoreDataDir <folder> explicitly'
+        }
+        $dataDir = [string](Get-SebValue $rows[0].p)
+      }
+      $logDir = $RestoreLogDir
+      if ([string]::IsNullOrWhiteSpace($logDir)) { $logDir = $dataDir }
+
+      Write-SebJob -Index 1 -Total 1 -Database $RestoreAs
+      Invoke-SebRestoreToPoint -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $chosen.InstanceName `
+        -Database $Database -RestoreAs $RestoreAs -StopAt $StopAt -DataDir $dataDir -LogDir $logDir
+
+      Write-SebLog ('point-in-time restore finished: {0} -> {1} @ {2}' -f $Database, $RestoreAs, $StopAt)
+      Write-Host (ConvertTo-Json @{ Ok = $true; Database = $RestoreAs; Check = '' } -Compress)
     }
     finally { $connection.Close() }
   }
