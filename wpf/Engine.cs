@@ -191,6 +191,36 @@ static class Engine
         catch (Exception ex) { error = ex.Message; return false; }
     }
 
+    // Discover the SQL Server instances on this host by reading the registry - the same
+    // source SQL Server Browser and the engine use. Value names under Instance Names\SQL
+    // are the instance names: "MSSQLSERVER" is the default instance, anything else (e.g.
+    // "SQLEXPRESS") is a named instance. Registry-only, so it needs no elevation and no
+    // SQL round-trip - safe to call while building the setup form.
+    public static List<string> DiscoverInstances()
+    {
+        List<string> names = new List<string>();
+        string[] keys = new string[] {
+            @"SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL",
+            @"SOFTWARE\WOW6432Node\Microsoft\Microsoft SQL Server\Instance Names\SQL"
+        };
+        foreach (string k in keys)
+        {
+            try
+            {
+                using (Microsoft.Win32.RegistryKey rk = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(k))
+                {
+                    if (rk == null) { continue; }
+                    foreach (string vn in rk.GetValueNames())
+                    {
+                        if (!string.IsNullOrEmpty(vn) && !names.Contains(vn)) { names.Add(vn); }
+                    }
+                }
+            }
+            catch { }
+        }
+        return names;
+    }
+
     // The engine's log directory: %ProgramData%\SqlExpressBackup\logs, holding one
     // backup-YYYYMM.log per month (line format: "yyyy-MM-dd HH:mm:ss [LEVEL] message").
     public static string LogDir()

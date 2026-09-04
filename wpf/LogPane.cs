@@ -159,7 +159,11 @@ class LogPane : Border
         Window w = new Window();
         w.Title = lastTitle;
         w.Width = 940; w.Height = 620; w.MinWidth = 480; w.MinHeight = 260;
-        w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        Window owner = Window.GetWindow(this);
+        if (owner == null && Application.Current != null) { owner = Application.Current.MainWindow; }
+        w.Owner = owner;
+        w.WindowStartupLocation = owner != null ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen;
+        if (owner != null) { w.Closed += delegate { try { owner.Activate(); } catch { } }; }
         w.Background = Theme.Bg; w.FontFamily = Ui.Face;
         // default WindowStyle already gives minimize / maximize / resize + a taskbar entry
         LogPane child = new LogPane(lastTitle, true, delegate { w.Close(); }, false);

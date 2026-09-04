@@ -15,8 +15,8 @@ class SetupWizard
     static readonly int[] Hrs = new int[] { 1, 2, 3, 4, 6, 8, 12, 24 };
 
     Window win;
-    TextBox instanceBox, shareBox, stagingBox, hourlyBox, dailyBox;
-    ComboBox intervalBox;
+    TextBox shareBox, stagingBox, hourlyBox, dailyBox;
+    ComboBox intervalBox, instanceBox;
     Border applyBtn;
     LogPane log;
     Action onDone;
@@ -39,7 +39,7 @@ class SetupWizard
         intro.TextWrapping = TextWrapping.Wrap; intro.Margin = new Thickness(0, 6, 0, 16);
         sp.Children.Add(intro);
 
-        instanceBox = Field(sp, "SQL instance", "", "Blank = the only instance on this host; otherwise e.g. SQLEXPRESS");
+        instanceBox = InstanceField(sp);
         shareBox = Field(sp, "Backup share (UNC)", "", "Where backups are written, e.g. \\\\fileserver\\sqlbackups");
         stagingBox = Field(sp, "Staging folder", "C:\\SqlBackupStaging", "Local scratch folder SQL writes to before copying to the share");
 
@@ -66,7 +66,28 @@ class SetupWizard
         sp.Children.Add(log);
 
         sv.Content = sp; win.Content = sv;
+        // When this window closes, hand focus back to the owner so the app stays in front
+        // instead of dropping behind whatever is next in the Z-order.
+        if (owner != null) { win.Closed += delegate { try { owner.Activate(); } catch { } }; }
         win.Show();
+    }
+
+    // Auto-discovered SQL instance picker: an editable combo pre-filled from the registry.
+    ComboBox InstanceField(StackPanel sp)
+    {
+        sp.Children.Add(Label("SQL instance"));
+        ComboBox c = new ComboBox(); c.IsEditable = true; c.FontSize = 12.5; c.FontFamily = Ui.Face;
+        c.Width = 440; c.HorizontalAlignment = HorizontalAlignment.Left;
+        System.Collections.Generic.List<string> inst = Engine.DiscoverInstances();
+        foreach (string i in inst) { c.Items.Add(i); }
+        string hint;
+        if (inst.Count == 1) { c.Text = inst[0]; hint = "Discovered: " + inst[0] + " (auto-filled). Blank = the only instance on this host."; }
+        else if (inst.Count > 1) { hint = "Discovered " + inst.Count + ": " + string.Join(", ", inst.ToArray()) + " - pick one from the list."; }
+        else { hint = "No instance auto-discovered - type it, e.g. SQLEXPRESS. Blank = the only instance on this host."; }
+        sp.Children.Add(c);
+        TextBlock h = Ui.Text(hint, 11, Theme.Ink3); h.TextWrapping = TextWrapping.Wrap; h.Margin = new Thickness(0, 2, 0, 10);
+        sp.Children.Add(h);
+        return c;
     }
 
     void Apply()

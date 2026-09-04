@@ -53,6 +53,7 @@ class RestoreWindow
         win.WindowStartupLocation = WindowStartupLocation.CenterOwner;
         win.Background = Theme.Bg; win.FontFamily = Ui.Face;
         win.Content = BuildRoot();
+        if (owner != null) { win.Closed += delegate { try { owner.Activate(); } catch { } }; }
         win.Show();
         LoadSets();
     }

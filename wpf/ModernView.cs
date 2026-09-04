@@ -206,7 +206,10 @@ class ModernView
         Window w = new Window();
         w.Title = "Backup schedule";
         w.Width = 480; w.Height = 400; w.MinWidth = 380; w.MinHeight = 280;
-        w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        Window main = Application.Current != null ? Application.Current.MainWindow : null;
+        w.Owner = main;
+        w.WindowStartupLocation = main != null ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen;
+        if (main != null) { w.Closed += delegate { try { main.Activate(); } catch { } }; }
         w.Background = Theme.Bg; w.FontFamily = Ui.Face;
         ScrollViewer sv = new ScrollViewer(); sv.Padding = new Thickness(20, 18, 20, 18);
         StackPanel sp = new StackPanel();
@@ -372,7 +375,10 @@ class ModernView
         Window w = new Window();
         w.Title = "Databases";
         w.Width = 560; w.Height = 520; w.MinWidth = 420; w.MinHeight = 300;
-        w.WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        Window main = Application.Current != null ? Application.Current.MainWindow : null;
+        w.Owner = main;
+        w.WindowStartupLocation = main != null ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen;
+        if (main != null) { w.Closed += delegate { try { main.Activate(); } catch { } }; }
         w.Background = Theme.Bg; w.FontFamily = Ui.Face;
         ScrollViewer sv = new ScrollViewer(); sv.Padding = new Thickness(20, 18, 20, 18);
         StackPanel sp = new StackPanel();
