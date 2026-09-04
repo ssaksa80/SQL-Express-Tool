@@ -859,4 +859,114 @@ Assert (-not (Test-SebNeedsRecoveryFull -Model 'FULL')) 'a database already in F
 Assert (Test-SebNeedsRecoveryFull -Model 'SIMPLE') 'a SIMPLE database needs the change'
 Assert (Test-SebNeedsRecoveryFull -Model 'BULK_LOGGED') 'a BULK_LOGGED database needs the change'
 
+# ---- A4. the SQL InfoMessage handler is unsubscribed on every exit path -------------
+# Regression for a delegate leak. The progress handler was subscribed once up front but
+# unsubscribed only in the finally of the compression-fallback retry at the bottom of
+# the function. The common success path returned early and both rethrow paths threw, so
+# each left one more handler subscribed on the connection. The SAME connection is reused
+# for every database in a pass, and the handler reads the script-scoped current database,
+# so by the Nth database its BACKUP emitted N copies of every [PROGRESS] line - noise
+# that grew across the pass, plus a delegate leak for the life of the connection. The fix
+# routes the whole body through Invoke-SebWithInfoHandler, which pairs add/remove in one
+# try/finally so it runs on success, on either throw, and after the fallback retry.
+#
+# Invoke-SebBackupDatabase needs a live connection, so it is driven with a fake one that
+# counts subscribe/unsubscribe and serves one ExecuteNonQuery outcome per call from a
+# queue - the same injected-collaborator style as the seams above (a ScriptMethod that
+# throws is wrapped in a MethodInvocationException, exactly as a real SqlException is, so
+# the error-classification path is exercised for real). This drives the REAL function,
+# not a copy of its logic.
+function New-SebFakeConn {
+  param([System.Collections.Queue]$Behaviours)
+  $c = [pscustomobject]@{ Added = 0; Removed = 0; Execs = 0; Behaviours = $Behaviours }
+  $c | Add-Member -MemberType ScriptMethod -Name add_InfoMessage -Value { param($h) $this.Added++ }
+  $c | Add-Member -MemberType ScriptMethod -Name remove_InfoMessage -Value { param($h) $this.Removed++ }
+  $c | Add-Member -MemberType ScriptMethod -Name CreateCommand -Value {
+    $cmd = [pscustomobject]@{ CommandText = ''; CommandTimeout = 0; Parent = $this }
+    $cmd | Add-Member -MemberType ScriptMethod -Name ExecuteNonQuery -Value {
+      $this.Parent.Execs++
+      $behaviour = $this.Parent.Behaviours.Dequeue()
+      return (& $behaviour)
+    }
+    $cmd | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+    return $cmd
+  }
+  return $c
+}
+
+$savedCompression = $script:SebCompression
+
+# Success path: the first BACKUP succeeds and the function returns early. This is the
+# path that leaked - the early return jumped over the only remove_InfoMessage.
+$script:SebCompression = 'unknown'
+$queue = New-Object System.Collections.Queue
+$queue.Enqueue({ 0 })
+$conn = New-SebFakeConn -Behaviours $queue
+Invoke-SebBackupDatabase -Connection $conn -Database 'APPDB' -TargetFile 'D:\stg\APPDB.bak' -Kind 'full'
+Assert ($conn.Added -eq 1) "success path subscribes to InfoMessage exactly once (added=$($conn.Added))"
+Assert ($conn.Removed -eq 1) "success path UNSUBSCRIBES exactly once - the leak this fixes (removed=$($conn.Removed))"
+Assert ($script:SebCompression -eq 'on') 'a first success probes compression as on'
+
+# Fallback path: a recognised compression failure retries uncompressed and succeeds.
+# This was the one path that already unsubscribed; asserted so the retry and the
+# unknown->off transition keep working after the refactor.
+$script:SebCompression = 'unknown'
+$queue = New-Object System.Collections.Queue
+$queue.Enqueue({ throw 'Backup compression is not supported on this edition' })
+$queue.Enqueue({ 0 })
+$conn = New-SebFakeConn -Behaviours $queue
+Invoke-SebBackupDatabase -Connection $conn -Database 'APPDB' -TargetFile 'D:\stg\APPDB.bak'
+Assert ($conn.Added -eq 1) 'fallback path still subscribes once'
+Assert ($conn.Removed -eq 1) "fallback path still unsubscribes once (removed=$($conn.Removed))"
+Assert ($conn.Execs -eq 2) "the compressed attempt actually fell back to an uncompressed retry (execs=$($conn.Execs))"
+Assert ($script:SebCompression -eq 'off') 'a recognised compression failure flips compression to off'
+
+# Rethrow path 1: compression already off, so an error is not a compression signal and
+# propagates. That exception used to skip the remove.
+$script:SebCompression = 'off'
+$queue = New-Object System.Collections.Queue
+$queue.Enqueue({ throw 'Write on backup device failed' })
+$conn = New-SebFakeConn -Behaviours $queue
+$threw = $false
+try { Invoke-SebBackupDatabase -Connection $conn -Database 'APPDB' -TargetFile 'D:\stg\APPDB.bak' } catch { $threw = $true }
+Assert $threw 'an error with compression already off still propagates to the caller'
+Assert ($conn.Added -eq 1) 'the already-off rethrow path subscribes once'
+Assert ($conn.Removed -eq 1) "the already-off rethrow path UNSUBSCRIBES once even though it throws (removed=$($conn.Removed))"
+
+# Rethrow path 2: an unrecognised error while compression is on is not a compression
+# signal either, so it also propagates - and must not leak the handler.
+$script:SebCompression = 'on'
+$queue = New-Object System.Collections.Queue
+$queue.Enqueue({ throw 'some unrelated backup failure' })
+$conn = New-SebFakeConn -Behaviours $queue
+$threw = $false
+try { Invoke-SebBackupDatabase -Connection $conn -Database 'APPDB' -TargetFile 'D:\stg\APPDB.bak' } catch { $threw = $true }
+Assert $threw 'an unrecognised error still propagates'
+Assert ($conn.Added -eq 1) 'the unrecognised-error path subscribes once'
+Assert ($conn.Removed -eq 1) "the unrecognised-error path UNSUBSCRIBES once (removed=$($conn.Removed))"
+
+# The seam in isolation: add/remove are paired around the body whether it returns a
+# value, returns early, or throws. A fake connection counts the calls; the throw case
+# also proves the exception is not swallowed.
+function New-SebPairCounter {
+  $x = [pscustomobject]@{ Added = 0; Removed = 0 }
+  $x | Add-Member -MemberType ScriptMethod -Name add_InfoMessage -Value { param($h) $this.Added++ }
+  $x | Add-Member -MemberType ScriptMethod -Name remove_InfoMessage -Value { param($h) $this.Removed++ }
+  return $x
+}
+$pc = New-SebPairCounter
+Invoke-SebWithInfoHandler -Connection $pc -Handler $null -Body { 'ok' } | Out-Null
+Assert ($pc.Added -eq 1 -and $pc.Removed -eq 1) "the seam pairs add/remove around a body that completes normally (added=$($pc.Added) removed=$($pc.Removed))"
+
+$pc = New-SebPairCounter
+Invoke-SebWithInfoHandler -Connection $pc -Handler $null -Body { return }
+Assert ($pc.Added -eq 1 -and $pc.Removed -eq 1) "the seam pairs add/remove around a body that returns early (added=$($pc.Added) removed=$($pc.Removed))"
+
+$pc = New-SebPairCounter
+$threw = $false
+try { Invoke-SebWithInfoHandler -Connection $pc -Handler $null -Body { throw 'boom' } } catch { $threw = $true }
+Assert ($threw -and $pc.Added -eq 1 -and $pc.Removed -eq 1) "the seam unsubscribes and rethrows when the body throws (threw=$threw added=$($pc.Added) removed=$($pc.Removed))"
+
+$script:SebCompression = $savedCompression
+
 Write-Host 'ALL PASS'

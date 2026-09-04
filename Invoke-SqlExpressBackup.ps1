@@ -1091,6 +1091,21 @@ function Get-SebBackupSql {
   return ('{0} {1} TO DISK = {2} WITH {3}' -f $verb, $quoted, $literal, ($with -join ', '))
 }
 
+# Subscribe to InfoMessage, run a body, and ALWAYS unsubscribe. Forgetting the remove
+# leaks a delegate on the connection, and the connection is reused for every database in
+# a pass: a leaked handler fires again on the next database's BACKUP and, because it
+# reads the script-scoped current database, duplicates that database's [PROGRESS] lines -
+# once more for every stale handler, so the noise grows across the pass. Pairing add and
+# remove in one try/finally makes the removal run on every exit - a value, an early
+# return, or a throw. Kept as its own function so the pairing is testable with a fake
+# connection that counts add_InfoMessage/remove_InfoMessage, without a live SQL Server.
+function Invoke-SebWithInfoHandler {
+  param($Connection, $Handler, [scriptblock]$Body)
+  $Connection.add_InfoMessage($Handler)
+  try { & $Body }
+  finally { $Connection.remove_InfoMessage($Handler) }
+}
+
 function Invoke-SebBackupDatabase {
   param($Connection, [string]$Database, [string]$TargetFile, [ValidateSet('full','diff')][string]$Kind = 'full')
   $compress = ($script:SebCompression -ne 'off')
@@ -1102,31 +1117,34 @@ function Invoke-SebBackupDatabase {
   }
   $script:SebProgressDb = $Database
   $script:SebProgressKind = $Kind
-  $Connection.add_InfoMessage($handler)
-  try {
-    Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
-    if ($script:SebCompression -eq 'unknown') { $script:SebCompression = 'on' }
-    return
-  }
-  catch {
-    $numbers = Get-SebSqlErrorNumbers $_
-    $message = $_.Exception.Message
-    # 3201 is "Cannot open backup device". On this script that is almost always the
-    # SQL service account lacking rights on the staging folder, which is worth
-    # saying outright rather than leaving as "Operating system error 5".
-    if ($numbers -contains 3201) {
-      throw ("SQL Server cannot write '$TargetFile'. The .bak is created by the SQL Server service " +
-        "account, not by whoever runs this script, so that account needs Modify on the staging " +
-        "folder. Re-run -Setup, which grants it and then proves it. Original error: " + $message)
+  # The whole attempt - first try, error classification, and the uncompressed retry -
+  # runs inside the handler wrapper so the delegate is removed on every one of those
+  # exit paths, not only after the fallback retry the way it once was.
+  Invoke-SebWithInfoHandler -Connection $Connection -Handler $handler -Body {
+    try {
+      Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
+      if ($script:SebCompression -eq 'unknown') { $script:SebCompression = 'on' }
+      return
     }
-    if ($script:SebCompression -eq 'off') { throw }
-    if (-not (Test-SebCompressionUnsupported -Numbers $numbers -Message $message)) { throw }
-    $script:SebCompression = 'off'
-    Write-SebLog 'this edition has no backup compression - continuing uncompressed' 'INFO'
+    catch {
+      $numbers = Get-SebSqlErrorNumbers $_
+      $message = $_.Exception.Message
+      # 3201 is "Cannot open backup device". On this script that is almost always the
+      # SQL service account lacking rights on the staging folder, which is worth
+      # saying outright rather than leaving as "Operating system error 5".
+      if ($numbers -contains 3201) {
+        throw ("SQL Server cannot write '$TargetFile'. The .bak is created by the SQL Server service " +
+          "account, not by whoever runs this script, so that account needs Modify on the staging " +
+          "folder. Re-run -Setup, which grants it and then proves it. Original error: " + $message)
+      }
+      if ($script:SebCompression -eq 'off') { throw }
+      if (-not (Test-SebCompressionUnsupported -Numbers $numbers -Message $message)) { throw }
+      $script:SebCompression = 'off'
+      Write-SebLog 'this edition has no backup compression - continuing uncompressed' 'INFO'
+    }
+    $sql = Get-SebBackupSql -Kind $Kind -Database $Database -TargetFile $TargetFile -Compress $false
+    Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
   }
-  $sql = Get-SebBackupSql -Kind $Kind -Database $Database -TargetFile $TargetFile -Compress $false
-  try { Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql }
-  finally { $Connection.remove_InfoMessage($handler) }
 }
 
 # BACKUP LOG. Error 4214 ("no current database backup") means the log chain has no
