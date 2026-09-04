@@ -812,15 +812,17 @@ Assert ((Get-SebStampFromName -Name 'APPDB_20260904-091500.trn' -Fallback $fb) -
 Assert ((Get-SebStampFromName -Name 'APPDB_20260904-091500.dif' -Fallback $fb) -eq $stampA) 'the stamp is read out of a .dif name'
 Assert ((Get-SebStampFromName -Name 'APPDB_20260904-091500.bak' -Fallback $fb) -eq $stampA) 'the stamp is still read out of a .bak name (no regression)'
 
-$tmpA = Join-Path $env:TEMP ('seb-a1-' + [guid]::NewGuid().ToString('N'))
-[void](New-Item -ItemType Directory -Path $tmpA -Force)
-Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-090000.bak') -Value 'x'
-Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-091500.trn') -Value 'x'
-Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-093000.dif') -Value 'x'
-Set-Content -LiteralPath (Join-Path $tmpA 'notes.txt') -Value 'x'
-$facts = @(Get-SebFolderFacts -Directory $tmpA)
-Assert ($facts.Count -eq 3) "folder facts include .bak, .dif and .trn but not .txt (got $($facts.Count))"
-Assert (@($facts | Where-Object { $_.Name -like '*.trn' }).Count -eq 1) 'the .trn file is enumerated'
-Remove-Item -LiteralPath $tmpA -Recurse -Force -ErrorAction SilentlyContinue
+$tmpA = Join-Path $env:TEMP ('seb-a1-' + [Guid]::NewGuid().ToString('N'))
+try {
+  [void](New-Item -ItemType Directory -Path $tmpA -Force)
+  Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-090000.bak') -Value 'x'
+  Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-091500.trn') -Value 'x'
+  Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-093000.dif') -Value 'x'
+  Set-Content -LiteralPath (Join-Path $tmpA 'notes.txt') -Value 'x'
+  $facts = @(Get-SebFolderFacts -Directory $tmpA)
+  Assert ($facts.Count -eq 3) "folder facts include .bak, .dif and .trn but not .txt (got $($facts.Count))"
+  Assert (@($facts | Where-Object { $_.Name -like '*.trn' }).Count -eq 1) 'the .trn file is enumerated'
+}
+finally { Remove-Item -LiteralPath $tmpA -Recurse -Force -ErrorAction SilentlyContinue }
 
 Write-Host 'ALL PASS'

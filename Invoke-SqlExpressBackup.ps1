@@ -246,7 +246,7 @@ function Get-SebBackupPath {
 }
 
 function Get-SebFileName {
-  param([string]$Database, [datetime]$Stamp, [string]$Extension = 'bak')
+  param([string]$Database, [datetime]$Stamp, [ValidateSet('bak','dif','trn')][string]$Extension = 'bak')
   return ('{0}_{1}.{2}' -f (Get-SebSafeName $Database), $Stamp.ToString('yyyyMMdd-HHmmss'), $Extension)
 }
 
@@ -1141,7 +1141,7 @@ function Get-SebFolderFacts {
   param([string]$Directory)
   if (-not (Test-Path -LiteralPath $Directory)) { return @() }
   $items = Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '\.(bak|dif|trn)$' }
+    Where-Object { $_.Name -cmatch '\.(bak|dif|trn)$' }
   $facts = foreach ($item in $items) {
     [pscustomobject]@{
       Name      = $item.Name
