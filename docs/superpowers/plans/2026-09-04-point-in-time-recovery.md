@@ -303,7 +303,7 @@ git commit -m "feat(engine): idempotent switch of a database to FULL recovery"
 - Modify: `Invoke-SqlExpressBackup.ps1` (new `Get-SebChainRetentionPlan`)
 - Test: `test/sqlexpress-backup.test.ps1`
 
-- [ ] **Step 1: Write the failing tests.** Append. Facts carry a `[decimal]` `FirstLSN`, and fulls carry their own `FirstLSN`; diffs/logs carry `LastLSN`. The rule under test: keep the newest full at or before the horizon plus everything newer, and never delete a diff/log still needed to roll that retained full forward.
+- [ ] **Step 1: Write the failing tests.** Append. Facts carry a `[decimal]` `FirstLSN`, and fulls carry their own `FirstLSN`; diffs/logs carry `LastLSN`. The rule under test: keep the oldest full still newer than the horizon plus everything newer (falling back to the single newest full when none are in-horizon), and never delete a diff/log still needed to roll a retained full forward.
 
 ```powershell
 # ---- B1. chain-safe retention never strands a needed segment ------------------------
@@ -347,11 +347,12 @@ Assert ($planB4.FullDelete.Count -eq 0 -and $planB4.DiffDelete.Count -eq 0 -and 
 
 - [ ] **Step 3: Implement.** Add next to `Get-SebRetentionPlan`:
 ```powershell
-# Chain-safe retention for FULL-recovery databases. Keep the newest full at or before
-# the horizon and every full newer than it; keep every diff/log whose LastLSN reaches
-# into or past the oldest retained full (i.e. still needed to roll it forward). Prune
-# only segments that end strictly before the oldest retained full begins. Never leave
-# zero fulls. GFS (a later feature) layers extra "keep" rules on top of this floor.
+# Chain-safe retention for FULL-recovery databases. Keep the oldest full still newer
+# than the horizon and every full newer than it (fall back to the single newest full
+# when none are in-horizon); keep every diff/log whose LastLSN reaches into or past
+# that anchor full (i.e. still needed to roll it forward). Prune only segments that end
+# strictly before the anchor begins. Never leave zero fulls. GFS (a later feature)
+# layers extra "keep" rules on top of this floor.
 function Get-SebChainRetentionPlan {
   param(
     [object[]]$Fulls = @(),
@@ -362,19 +363,19 @@ function Get-SebChainRetentionPlan {
   )
   if ($DailyKeepDays -lt 1) { $DailyKeepDays = 1 }
   $result = [pscustomobject]@{ FullDelete = @(); DiffDelete = @(); LogDelete = @() }
-  $fullsSorted = @($Fulls | Sort-Object -Property Timestamp)   # oldest first
+  $fullsSorted = @($Fulls | Sort-Object -Property Timestamp, FirstLSN)   # oldest first, deterministic on ties
   if ($fullsSorted.Count -eq 0) { return $result }
 
   $horizon = $Now.AddDays(-1 * $DailyKeepDays)
-  # The oldest full we must keep: the newest full whose stamp is <= horizon anchors the
-  # window (older fulls are prunable); if every full is newer than the horizon, keep the
-  # oldest of them; if every full is older, keep the single newest (never zero).
-  $atOrBeforeHorizon = @($fullsSorted | Where-Object { $_.Timestamp -le $horizon })
-  if ($atOrBeforeHorizon.Count -gt 0) {
-    $anchor = $atOrBeforeHorizon[$atOrBeforeHorizon.Count - 1]
+  # Anchor = the oldest full still newer than the horizon (the base a restore to the
+  # oldest recoverable point needs); if none are in-horizon, keep the single newest full
+  # so we never leave zero fulls. Fulls older than the anchor are prunable.
+  $inHorizon = @($fullsSorted | Where-Object { $_.Timestamp -gt $horizon })
+  if ($inHorizon.Count -gt 0) {
+    $anchor = $inHorizon[0]
   }
-  elseif ($fullsSorted.Count -gt 0) {
-    $anchor = $fullsSorted[0]
+  else {
+    $anchor = $fullsSorted[$fullsSorted.Count - 1]
   }
   $anchorLsn = [decimal]$anchor.FirstLSN
 
