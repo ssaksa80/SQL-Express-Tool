@@ -219,8 +219,17 @@ static class Install
         string dir = InstallDir();
         try
         {
-            // A detached cmd waits for this process to exit, then removes the folder.
-            string cmd = "/C ping 127.0.0.1 -n 3 > nul & rmdir /S /Q \"" + dir + "\"";
+            // A detached cmd waits for this process to exit, then removes the folder -
+            // with RETRIES. The first rmdir can clear the contents yet fail to drop the
+            // now-empty directory when a handle to it is briefly still open (the exiting
+            // exe, antivirus, an open Explorer window), leaving an empty shell behind.
+            // Three attempts spaced ~2s apart clear that race. `rmdir /S /Q` on an
+            // already-empty or already-gone dir is harmless, so the extra passes cost
+            // nothing when the first one succeeds.
+            string q = "\"" + dir + "\"";
+            string wait = "ping 127.0.0.1 -n 3 >nul";
+            string rm = "rmdir /S /Q " + q + " 2>nul";
+            string cmd = "/C " + wait + " & " + rm + " & " + wait + " & " + rm + " & " + wait + " & " + rm;
             ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", cmd);
             psi.UseShellExecute = false; psi.CreateNoWindow = true;
             Process.Start(psi);
