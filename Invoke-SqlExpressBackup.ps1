@@ -2429,10 +2429,10 @@ function Get-SebRestoreSql {
 # or an { Error } describing why the target is not recoverable. LSNs are decimals.
 function Get-SebRestorePlan {
   param([object[]]$Catalogue = @(), [datetime]$StopAt)
-  $fulls = @($Catalogue | Where-Object { $_.Kind -eq 'full' } | Sort-Object Finish)
+  $fulls = @($Catalogue | Where-Object { $_.Kind -eq 'full' } | Sort-Object Finish, FirstLSN)
   $eligible = @($fulls | Where-Object { $_.Finish -le $StopAt })
   if ($eligible.Count -eq 0) {
-    return [pscustomobject]@{ Error = 'target is before the earliest full backup' }
+    return [pscustomobject]@{ Error = ('target is before the earliest full backup (earliest recoverable: {0:yyyy-MM-dd HH:mm:ss})' -f $fulls[0].Finish) }
   }
   $base = $eligible[$eligible.Count - 1]
   $steps = New-Object System.Collections.ArrayList
@@ -2445,26 +2445,29 @@ function Get-SebRestorePlan {
   # that took writes during its full.
   $diffs = @($Catalogue | Where-Object {
       $_.Kind -eq 'diff' -and [decimal]$_.DatabaseBackupLSN -eq [decimal]$base.CheckpointLSN -and $_.Finish -le $StopAt
-    } | Sort-Object Finish)
+    } | Sort-Object Finish, FirstLSN)
   if ($diffs.Count -gt 0) {
     $diff = $diffs[$diffs.Count - 1]
     [void]$steps.Add([pscustomobject]@{ Kind = 'diff'; File = $diff.File; Recovery = $false; StopAt = $null })
     $chainLsn = [decimal]$diff.LastLSN
   }
 
+  # Keyed on LastLSN, not FirstLSN: a log that STARTS before the chain point but ENDS
+  # past it (e.g. bracketing a differential's LSN, the L1 case) is still the next log
+  # that must be applied - filtering on FirstLSN would wrongly exclude it.
   $logs = @($Catalogue | Where-Object { $_.Kind -eq 'log' -and [decimal]$_.LastLSN -gt $chainLsn } | Sort-Object { [decimal]$_.FirstLSN })
   $spanning = $null
   $prevLast = $chainLsn
   foreach ($log in $logs) {
     if ([decimal]$log.FirstLSN -gt $prevLast) {
-      return [pscustomobject]@{ Error = ('gap in the log chain before LSN {0} - the backup chain is broken' -f $log.FirstLSN) }
+      return [pscustomobject]@{ Error = ('gap in the log chain: no backup bridges LSN {0} to {1} ({2}) - the chain is broken and this point cannot be restored' -f $prevLast, $log.FirstLSN, $log.File) }
     }
     if ($log.Finish -ge $StopAt) { $spanning = $log; break }
     [void]$steps.Add([pscustomobject]@{ Kind = 'log'; File = $log.File; Recovery = $false; StopAt = $null })
     $prevLast = [decimal]$log.LastLSN
   }
   if ($null -eq $spanning) {
-    $latest = if ($logs.Count -gt 0) { $logs[$logs.Count - 1].Finish } else { $base.Finish }
+    $latest = if ($logs.Count -gt 0) { $logs[$logs.Count - 1].Finish } elseif ($diffs.Count -gt 0) { $diffs[$diffs.Count - 1].Finish } else { $base.Finish }
     return [pscustomobject]@{ Error = ('target is after the newest log backup (latest recoverable: {0:yyyy-MM-dd HH:mm:ss})' -f $latest) }
   }
   [void]$steps.Add([pscustomobject]@{ Kind = 'log'; File = $spanning.File; Recovery = $true; StopAt = $StopAt })

@@ -1050,6 +1050,16 @@ Assert ($pe.Error -match 'earliest') 'a target before the first full is a bounde
 $pl = Get-SebRestorePlan -Catalogue $cat -StopAt ($b.AddHours(9))
 Assert ($pl.Error -match 'newest|latest') 'a target after the last log is a bounded-range error'
 
+# When a differential is the newest usable backup and no log extends past it, the
+# latest-recoverable time in the error must reflect the DIFF's finish, not the full's -
+# reporting the full's time here would understate how much is actually recoverable.
+$catNoLog = @(
+  (New-Cat 'full' 'F.bak' 100 100 0   105 $b),
+  (New-Cat 'diff' 'D.dif' 150 150 105 0   $b.AddHours(2))
+)
+$pnl = Get-SebRestorePlan -Catalogue $catNoLog -StopAt ($b.AddHours(2).AddMinutes(30))
+Assert ($pnl.Error -match 'latest recoverable: 2026-09-04 10:00:00') 'the latest-recoverable time reflects the newest diff when no log extends past it'
+
 # A gap in the log chain (missing 160->220) is detected, not silently skipped.
 $catGap = @(
   (New-Cat 'full' 'F.bak' 100 100 0 105 $b),
