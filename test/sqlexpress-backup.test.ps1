@@ -852,4 +852,11 @@ Assert (Test-SebLogNeedsBase -Numbers @(3013,4214)) 'a 4214 among other numbers 
 Assert (-not (Test-SebLogNeedsBase -Numbers @(3201))) 'an unrelated SQL error is not a missing-base signal'
 Assert (-not (Test-SebLogNeedsBase -Numbers @())) 'no error numbers is not a missing-base signal'
 
+# ---- A3. switching recovery model ---------------------------------------------------
+Assert ((Get-SebRecoveryFullSql -Database 'APPDB') -eq 'ALTER DATABASE [APPDB] SET RECOVERY FULL') 'the recovery-model change is a bracket-quoted ALTER DATABASE'
+Assert ((Get-SebRecoveryFullSql -Database "we'ird") -eq "ALTER DATABASE [we'ird] SET RECOVERY FULL") 'an odd database name is still bracket-quoted'
+Assert (-not (Test-SebNeedsRecoveryFull -Model 'FULL')) 'a database already in FULL needs no change'
+Assert (Test-SebNeedsRecoveryFull -Model 'SIMPLE') 'a SIMPLE database needs the change'
+Assert (Test-SebNeedsRecoveryFull -Model 'BULK_LOGGED') 'a BULK_LOGGED database needs the change'
+
 Write-Host 'ALL PASS'

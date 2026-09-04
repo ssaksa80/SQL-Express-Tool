@@ -1147,6 +1147,29 @@ function Invoke-SebBackupLog {
   }
 }
 
+function Get-SebRecoveryFullSql {
+  param([string]$Database)
+  return ('ALTER DATABASE {0} SET RECOVERY FULL' -f (Get-SebQuotedName $Database))
+}
+
+function Test-SebNeedsRecoveryFull {
+  param([string]$Model)
+  return ($Model -ne 'FULL')
+}
+
+# Idempotent. Reads the model, changes it only if needed, and returns $true when it
+# changed (so the caller knows a fresh anchoring full is now required).
+function Set-SebRecoveryFull {
+  param($Connection, [string]$Database)
+  $rows = Invoke-SebSqlTable -Connection $Connection -Sql (
+    "SELECT recovery_model_desc AS m FROM sys.databases WHERE name = " + (Get-SebSqlLiteral $Database))
+  $model = if (@($rows).Count -gt 0) { [string]$rows[0].m } else { 'FULL' }
+  if (-not (Test-SebNeedsRecoveryFull -Model $model)) { return $false }
+  Invoke-SebSqlNonQuery -Connection $Connection -Sql (Get-SebRecoveryFullSql -Database $Database)
+  Write-SebLog ('recovery model of a database set to FULL') 'INFO'
+  return $true
+}
+
 function Test-SebBackupFile {
   param($Connection, [string]$TargetFile)
   $sql = 'RESTORE VERIFYONLY FROM DISK = {0} WITH CHECKSUM' -f (Get-SebSqlLiteral $TargetFile)
