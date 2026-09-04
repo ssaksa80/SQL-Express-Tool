@@ -517,7 +517,7 @@ git commit -m "feat(engine): pure point-in-time restore planner with gap detecti
 ```powershell
 function Get-SebRestoreHeaderFacts {
   param($Connection, [string]$File, [string]$Kind)
-  $rows = @(Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE HEADERONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $File)))
+  $rows = Invoke-SebSqlTable -Connection $Connection -Sql ('RESTORE HEADERONLY FROM DISK = {0}' -f (Get-SebSqlLiteral $File))
   if ($rows.Count -eq 0) { return $null }
   $r = $rows[0]
   # Wrap every column in Get-SebValue so a NULL header field arrives as $null, never a
