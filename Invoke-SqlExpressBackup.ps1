@@ -72,6 +72,7 @@ param(
   [string]$As = 'Task',
   [switch]$Run,
   [switch]$Loop,                  # service mode: keep running, one pass per interval
+  [switch]$BackupLog,             # transaction-log-only pass for FULL-recovery databases
   [switch]$Status,
   [switch]$Reschedule,            # change interval/retention in config and re-register the schedule
   [switch]$SelfTest,
@@ -1365,6 +1366,48 @@ function Get-SebMutex {
     }
   }
   return $null
+}
+
+# Which kind of backup a data pass should take: a full when the newest full is at least
+# FullEveryHours old (or none exists), otherwise a differential off that full.
+function Get-SebBackupKindDue {
+  param([double]$HoursSinceFull, [int]$FullEveryHours = 24)
+  if ($HoursSinceFull -ge $FullEveryHours) { return 'full' }
+  return 'diff'
+}
+
+# The -BackupLog task: one transaction-log backup of every FULL-recovery user database,
+# staged locally then copied to the share's log/ folder. If a database has no base yet
+# (SEB_LOG_NO_BASE), anchor it with a full first, then retry the log.
+function Invoke-SebBackupLogPass {
+  param($Connection, [string]$Root, [string]$HostName, [string]$InstanceLabel, [string]$StagingPath)
+  $rows = Invoke-SebSqlTable -Connection $Connection -Sql @'
+SELECT d.name, d.state, d.source_database_id, d.is_in_standby
+FROM sys.databases AS d
+'@
+  foreach ($db in @(Select-SebDatabase -Rows $rows)) {
+    $modelRows = Invoke-SebSqlTable -Connection $Connection -Sql (Get-SebRecoveryModelSql -Database $db)
+    if ((Get-SebRecoveryModelFromRows -Rows $modelRows) -ne 'FULL') { continue }
+    $stamp = Get-Date
+    $logName = Get-SebFileName -Database $db -Stamp $stamp -Extension 'trn'
+    $logStaged = Join-Path $StagingPath $logName
+    try { Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged }
+    catch {
+      if ("$_" -notmatch 'SEB_LOG_NO_BASE') { throw }
+      Write-SebLog ('anchoring {0} with a full before its first log backup' -f $db) 'INFO'
+      $anchorName = Get-SebFileName -Database $db -Stamp $stamp
+      $anchorStaged = Join-Path $StagingPath $anchorName
+      Invoke-SebBackupDatabase -Connection $Connection -Database $db -TargetFile $anchorStaged -Kind 'full'
+      $anchorDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'hourly') $anchorName
+      Copy-SebVerified -Source $anchorStaged -Destination $anchorDest
+      Remove-Item -LiteralPath $anchorStaged -Force -ErrorAction SilentlyContinue
+      Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged
+    }
+    $logDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'log') $logName
+    Copy-SebVerified -Source $logStaged -Destination $logDest
+    Remove-Item -LiteralPath $logStaged -Force -ErrorAction SilentlyContinue
+    Write-SebLog ('log backup of {0} taken and copied' -f $db) 'INFO'
+  }
 }
 
 function Invoke-SebPass {
@@ -3079,6 +3122,37 @@ try {
   elseif ($Status) {
     Assert-SebElevated -Mode 'Status'
     Show-SebStatus
+  }
+  elseif ($BackupLog) {
+    # Mirrors -Run/Invoke-SebPass's own setup/teardown: same elevation gate (this reads
+    # the same locked config, and the SQL-auth branch reads the sealed credential too),
+    # same Windows-vs-SQL-auth connection pattern, same dispose-in-finally shape.
+    Assert-SebElevated -Mode 'BackupLog'
+    $config = Read-SebConfig
+    $password = $null
+    $connection = $null
+    try {
+      if ($config.UseWindowsAuth) {
+        $connection = New-SebSqlConnection -DataSource $config.DataSource -WindowsAuth
+      }
+      else {
+        $master = Get-SebMasterKey
+        try {
+          $blob = Get-Content -LiteralPath (Get-SebCredPath) -Raw
+          $password = Unprotect-SebSecureString -Blob $blob.Trim() -Master $master
+        }
+        finally { [System.Array]::Clear($master, 0, $master.Length) }
+        $connection = New-SebSqlConnection -DataSource $config.DataSource -User $config.SqlUser -Password $password
+      }
+      Write-SebLog ('connected to {0}' -f $config.DataSource)
+
+      Invoke-SebBackupLogPass -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath
+      Write-Host (ConvertTo-Json @{ Ok = $true; Mode = 'BackupLog' } -Compress)
+    }
+    finally {
+      if ($null -ne $connection) { $connection.Dispose() }
+      if ($null -ne $password) { $password.Dispose() }
+    }
   }
   else {
     Assert-SebElevated -Mode 'Run'

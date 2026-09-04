@@ -1138,4 +1138,11 @@ Assert ($sqlLR -match 'RECOVERY' -and $sqlLR -notmatch 'NORECOVERY') 'the final 
 
 Assert ((Get-Command Invoke-SebRestoreToPoint -ErrorAction SilentlyContinue) -ne $null) 'Invoke-SebRestoreToPoint is defined'
 
+# ---- D1a. a data pass takes a full when one is due, otherwise a differential --------
+Assert ((Get-SebBackupKindDue -HoursSinceFull 30 -FullEveryHours 24) -eq 'full') 'no recent full -> take a full'
+Assert ((Get-SebBackupKindDue -HoursSinceFull 3  -FullEveryHours 24) -eq 'diff') 'a recent full -> take a differential'
+Assert ((Get-SebBackupKindDue -HoursSinceFull ([double]::PositiveInfinity) -FullEveryHours 24) -eq 'full') 'a database that has never had a full -> take a full'
+Assert ((Get-SebBackupKindDue -HoursSinceFull 24 -FullEveryHours 24) -eq 'full') 'exactly at the interval -> a full is due'
+Assert ((Get-Command Invoke-SebBackupLogPass -ErrorAction SilentlyContinue) -ne $null) 'Invoke-SebBackupLogPass is defined'
+
 Write-Host 'ALL PASS'
