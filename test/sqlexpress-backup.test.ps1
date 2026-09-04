@@ -801,4 +801,26 @@ $helperBlock = $engineText.Substring($helperIdx, 700)
 Assert ($helperBlock -match 'SqlAccount' -and $helperBlock -match "AccessRight Read") 'the SQL service is granted READ on the share'
 Assert ($helperBlock -match "MachineAccount" -and $helperBlock -match "AccessRight Full") 'the machine account keeps Full - it is what copies backups in'
 
+# ---- A1. filenames and folder facts carry .dif / .trn as well as .bak --------------
+$stampA = [datetime]'2026-09-04 09:15:00'
+Assert ((Get-SebFileName -Database 'APPDB' -Stamp $stampA) -eq 'APPDB_20260904-091500.bak') 'default extension is .bak (unchanged)'
+Assert ((Get-SebFileName -Database 'APPDB' -Stamp $stampA -Extension 'dif') -eq 'APPDB_20260904-091500.dif') 'a differential file is named .dif'
+Assert ((Get-SebFileName -Database 'APPDB' -Stamp $stampA -Extension 'trn') -eq 'APPDB_20260904-091500.trn') 'a log file is named .trn'
+
+$fb = [datetime]'2000-01-01'
+Assert ((Get-SebStampFromName -Name 'APPDB_20260904-091500.trn' -Fallback $fb) -eq $stampA) 'the stamp is read out of a .trn name'
+Assert ((Get-SebStampFromName -Name 'APPDB_20260904-091500.dif' -Fallback $fb) -eq $stampA) 'the stamp is read out of a .dif name'
+Assert ((Get-SebStampFromName -Name 'APPDB_20260904-091500.bak' -Fallback $fb) -eq $stampA) 'the stamp is still read out of a .bak name (no regression)'
+
+$tmpA = Join-Path $env:TEMP ('seb-a1-' + [guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpA -Force)
+Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-090000.bak') -Value 'x'
+Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-091500.trn') -Value 'x'
+Set-Content -LiteralPath (Join-Path $tmpA 'APPDB_20260904-093000.dif') -Value 'x'
+Set-Content -LiteralPath (Join-Path $tmpA 'notes.txt') -Value 'x'
+$facts = @(Get-SebFolderFacts -Directory $tmpA)
+Assert ($facts.Count -eq 3) "folder facts include .bak, .dif and .trn but not .txt (got $($facts.Count))"
+Assert (@($facts | Where-Object { $_.Name -like '*.trn' }).Count -eq 1) 'the .trn file is enumerated'
+Remove-Item -LiteralPath $tmpA -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host 'ALL PASS'

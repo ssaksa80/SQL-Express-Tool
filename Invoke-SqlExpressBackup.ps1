@@ -236,7 +236,7 @@ function Get-SebBackupPath {
     [string]$HostName,
     [string]$InstanceLabel,
     [string]$Database,
-    [ValidateSet('hourly', 'daily')]
+    [ValidateSet('hourly', 'daily', 'diff', 'log')]
     [string]$Kind
   )
   $path = Join-Path $Root (Get-SebSafeName $HostName)
@@ -246,8 +246,8 @@ function Get-SebBackupPath {
 }
 
 function Get-SebFileName {
-  param([string]$Database, [datetime]$Stamp)
-  return ('{0}_{1}.bak' -f (Get-SebSafeName $Database), $Stamp.ToString('yyyyMMdd-HHmmss'))
+  param([string]$Database, [datetime]$Stamp, [string]$Extension = 'bak')
+  return ('{0}_{1}.{2}' -f (Get-SebSafeName $Database), $Stamp.ToString('yyyyMMdd-HHmmss'), $Extension)
 }
 
 # Trust the name over the mtime. Copying a file to a share can move LastWriteTime,
@@ -255,7 +255,7 @@ function Get-SebFileName {
 # file. The stamp is baked into the name at BACKUP time and never changes after.
 function Get-SebStampFromName {
   param([string]$Name, [datetime]$Fallback)
-  $match = [regex]::Match($Name, '_(\d{8})-(\d{6})\.bak$')
+  $match = [regex]::Match($Name, '_(\d{8})-(\d{6})\.(bak|dif|trn)$')
   if (-not $match.Success) { return $Fallback }
   $parsed = [datetime]::MinValue
   $ok = [datetime]::TryParseExact(
@@ -1140,7 +1140,8 @@ function Copy-SebVerified {
 function Get-SebFolderFacts {
   param([string]$Directory)
   if (-not (Test-Path -LiteralPath $Directory)) { return @() }
-  $items = Get-ChildItem -LiteralPath $Directory -Filter '*.bak' -File -ErrorAction SilentlyContinue
+  $items = Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '\.(bak|dif|trn)$' }
   $facts = foreach ($item in $items) {
     [pscustomobject]@{
       Name      = $item.Name
