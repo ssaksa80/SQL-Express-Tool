@@ -191,6 +191,38 @@ static class Engine
         catch (Exception ex) { error = ex.Message; return false; }
     }
 
+    // Point-in-time restore: <src> -> a new database <asName>, replayed up to the local
+    // wall-clock moment <stopAt>. Unelevated - same restore context as RestoreRun/RestoreList
+    // (reads public.json, no UAC) - so this calls Run() directly exactly like they do.
+    // Streams every line to onLine as it arrives (the [STAGE]/[PROGRESS] markers, and on
+    // failure the engine's own [ERROR] line naming the reason - a bounded/gap target, a
+    // missing backup, etc). -RestoreToPoint prints a final {"Ok":true,...} line ONLY on
+    // success; a validation failure throws inside the engine before that line is ever
+    // written, so success here is never assumed from the process just having run - it is
+    // read back off that final JSON line, the same way RestoreVerify reads "Ok" above.
+    public static bool RestoreToPoint(string src, string asName, DateTime stopAt, bool replace, Action<string> onLine)
+    {
+        string args = "-RestoreToPoint -Database \"" + src + "\" -RestoreAs \"" + asName +
+            "\" -StopAt \"" + stopAt.ToString("yyyy-MM-ddTHH:mm:ss") + "\"";
+        if (replace) { args += " -RestoreReplace"; }
+
+        StringBuilder all = new StringBuilder();
+        Run(args, delegate(string line)
+        {
+            all.AppendLine(line);
+            if (onLine != null) { onLine(line); }
+        });
+        string json = LastJsonLine(all.ToString());
+        if (json == null) { return false; }
+        try
+        {
+            JavaScriptSerializer js = new JavaScriptSerializer();
+            Dictionary<string, object> d = js.Deserialize<Dictionary<string, object>>(json);
+            return d != null && d.ContainsKey("Ok") && Convert.ToBoolean(d["Ok"]);
+        }
+        catch { return false; }
+    }
+
     // Discover the SQL Server instances on this host by reading the registry - the same
     // source SQL Server Browser and the engine use. Value names under Instance Names\SQL
     // are the instance names: "MSSQLSERVER" is the default instance, anything else (e.g.

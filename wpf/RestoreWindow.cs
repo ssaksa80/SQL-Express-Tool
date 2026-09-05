@@ -42,6 +42,16 @@ class RestoreWindow
     Border verifyCard;
     bool busy;
 
+    // ---- point-in-time restore mode -------------------------------------------------
+    bool pointInTimeMode;
+    Border modeHeader;
+    ComboBox pointDbBox;
+    DatePicker pointDate;
+    TextBox pointHourBox, pointMinuteBox, pointAsBox;
+    CheckBox pointReplaceBox;
+    Border pointStartBtn;
+    string pointAsDefaultFor;
+
     struct PlanFile { public string Logical; public string Type; public long Bytes; }
 
     public void Show(Window owner)
@@ -125,12 +135,61 @@ class RestoreWindow
 
     FrameworkElement DetailPane()
     {
+        Grid outer = new Grid();
+        outer.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // mode toggle
+        outer.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+
+        modeHeader = new Border();
+        modeHeader.Background = Theme.Surface; modeHeader.BorderBrush = Theme.Line; modeHeader.BorderThickness = new Thickness(0, 0, 0, 1);
+        modeHeader.Padding = new Thickness(14, 10, 14, 0);
+        RenderModeHeader();
+        outer.Children.Add(modeHeader);
+
         ScrollViewer sv = new ScrollViewer(); sv.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
         sv.Padding = new Thickness(18, 14, 18, 14);
         detail = new StackPanel();
         detail.Children.Add(Ui.Text("Select a backup set", 15, Theme.Ink3, FontWeights.SemiBold));
         sv.Content = detail;
-        return sv;
+        Grid.SetRow(sv, 1);
+        outer.Children.Add(sv);
+        return outer;
+    }
+
+    // Two-tab header: the existing per-set restore, or restore-to-a-point-in-time.
+    // Switching modes just swaps what is rendered into `detail` - the tree pane and the
+    // progress/log strip below are shared by both.
+    void RenderModeHeader()
+    {
+        StackPanel row = new StackPanel(); row.Orientation = Orientation.Horizontal;
+        row.Children.Add(Tab("Backup set", !pointInTimeMode, delegate { SetMode(false); }));
+        row.Children.Add(Margin(Tab("Restore to a point in time", pointInTimeMode, delegate { SetMode(true); }), 16, 0, 0, 0));
+        modeHeader.Child = row;
+    }
+
+    Border Tab(string text, bool selected, Action onClick)
+    {
+        Border b = new Border();
+        b.Padding = new Thickness(2, 6, 2, 8);
+        b.BorderThickness = new Thickness(0, 0, 0, 2);
+        b.BorderBrush = selected ? Theme.Accent : Brushes.Transparent;
+        b.Cursor = System.Windows.Input.Cursors.Hand;
+        b.Child = Ui.Text(text, 12.5, selected ? Theme.Ink : Theme.Ink3, selected ? FontWeights.SemiBold : FontWeights.Normal);
+        if (onClick != null) { b.MouseLeftButtonUp += delegate { onClick(); }; }
+        return b;
+    }
+
+    void SetMode(bool pit)
+    {
+        if (busy || pointInTimeMode == pit) { return; }
+        pointInTimeMode = pit;
+        RenderModeHeader();
+        if (pit) { RenderPointInTime(); }
+        else if (current != null && inspected != null) { ApplyInspect(inspected); }
+        else
+        {
+            detail.Children.Clear();
+            detail.Children.Add(Ui.Text("Select a backup set", 15, Theme.Ink3, FontWeights.SemiBold));
+        }
     }
 
     Border ProgressBar()
@@ -178,6 +237,9 @@ class RestoreWindow
 
         BuildFilter();
         RenderSets();
+        // The point-in-time picker's database list comes from this same catalogue; if the
+        // user switched into that mode before the async load finished, refresh it now.
+        if (pointInTimeMode) { RenderPointInTime(); }
     }
 
     // Per-database filter checkboxes plus All / None quick actions.
@@ -306,6 +368,7 @@ class RestoreWindow
     void Select(RestoreSet r, Border row)
     {
         if (busy) { return; }
+        if (pointInTimeMode) { pointInTimeMode = false; RenderModeHeader(); }
         if (selectedRow != null) { selectedRow.Background = Brushes.Transparent; }
         selectedRow = row; row.Background = Theme.AccentBg;
         current = r; inspected = null;
@@ -657,6 +720,187 @@ class RestoreWindow
             });
         });
         t.IsBackground = true; t.Start();
+    }
+
+    // ---- point-in-time restore ------------------------------------------------------
+
+    // Populate the point-in-time form. Deliberately minimal: pick a source database, a
+    // target moment, and a restore-as name, then let the engine's own planner validate
+    // the range and report any gap - no bounds-limited picker or plan preview here (the
+    // engine already refuses cleanly, with a specific message, when asked for something
+    // it cannot do).
+    void RenderPointInTime()
+    {
+        detail.Children.Clear();
+        verifyCard = null;
+
+        detail.Children.Add(Ui.Text("Restore to a point in time", 18, Theme.Ink, FontWeights.SemiBold));
+        detail.Children.Add(Margin(Ui.Text(
+            "Replays a database's full, differential, and log backups up to an exact moment, into a new database. The source is never touched.",
+            12.5, Theme.Ink3), 0, 4, 0, 16));
+
+        if (dbOrder.Count == 0)
+        {
+            detail.Children.Add(Ui.Text("No databases with backup sets yet.", 13, Theme.Ink3));
+            return;
+        }
+
+        detail.Children.Add(Ui.Eyebrow("Source database"));
+        pointDbBox = new ComboBox(); pointDbBox.Width = 260; pointDbBox.FontSize = 12.5;
+        pointDbBox.HorizontalAlignment = HorizontalAlignment.Left;
+        foreach (string db in dbOrder) { pointDbBox.Items.Add(db); }
+        pointDbBox.SelectedIndex = 0;
+        pointDbBox.SelectionChanged += delegate { SyncPointAsName(); UpdatePointStart(); };
+        detail.Children.Add(Margin(pointDbBox, 0, 6, 0, 16));
+
+        detail.Children.Add(Ui.Eyebrow("Restore to this moment"));
+        StackPanel timeRow = new StackPanel(); timeRow.Orientation = Orientation.Horizontal; timeRow.Margin = new Thickness(0, 6, 0, 4);
+        pointDate = new DatePicker(); pointDate.Width = 132; pointDate.FontSize = 12.5;
+        pointDate.SelectedDate = DateTime.Now.Date;
+        pointDate.SelectedDateChanged += delegate { UpdatePointStart(); };
+        timeRow.Children.Add(pointDate);
+        TextBlock atLbl = Ui.Text("at", 12.5, Theme.Ink3); atLbl.VerticalAlignment = VerticalAlignment.Center; atLbl.Margin = new Thickness(10, 0, 8, 0);
+        timeRow.Children.Add(atLbl);
+        pointHourBox = SmallTimeBox(DateTime.Now.ToString("HH", CultureInfo.InvariantCulture), delegate { UpdatePointStart(); });
+        timeRow.Children.Add(pointHourBox);
+        TextBlock colon = Ui.Text(":", 13, Theme.Ink2, FontWeights.SemiBold); colon.VerticalAlignment = VerticalAlignment.Center; colon.Margin = new Thickness(4, 0, 4, 0);
+        timeRow.Children.Add(colon);
+        pointMinuteBox = SmallTimeBox(DateTime.Now.ToString("mm", CultureInfo.InvariantCulture), delegate { UpdatePointStart(); });
+        timeRow.Children.Add(pointMinuteBox);
+        TextBlock hintLbl = Ui.Text("(24h, local time)", 11, Theme.Ink3); hintLbl.VerticalAlignment = VerticalAlignment.Center; hintLbl.Margin = new Thickness(8, 0, 0, 0);
+        timeRow.Children.Add(hintLbl);
+        detail.Children.Add(timeRow);
+        detail.Children.Add(Margin(Ui.Text(
+            "The engine works out the restore chain itself and reports a clear error here if the target is outside the recoverable range or a backup is missing.",
+            11.5, Theme.Ink3), 0, 6, 0, 18));
+
+        detail.Children.Add(Ui.Eyebrow("Restore as"));
+        pointAsBox = new TextBox(); pointAsBox.Width = 260; pointAsBox.FontSize = 12.5; pointAsBox.FontFamily = Ui.Face;
+        pointAsBox.HorizontalAlignment = HorizontalAlignment.Left;
+        string firstDb = pointDbBox.SelectedItem.ToString();
+        pointAsBox.Text = PointDefaultName(firstDb);
+        pointAsDefaultFor = firstDb;
+        pointAsBox.TextChanged += delegate { UpdatePointStart(); };
+        detail.Children.Add(Margin(pointAsBox, 0, 6, 0, 12));
+
+        pointReplaceBox = new CheckBox();
+        pointReplaceBox.Content = "Overwrite if a database with this name already exists";
+        pointReplaceBox.Foreground = Theme.Ink2; pointReplaceBox.FontFamily = Ui.Face; pointReplaceBox.FontSize = 12.5;
+        detail.Children.Add(Margin(pointReplaceBox, 0, 0, 0, 18));
+
+        StackPanel act = new StackPanel(); act.Orientation = Orientation.Horizontal;
+        pointStartBtn = Ui.PrimaryButton("Restore to this point", delegate { StartPointRestore(); });
+        act.Children.Add(pointStartBtn);
+        detail.Children.Add(act);
+
+        UpdatePointStart();
+    }
+
+    // Only overwrite the "restore as" box when it still holds the default we last set - so
+    // switching the source database updates the suggestion without clobbering a name the
+    // user actually typed.
+    void SyncPointAsName()
+    {
+        if (pointAsBox == null || pointDbBox == null) { return; }
+        string db = pointDbBox.SelectedItem == null ? "" : pointDbBox.SelectedItem.ToString();
+        if (pointAsBox.Text.Trim().Length == 0 || pointAsBox.Text == PointDefaultName(pointAsDefaultFor))
+        {
+            pointAsBox.Text = PointDefaultName(db);
+        }
+        pointAsDefaultFor = db;
+    }
+
+    static string PointDefaultName(string db) { return (string.IsNullOrEmpty(db) ? "Restored" : db) + "_pit"; }
+
+    static TextBox SmallTimeBox(string initial, Action onChange)
+    {
+        TextBox t = new TextBox(); t.Text = initial; t.Width = 42; t.FontSize = 12.5; t.FontFamily = Ui.Face;
+        t.HorizontalContentAlignment = HorizontalAlignment.Center;
+        if (onChange != null) { t.TextChanged += delegate { onChange(); }; }
+        return t;
+    }
+
+    // Compose the date picker + hour/minute boxes into one local DateTime. False on any
+    // unparsable/out-of-range field - the Restore button just stays disabled; the engine
+    // does the real range/gap validation once a request is actually made.
+    bool TryBuildStopAt(out DateTime stopAt, out string error)
+    {
+        stopAt = DateTime.MinValue; error = "";
+        if (pointDate == null || pointDate.SelectedDate == null) { error = "pick a date"; return false; }
+        int hour, minute;
+        if (pointHourBox == null || !int.TryParse(pointHourBox.Text.Trim(), out hour) || hour < 0 || hour > 23) { error = "hour must be 0-23"; return false; }
+        if (pointMinuteBox == null || !int.TryParse(pointMinuteBox.Text.Trim(), out minute) || minute < 0 || minute > 59) { error = "minute must be 0-59"; return false; }
+        DateTime d = pointDate.SelectedDate.Value.Date;
+        stopAt = new DateTime(d.Year, d.Month, d.Day, hour, minute, 0);
+        return true;
+    }
+
+    void UpdatePointStart()
+    {
+        DateTime stopAt; string err;
+        bool ok = !busy && pointDbBox != null && pointDbBox.SelectedItem != null
+            && pointAsBox != null && pointAsBox.Text.Trim().Length > 0
+            && TryBuildStopAt(out stopAt, out err);
+        if (pointStartBtn != null)
+        {
+            pointStartBtn.Opacity = ok ? 1.0 : 0.45;
+            pointStartBtn.IsHitTestVisible = ok;
+        }
+    }
+
+    // Mirrors StartRestore: same GlowBar/LogPane streaming, same [JOB]/[STAGE]/[PROGRESS]
+    // markers, same "restore lands in a new database" framing. The one real difference is
+    // success: -RestoreToPoint can fail on a validation error (out-of-range target, a gap
+    // in the log chain) with no trailing JSON at all, so success is only ever claimed when
+    // Engine.RestoreToPoint itself confirms the final line was {"Ok":true,...}.
+    void StartPointRestore()
+    {
+        if (busy || pointDbBox == null || pointDbBox.SelectedItem == null) { return; }
+        DateTime stopAt; string perr;
+        if (!TryBuildStopAt(out stopAt, out perr)) { return; }
+        string src = pointDbBox.SelectedItem.ToString();
+        string asName = pointAsBox.Text.Trim();
+        bool replace = pointReplaceBox != null && pointReplaceBox.IsChecked == true;
+
+        busy = true; UpdatePointStart();
+        glow.Begin("Restoring " + asName);
+        logHost.Visibility = Visibility.Visible;
+        log.SetTitle("Restore — activity");
+        log.Clear();
+        Thread t = new Thread(delegate ()
+        {
+            int total = 1, index = 0; string stage = "starting"; int pct = -1;
+            string lastError = "";
+            bool ok = Engine.RestoreToPoint(src, asName, stopAt, replace, delegate(string line)
+            {
+                bool marker = false;
+                if (line.StartsWith("[JOB]")) { index = FieldInt(line, "index", index); total = FieldInt(line, "total", total); marker = true; }
+                else if (line.StartsWith("[STAGE]")) { stage = FieldRest(line, "stage"); marker = true; }
+                else if (line.StartsWith("[PROGRESS]")) { pct = FieldInt(line, "pct", pct); marker = true; }
+                if (line.IndexOf("[ERROR]", StringComparison.OrdinalIgnoreCase) >= 0) { lastError = line; }
+                double overall = Overall(index, total, stage, pct);
+                Dispatch(delegate
+                {
+                    if (marker) { glow.Update(overall, "Restoring " + asName + "  ·  " + stage); }
+                    if (!line.StartsWith("[PROGRESS]")) { log.Append(line); }
+                });
+            });
+            Dispatch(delegate
+            {
+                string finishMsg = ok ? ("Restore finished — " + asName + " (source untouched)")
+                    : (lastError.Length > 0 ? ("Restore FAILED — " + StripLogPrefix(lastError)) : "Restore FAILED — see the log below");
+                glow.Finish(ok, finishMsg);
+                busy = false; UpdatePointStart();
+            });
+        });
+        t.IsBackground = true; t.Start();
+    }
+
+    static string StripLogPrefix(string line)
+    {
+        int i = line.IndexOf("[ERROR]", StringComparison.OrdinalIgnoreCase);
+        if (i < 0) { return line; }
+        return line.Substring(i + 7).Trim();
     }
 
     // ---- small builders -----------------------------------------------------------
