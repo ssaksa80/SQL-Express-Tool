@@ -3255,17 +3255,18 @@ try {
         try { Unregister-ScheduledTask -TaskName $script:SebTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
       }
       Install-SebTask -ScriptPath $scriptPath -ConfigDirectory $script:SebConfigDir -Hours ([int]$config.IntervalHours)
-      # Install-SebTask (above) reads the config just written and stands the log task
-      # up when RecoveryMode is now Full, but it only ever ADDS that task. Tear it
-      # down here for the reverse transition, Full -> Simple, using the same
-      # existence-guarded Unregister-ScheduledTask call Uninstall-SebSchedule uses -
-      # a Simple config that never had the task is the ordinary case, not an error.
-      if ([string]$config.RecoveryMode -ne 'Full') {
-        $logTaskName = Get-SebLogTaskName -Base $script:SebTaskName
-        if (Get-ScheduledTask -TaskName $logTaskName -ErrorAction SilentlyContinue) {
-          Unregister-ScheduledTask -TaskName $logTaskName -Confirm:$false -ErrorAction SilentlyContinue
-          Write-SebLog ('scheduled task "{0}" removed' -f $logTaskName)
-        }
+    }
+    # Reconcile the log task after either install path: switching away from Full removes it.
+    # Install-SebService/Install-SebTask (above) read the config just written and stand the
+    # log task up when RecoveryMode is now Full, but each only ever ADDS that task - this
+    # depends only on $config.RecoveryMode, not on which branch just ran, so it runs once
+    # here for both. Same existence-guarded Unregister-ScheduledTask idiom Uninstall-SebSchedule
+    # uses; a Simple config that never had the task is the ordinary case, not an error.
+    if ([string]$config.RecoveryMode -ne 'Full') {
+      $logTaskName = Get-SebLogTaskName -Base $script:SebTaskName
+      if (Get-ScheduledTask -TaskName $logTaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $logTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Write-SebLog ('scheduled task "{0}" removed' -f $logTaskName)
       }
     }
     # RecoveryMode/LogIntervalMinutes/FullEveryHours are read back off $config rather than
