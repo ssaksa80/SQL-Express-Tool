@@ -103,9 +103,9 @@ param(
   [int]$HourlyKeep = 3,
   [int]$DailyKeepDays = 7,
   [ValidateSet('Simple', 'Full')]
-  [string]$RecoveryMode,           # point-in-time recovery mode; omitted means "leave as-is" in -Reschedule
-  [int]$LogIntervalMinutes,        # Full mode only: how often -BackupLog runs; omitted means "leave as-is" in -Reschedule
-  [int]$FullEveryHours,            # Full mode only: how often the data pass takes a full instead of a diff; omitted means "leave as-is" in -Reschedule
+  [string]$RecoveryMode = 'Simple', # point-in-time recovery mode; -Reschedule still gates on ContainsKey, so omitting it there means "leave as-is"
+  [int]$LogIntervalMinutes = 15,    # Full mode only: how often -BackupLog runs; same ContainsKey gating in -Reschedule
+  [int]$FullEveryHours = 24,        # Full mode only: how often the data pass takes a full instead of a diff; same ContainsKey gating in -Reschedule
   [switch]$UseWindowsAuth,
   [switch]$NoHashVerify,          # verify copies by length only (very large databases)
   [string]$NssmPath,
@@ -3157,18 +3157,6 @@ function Show-SebStatus {
 
 if ($DotSourceOnly) { return }
 
-# -Setup and -FullInstall both write a brand-new config and need concrete values for
-# these three; unlike -RecoveryMode/-LogIntervalMinutes/-FullEveryHours' top-level
-# declarations, they carry no default there (an omitted value has to mean "leave as
-# configured" in -Reschedule below), so the Simple/15/24 defaults are resolved once
-# here instead, the same way Invoke-SebSetup itself defaults them.
-$setupRecoveryMode = 'Simple'
-if ($PSBoundParameters.ContainsKey('RecoveryMode')) { $setupRecoveryMode = $RecoveryMode }
-$setupLogIntervalMinutes = 15
-if ($PSBoundParameters.ContainsKey('LogIntervalMinutes')) { $setupLogIntervalMinutes = $LogIntervalMinutes }
-$setupFullEveryHours = 24
-if ($PSBoundParameters.ContainsKey('FullEveryHours')) { $setupFullEveryHours = $FullEveryHours }
-
 $exitCode = 0
 $mutex = $null
 try {
@@ -3177,7 +3165,7 @@ try {
     Invoke-SebSetup -PinnedInstance $Instance -Share $SharePath -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
       -WindowsAuth:$UseWindowsAuth -SkipHash:$NoHashVerify `
-      -RecoveryMode $setupRecoveryMode -LogIntervalMinutes $setupLogIntervalMinutes -FullEveryHours $setupFullEveryHours
+      -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours
   }
   elseif ($Install) {
     Assert-SebElevated -Mode 'Install'
@@ -3404,7 +3392,7 @@ try {
     Invoke-SebSetup -PinnedInstance $Instance -Share $unc -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
       -WindowsAuth -SkipHash:$NoHashVerify `
-      -RecoveryMode $setupRecoveryMode -LogIntervalMinutes $setupLogIntervalMinutes -FullEveryHours $setupFullEveryHours
+      -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours
 
     Write-Host ''
     Write-Host '== 3/5  schedule ======================================================'
