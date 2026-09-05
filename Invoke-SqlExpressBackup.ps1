@@ -1441,6 +1441,41 @@ function Save-SebCopyOrPend {
   }
 }
 
+# Artifacts to publish to the share for one verified plain staged backup. Off -> just the
+# plain file. On -> the .zip plus its .meta.json sidecar (LSN facts read from the plain file
+# BEFORE zipping, so the catalogue can read them without decompressing). Returns @({Src;Name})
+# in copy order; the plain staged file is left for the caller's own staged cleanup. HeaderReader
+# is injectable for testing; it defaults to a real RESTORE HEADERONLY of the plain file.
+function Get-SebPublishSet {
+  param($Connection, [string]$StagedPlain, [string]$PlainName, [string]$Kind, [bool]$Compress, [scriptblock]$HeaderReader)
+  if (-not $Compress) {
+    return @([pscustomobject]@{ Src = $StagedPlain; Name = $PlainName })
+  }
+  if (-not $HeaderReader) { $HeaderReader = { param($c, $f, $k) Get-SebRestoreHeaderFacts -Connection $c -File $f -Kind $k } }
+  $facts = & $HeaderReader $Connection $StagedPlain $Kind
+  $stagedZip = $StagedPlain + '.zip'
+  Compress-SebFile -Source $StagedPlain -Destination $stagedZip
+  $stagedMeta = Get-SebSidecarName $stagedZip
+  Set-Content -LiteralPath $stagedMeta -Value (Get-SebSidecarJson -Facts $facts) -Encoding ASCII
+  $zipName = Get-SebCompressedName $PlainName
+  return @(
+    [pscustomobject]@{ Src = $stagedZip;  Name = $zipName }
+    [pscustomobject]@{ Src = $stagedMeta; Name = (Get-SebSidecarName $zipName) }
+  )
+}
+
+# Remove staged backup artifacts (.bak/.dif/.trn, their .zip variants, and .meta.json
+# sidecars) that no pending copy still points at - a backstop for the copy path's own
+# cleanup, run before a pass stages new files. Never removes a path in KeepPaths (a staged
+# source a still-pending entry needs). Case-insensitive on the extension so a differently-
+# cased staged name is not missed by a destructive sweep.
+function Clear-SebStagedExcept {
+  param([string]$StagingPath, [string[]]$KeepPaths = @())
+  Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction SilentlyContinue |
+    Where-Object { ($_.Name -match '\.(bak|dif|trn)(\.zip)?$' -or $_.Name -match '\.meta\.json$') -and $KeepPaths -notcontains $_.FullName } |
+    ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+}
+
 # =====================================================================
 # The pass
 # =====================================================================

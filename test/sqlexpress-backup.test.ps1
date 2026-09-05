@@ -1444,4 +1444,53 @@ Assert ($compFacts -match 'CompressBackups = True') 'CompressBackups is shown by
 Assert ($compFacts -match 'RecoveryMode = Simple') 'positive control: the RecoveryMode allow-list entry this test is modeled on still shows its value too'
 Assert (-not ($compFacts -match 'SUPERSECRETVALUE')) 'positive control: a field NOT on the allow-list is still redacted here - the probe can tell the difference'
 
+# ---- COMP-6a. the publish set + the staged sweep ------------------------------------
+# compress OFF: exactly the plain file, no zip made
+$tmp6 = Join-Path $env:TEMP ('seb-6a-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmp6 -Force)
+try {
+  $plain = Join-Path $tmp6 'APPDB_20260905-080000.bak'
+  [System.IO.File]::WriteAllBytes($plain, [byte[]](1..3000 | ForEach-Object { $_ % 256 }))
+  $setOff = Get-SebPublishSet -Connection $null -StagedPlain $plain -PlainName 'APPDB_20260905-080000.bak' -Kind 'full' -Compress $false
+  Assert (@($setOff).Count -eq 1 -and $setOff[0].Src -eq $plain -and $setOff[0].Name -eq 'APPDB_20260905-080000.bak') 'compress off -> the plain file is the only artifact'
+  Assert (-not (Test-Path -LiteralPath ($plain + '.zip'))) 'compress off -> no .zip was created'
+  # compress ON: zip + sidecar, facts injected (no SQL). Plain stays for the caller.
+  $fakeFacts = { param($c, $f, $k) [pscustomobject]@{ Kind = $k; File = $f; FirstLSN = [decimal]10; LastLSN = [decimal]20; DatabaseBackupLSN = [decimal]0; CheckpointLSN = [decimal]15; Finish = [datetime]'2026-09-05 08:00:00' } }
+  $setOn = Get-SebPublishSet -Connection $null -StagedPlain $plain -PlainName 'APPDB_20260905-080000.bak' -Kind 'full' -Compress $true -HeaderReader $fakeFacts
+  Assert (@($setOn).Count -eq 2) 'compress on -> two artifacts (zip + sidecar)'
+  Assert ($setOn[0].Name -eq 'APPDB_20260905-080000.bak.zip') 'the zip artifact is named <plain>.zip'
+  Assert ($setOn[1].Name -eq 'APPDB_20260905-080000.bak.zip.meta.json') 'the sidecar artifact is named <zip>.meta.json'
+  Assert (Test-Path -LiteralPath $setOn[0].Src) 'the staged .zip exists on disk'
+  Assert (Test-Path -LiteralPath $setOn[1].Src) 'the staged sidecar exists on disk'
+  Assert (Test-Path -LiteralPath $plain) 'the plain staged file is left for the caller to clean up'
+  # the zip round-trips to the original bytes
+  $back = Join-Path $tmp6 'back.bak'; Expand-SebFile -Source $setOn[0].Src -Destination $back
+  Assert ((Get-FileHash -LiteralPath $back -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $plain -Algorithm SHA256).Hash) 'the staged .zip decompresses to the original bytes'
+  # the sidecar carries the (injected) LSNs, readable via the catalogue's sidecar parser
+  $sf = Get-SebHeaderFactsFromSidecar -Json (Get-Content -LiteralPath $setOn[1].Src -Raw) -File $setOn[0].Name -Kind 'full'
+  Assert ($sf.CheckpointLSN -eq 15 -and $sf.LastLSN -eq 20) 'the sidecar preserves the LSNs for the catalogue'
+}
+finally { Remove-Item -LiteralPath $tmp6 -Recurse -Force -ErrorAction SilentlyContinue }
+# the staged sweep: keeps pending, removes the rest (zip + sidecar + plain + dif), leaves non-backup files
+$tmpS = Join-Path $env:TEMP ('seb-6as-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpS -Force)
+try {
+  $keepZip = Join-Path $tmpS 'APPDB_20260905-000000.bak.zip'; Set-Content -LiteralPath $keepZip -Value 'x'
+  $keepMeta = Join-Path $tmpS 'APPDB_20260905-000000.bak.zip.meta.json'; Set-Content -LiteralPath $keepMeta -Value 'x'
+  $goneZip = Join-Path $tmpS 'APPDB_20260904-000000.bak.zip'; Set-Content -LiteralPath $goneZip -Value 'x'
+  $goneMeta = Join-Path $tmpS 'APPDB_20260904-000000.bak.zip.meta.json'; Set-Content -LiteralPath $goneMeta -Value 'x'
+  $goneTrn = Join-Path $tmpS 'APPDB_20260904-010000.trn'; Set-Content -LiteralPath $goneTrn -Value 'x'
+  $goneDif = Join-Path $tmpS 'APPDB_20260904-020000.dif'; Set-Content -LiteralPath $goneDif -Value 'x'
+  $notBackup = Join-Path $tmpS 'notes.txt'; Set-Content -LiteralPath $notBackup -Value 'x'
+  Clear-SebStagedExcept -StagingPath $tmpS -KeepPaths @($keepZip, $keepMeta)
+  Assert (Test-Path -LiteralPath $keepZip) 'a still-pending .zip is kept'
+  Assert (Test-Path -LiteralPath $keepMeta) 'a still-pending sidecar is kept'
+  Assert (-not (Test-Path -LiteralPath $goneZip)) 'a non-pending .bak.zip is swept'
+  Assert (-not (Test-Path -LiteralPath $goneMeta)) 'a non-pending .meta.json is swept (no orphan sidecars)'
+  Assert (-not (Test-Path -LiteralPath $goneTrn)) 'a non-pending .trn is swept'
+  Assert (-not (Test-Path -LiteralPath $goneDif)) 'a non-pending .dif is swept (the old *.bak filter missed these)'
+  Assert (Test-Path -LiteralPath $notBackup) 'positive control: a non-backup file is NOT swept (the filter is scoped)'
+}
+finally { Remove-Item -LiteralPath $tmpS -Recurse -Force -ErrorAction SilentlyContinue }
+
 Write-Host 'ALL PASS'
