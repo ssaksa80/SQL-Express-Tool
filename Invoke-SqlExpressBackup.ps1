@@ -1870,6 +1870,14 @@ function Copy-SebEngineForService {
   return $target
 }
 
+# The log-backup task is named off the main task's name, so anything that already
+# knows $script:SebTaskName (Reschedule, Uninstall) can derive the second task's
+# name without a second script variable to keep in sync with the first.
+function Get-SebLogTaskName {
+  param([string]$Base)
+  return ($Base + '-Log')
+}
+
 function Install-SebTask {
   param([string]$ScriptPath, [string]$ConfigDirectory, [int]$Hours)
   $ScriptPath = Copy-SebEngineForService -ScriptPath $ScriptPath
@@ -1893,6 +1901,33 @@ function Install-SebTask {
   [void](Register-ScheduledTask -TaskName $script:SebTaskName -Action $action `
       -Trigger @($repeating, $atStartup) -Principal $principal -Settings $settings -Force)
   Write-SebLog ('scheduled task "{0}" registered - every {1} hour(s) as SYSTEM, and at every boot' -f $script:SebTaskName, $Hours)
+
+  # A second SYSTEM task, registered ONLY for a Full-recovery install: -BackupLog
+  # takes a transaction-log backup every few minutes, so the recovery point never
+  # drifts far behind "now". RecoveryMode and LogIntervalMinutes are config keys a
+  # LATER feature (D3) adds - an install made before that, or a Simple-recovery
+  # install, has neither key, and that must read as Simple (no log task) rather
+  # than throw. Same guard style as Invoke-SebPass uses for this same key.
+  $config = Read-SebConfig
+  $isFullMode = ([string]$config.RecoveryMode -eq 'Full')
+  if ($isFullMode) {
+    $logMinutes = 15
+    if ($config.PSObject.Properties['LogIntervalMinutes']) { $logMinutes = [int]$config.LogIntervalMinutes }
+
+    $logTaskName = Get-SebLogTaskName -Base $script:SebTaskName
+    # Same script path, same "-NoProfile ... -File" shape, same -ConfigDir as the
+    # main task's action above - only the mode flag changes.
+    $logArguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -BackupLog -ConfigDir "{1}"' -f $ScriptPath, $ConfigDirectory)
+    $logAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $logArguments
+    $logTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes $logMinutes)
+    $logSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
+      -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+      -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+
+    [void](Register-ScheduledTask -TaskName $logTaskName -Action $logAction `
+        -Trigger $logTrigger -Principal $principal -Settings $logSettings -Force)
+    Write-SebLog ('scheduled task "{0}" registered - every {1} minute(s), transaction-log backups for Full-recovery databases' -f $logTaskName, $logMinutes)
+  }
 }
 
 function Resolve-SebNssm {
@@ -1933,6 +1968,13 @@ function Uninstall-SebSchedule {
   if ($state.TaskPresent) {
     Unregister-ScheduledTask -TaskName $script:SebTaskName -Confirm:$false
     Write-SebLog ('scheduled task "{0}" removed' -f $script:SebTaskName)
+  }
+  # A Simple-recovery install never created this second task, so finding it absent
+  # here is the ordinary case, not an error worth surfacing.
+  $logTaskName = Get-SebLogTaskName -Base $script:SebTaskName
+  if (Get-ScheduledTask -TaskName $logTaskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $logTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-SebLog ('scheduled task "{0}" removed' -f $logTaskName)
   }
   if ($state.ServicePresent) {
     try { Stop-Service -Name $script:SebServiceName -Force -ErrorAction SilentlyContinue } catch { }

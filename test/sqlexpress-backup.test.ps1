@@ -1280,4 +1280,8 @@ Assert ((Get-SebLogPassExitCode -Succeeded 2 -Failed 0 -Pending 1) -eq 1) 'a log
 Assert ((Get-SebLogPassExitCode -Succeeded 1 -Failed 1 -Pending 0) -eq 1) 'one database failed alongside a success -> partial (1)'
 Assert ((Get-SebLogPassExitCode -Succeeded 0 -Failed 2 -Pending 0) -eq 2) 'every attempted database failed -> hard failure (2)'
 
+# ---- D2. the log task name derives from the base task name --------------------------
+Assert ((Get-SebLogTaskName -Base 'SqlExpressBackup') -eq 'SqlExpressBackup-Log') 'the log task is the base task name plus -Log'
+Assert ((Get-SebLogTaskName -Base 'X') -eq 'X-Log') 'the -Log suffix is appended to whatever the base name is'
+
 Write-Host 'ALL PASS'
