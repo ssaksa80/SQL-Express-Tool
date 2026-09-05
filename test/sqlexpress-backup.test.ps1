@@ -1383,4 +1383,20 @@ try {
 }
 finally { Remove-Item -LiteralPath $rcRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
+# ---- COMP-3b. sidecar carries LSN facts with full precision -------------------------
+# NOTE: numbered "3b" rather than "3" - a prior review-gaps fix (414ed3e) already used
+# the "COMP-3" label for Get-SebRestoreCatalogue's .bak.zip recognition, and the plan
+# (docs/superpowers/plans/2026-09-05-backup-compression.md) reserves "COMP-4" for the
+# next task's Get-SebFactsForFile selector. "3b" avoids colliding with either.
+$bigLsn = [decimal]'1234567890123456789012'   # 22 digits - would lose precision as a JSON number
+$facts0 = [pscustomobject]@{ Kind='full'; File='ignored'; FirstLSN=$bigLsn; LastLSN=([decimal]$bigLsn + 5); DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]777; Finish=[datetime]'2026-09-05 08:00:00' }
+$json = Get-SebSidecarJson -Facts $facts0
+Assert ($json -match '"FirstLSN"\s*:\s*"1234567890123456789012"') 'the sidecar stores LSNs as strings'
+$back = Get-SebHeaderFactsFromSidecar -Json $json -File 'C:\s\APPDB.bak.zip' -Kind 'full'
+Assert ($back.FirstLSN -eq $bigLsn) 'FirstLSN round-trips through the sidecar with full precision'
+Assert ($back.LastLSN -eq ([decimal]$bigLsn + 5)) 'LastLSN round-trips'
+Assert ($back.CheckpointLSN -eq 777) 'CheckpointLSN round-trips'
+Assert ($back.File -eq 'C:\s\APPDB.bak.zip' -and $back.Kind -eq 'full') 'File and Kind come from the parameters (folder-derived), not the JSON'
+Assert ($back.Finish -eq ([datetime]'2026-09-05 08:00:00')) 'Finish round-trips'
+
 Write-Host 'ALL PASS'

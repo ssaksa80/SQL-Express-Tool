@@ -2912,6 +2912,48 @@ function Get-SebHeaderFactsFromRow {
   }
 }
 
+# Serialize a catalogue fact to sidecar JSON. LSNs are strings so numeric(25,0) precision
+# survives ConvertFrom-Json (which would coerce a big JSON number to a lossy double).
+function Get-SebSidecarJson {
+  param($Facts)
+  $o = [ordered]@{
+    Kind              = [string]$Facts.Kind
+    FirstLSN          = [string]$Facts.FirstLSN
+    LastLSN           = [string]$Facts.LastLSN
+    DatabaseBackupLSN = [string]$Facts.DatabaseBackupLSN
+    CheckpointLSN     = [string]$Facts.CheckpointLSN
+    Finish            = $Facts.Finish.ToString('o')
+  }
+  return (ConvertTo-Json $o -Compress)
+}
+
+# Parse sidecar JSON back into the same fact shape Get-SebHeaderFactsFromRow produces.
+# File and Kind come from the caller (folder-derived), matching the HEADERONLY path.
+#
+# Finish is parsed with an EXPLICIT invariant-culture, round-trip-kind parse rather than
+# a plain [datetime] cast. ToString('o') above is always invariant/Gregorian, but the
+# implicit [datetime] cast on the way back uses the CURRENT culture's calendar - on a
+# host set to a non-Gregorian calendar (Thai Buddhist, UmAlQura, etc.) that silently
+# reads the same digits as a different year. This script runs unattended on whatever
+# locale the server has, so the parse must not depend on it.
+function Get-SebHeaderFactsFromSidecar {
+  param([string]$Json, [string]$File, [string]$Kind)
+  $o = ConvertFrom-Json $Json
+  $finish = [datetime]::Parse(
+    [string]$o.Finish,
+    [System.Globalization.CultureInfo]::InvariantCulture,
+    [System.Globalization.DateTimeStyles]::RoundtripKind)
+  return [pscustomobject]@{
+    Kind              = $Kind
+    File              = $File
+    FirstLSN          = [decimal]$o.FirstLSN
+    LastLSN           = [decimal]$o.LastLSN
+    DatabaseBackupLSN = [decimal]$o.DatabaseBackupLSN
+    CheckpointLSN     = [decimal]$o.CheckpointLSN
+    Finish            = $finish
+  }
+}
+
 # Impure. Read one backup file's header and map it. RESTORE HEADERONLY returns a
 # FirstLSN/LastLSN/DatabaseBackupLSN/CheckpointLSN/BackupFinishDate row per backup set.
 function Get-SebRestoreHeaderFacts {
