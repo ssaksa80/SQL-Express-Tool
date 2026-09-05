@@ -1480,6 +1480,32 @@ function Get-SebLogSpaceUsedPct {
   return 0
 }
 
+# Summarize one database's backup chain from its share folder facts (each an object
+# with a .Timestamp, as Get-SebFolderFacts returns). RPO is whole minutes since the
+# newest log - or since the newest full when there is no log yet, since that full IS
+# the most recent recovery point in that case. Health names the shapes that matter
+# operationally: nothing on the share at all, a log with no full underneath it to
+# restore onto first (the base full was deleted or never taken), a full sitting alone
+# waiting on its first log, or an ordinary chain. Pure so the RPO and health boundaries
+# are provable without a share, a database, or a clock anywhere near real.
+function Get-SebChainSummary {
+  param([object[]]$Fulls = @(), [object[]]$Diffs = @(), [object[]]$Logs = @(), [datetime]$Now)
+  $lastFull = $null; $lastDiff = $null; $lastLog = $null
+  if (@($Fulls).Count -gt 0) { $lastFull = (@($Fulls | Sort-Object Timestamp)[-1]).Timestamp }
+  if (@($Diffs).Count -gt 0) { $lastDiff = (@($Diffs | Sort-Object Timestamp)[-1]).Timestamp }
+  if (@($Logs).Count  -gt 0) { $lastLog  = (@($Logs  | Sort-Object Timestamp)[-1]).Timestamp }
+  $rpoAnchor = $lastLog
+  if ($null -eq $rpoAnchor) { $rpoAnchor = $lastFull }
+  $rpoMin = -1
+  if ($null -ne $rpoAnchor) { $rpoMin = [int][math]::Round(($Now - $rpoAnchor).TotalMinutes) }
+  $health = 'ok'
+  if ($null -eq $lastFull) {
+    if ($null -ne $lastLog -or $null -ne $lastDiff) { $health = 'no base full' } else { $health = 'no backups' }
+  }
+  elseif ($null -eq $lastLog) { $health = 'no logs yet' }
+  return [pscustomobject]@{ LastFull = $lastFull; LastDiff = $lastDiff; LastLog = $lastLog; RpoMinutes = $rpoMin; Health = $health }
+}
+
 # The -BackupLog task: one transaction-log backup of every FULL-recovery user database,
 # staged locally then copied to the share's log/ folder. If a database has no base yet
 # (SEB_LOG_NO_BASE), anchor it with a full first, then retry the log.
@@ -3280,6 +3306,26 @@ FROM sys.databases
           else {
             Write-Host ('   {0,-30} log healthy ({1}% used)' -f $db, $usedPct)
           }
+
+          # Same share layout the data pass writes to and "On the share" below reads back -
+          # Get-SebBackupPath applies the same Get-SebSafeName folding to host/instance/db
+          # that the pass used when it wrote these files, so this resolves to the same
+          # folder even when a name needed sanitizing. Read-only: three folder listings,
+          # reduced by the pure Get-SebChainSummary. Inside the same try this whole section
+          # is already wrapped in, so a share that has gone unreachable mid-loop reports on
+          # the single 'could not probe' line below rather than aborting the rest of -Status.
+          $fullFacts = @(Get-SebFolderFacts -Directory (Get-SebBackupPath -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $config.InstanceName -Database $db -Kind 'hourly'))
+          $diffFacts = @(Get-SebFolderFacts -Directory (Get-SebBackupPath -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $config.InstanceName -Database $db -Kind 'diff'))
+          $logFacts  = @(Get-SebFolderFacts -Directory (Get-SebBackupPath -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $config.InstanceName -Database $db -Kind 'log'))
+          $chain = Get-SebChainSummary -Fulls $fullFacts -Diffs $diffFacts -Logs $logFacts -Now (Get-Date)
+
+          $lastFullText = 'none'
+          if ($null -ne $chain.LastFull) { $lastFullText = $chain.LastFull.ToString('yyyy-MM-dd HH:mm') }
+          $lastLogText = 'none'
+          if ($null -ne $chain.LastLog) { $lastLogText = $chain.LastLog.ToString('yyyy-MM-dd HH:mm') }
+          $rpoText = 'n/a'
+          if ($chain.RpoMinutes -ge 0) { $rpoText = ('{0} min' -f $chain.RpoMinutes) }
+          Write-Host ('     {0}: model=FULL  last full={1}  last log={2}  RPO={3}  health={4}' -f $db, $lastFullText, $lastLogText, $rpoText, $chain.Health)
         }
       }
     }

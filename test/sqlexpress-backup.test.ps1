@@ -1302,4 +1302,19 @@ Assert ((Get-SebLogSpaceUsedPct -Rows @([pscustomobject]@{ 'Database Name' = 'X'
 Assert (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct (Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'APPDB') -ThresholdPct 70) 'APPDB (85% on a LOG_BACKUP wait) warns'
 Assert (-not (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct (Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'Other') -ThresholdPct 70)) 'Other (10%) does not warn'
 
+# ---- D3b-3. chain summary from folder facts -----------------------------------------
+function New-CS([datetime]$t) { return [pscustomobject]@{ Timestamp = $t } }
+$nowCS = [datetime]'2026-09-05 12:00:00'
+$sumOk = Get-SebChainSummary -Fulls @((New-CS $nowCS.AddHours(-6)), (New-CS $nowCS.AddHours(-30))) -Diffs @() -Logs @((New-CS $nowCS.AddMinutes(-10)), (New-CS $nowCS.AddMinutes(-40))) -Now $nowCS
+Assert ($sumOk.LastFull -eq $nowCS.AddHours(-6)) 'last full is the newest full'
+Assert ($sumOk.LastLog -eq $nowCS.AddMinutes(-10)) 'last log is the newest log'
+Assert ($sumOk.RpoMinutes -eq 10) 'RPO is minutes since the newest log'
+Assert ($sumOk.Health -eq 'ok') 'a chain with a full and logs is ok'
+$sumNoLog = Get-SebChainSummary -Fulls @((New-CS $nowCS.AddHours(-2))) -Diffs @() -Logs @() -Now $nowCS
+Assert ($sumNoLog.Health -eq 'no logs yet' -and $sumNoLog.RpoMinutes -eq 120) 'a full with no logs reports no-logs-yet and RPO from the full'
+$sumNone = Get-SebChainSummary -Fulls @() -Diffs @() -Logs @() -Now $nowCS
+Assert ($sumNone.Health -eq 'no backups' -and $sumNone.RpoMinutes -eq -1) 'no backups at all is reported, RPO -1'
+$sumOrphan = Get-SebChainSummary -Fulls @() -Diffs @() -Logs @((New-CS $nowCS.AddMinutes(-5))) -Now $nowCS
+Assert ($sumOrphan.Health -eq 'no base full') 'logs without a base full is flagged'
+
 Write-Host 'ALL PASS'
