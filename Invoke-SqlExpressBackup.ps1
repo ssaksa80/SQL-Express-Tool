@@ -102,6 +102,10 @@ param(
   [int]$IntervalHours = 6,
   [int]$HourlyKeep = 3,
   [int]$DailyKeepDays = 7,
+  [ValidateSet('Simple', 'Full')]
+  [string]$RecoveryMode,           # point-in-time recovery mode; omitted means "leave as-is" in -Reschedule
+  [int]$LogIntervalMinutes,        # Full mode only: how often -BackupLog runs; omitted means "leave as-is" in -Reschedule
+  [int]$FullEveryHours,            # Full mode only: how often the data pass takes a full instead of a diff; omitted means "leave as-is" in -Reschedule
   [switch]$UseWindowsAuth,
   [switch]$NoHashVerify,          # verify copies by length only (very large databases)
   [string]$NssmPath,
@@ -123,7 +127,8 @@ $script:SebCompression = 'unknown'   # unknown | on | off, probed once per pass
 # happens, a deny-list does not.
 $script:SebShowKeys = @(
   'Instance', 'InstanceName', 'DataSource', 'SharePath', 'StagingPath',
-  'IntervalHours', 'HourlyKeep', 'DailyKeepDays', 'SqlUser', 'UseWindowsAuth',
+  'IntervalHours', 'HourlyKeep', 'DailyKeepDays', 'RecoveryMode', 'LogIntervalMinutes',
+  'FullEveryHours', 'SqlUser', 'UseWindowsAuth',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -1453,6 +1458,16 @@ function Get-SebLogPassExitCode {
   return 0
 }
 
+# A database waiting on LOG_BACKUP with its log file most of the way full is the
+# transaction log growing because nothing has truncated it yet - exactly what Full
+# recovery without a running log-backup task looks like. Any OTHER wait (or the same
+# wait below threshold) is a different problem and not this warning's job to catch.
+# Pure so the threshold boundary is provable without a real database anywhere near full.
+function Get-SebLogGrowthWarning {
+  param([string]$Wait, [double]$UsedPct, [double]$ThresholdPct = 70)
+  return ($Wait -eq 'LOG_BACKUP' -and $UsedPct -ge $ThresholdPct)
+}
+
 # The -BackupLog task: one transaction-log backup of every FULL-recovery user database,
 # staged locally then copied to the share's log/ folder. If a database has no base yet
 # (SEB_LOG_NO_BASE), anchor it with a full first, then retry the log.
@@ -2001,7 +2016,7 @@ function Uninstall-SebSchedule {
 # =====================================================================
 
 function Invoke-SebSetup {
-  param([string]$PinnedInstance, [string]$Share, [string]$Staging, [int]$Hours, [int]$Hourly, [int]$DailyDays, [switch]$WindowsAuth, [switch]$SkipHash)
+  param([string]$PinnedInstance, [string]$Share, [string]$Staging, [int]$Hours, [int]$Hourly, [int]$DailyDays, [switch]$WindowsAuth, [switch]$SkipHash, [string]$RecoveryMode = 'Simple', [int]$LogIntervalMinutes = 15, [int]$FullEveryHours = 24)
 
   if (-not (Test-Path -LiteralPath $script:SebConfigDir)) {
     [void](New-Item -ItemType Directory -Path $script:SebConfigDir -Force)
@@ -2150,6 +2165,9 @@ function Invoke-SebSetup {
       IntervalHours = $Hours
       HourlyKeep    = $Hourly
       DailyKeepDays = $DailyDays
+      RecoveryMode       = $RecoveryMode
+      LogIntervalMinutes = $LogIntervalMinutes
+      FullEveryHours     = $FullEveryHours
       SqlUser       = $sqlUser
       SqlServiceAccount = $sqlAccount
       UseWindowsAuth = [bool]$WindowsAuth
@@ -3139,6 +3157,18 @@ function Show-SebStatus {
 
 if ($DotSourceOnly) { return }
 
+# -Setup and -FullInstall both write a brand-new config and need concrete values for
+# these three; unlike -RecoveryMode/-LogIntervalMinutes/-FullEveryHours' top-level
+# declarations, they carry no default there (an omitted value has to mean "leave as
+# configured" in -Reschedule below), so the Simple/15/24 defaults are resolved once
+# here instead, the same way Invoke-SebSetup itself defaults them.
+$setupRecoveryMode = 'Simple'
+if ($PSBoundParameters.ContainsKey('RecoveryMode')) { $setupRecoveryMode = $RecoveryMode }
+$setupLogIntervalMinutes = 15
+if ($PSBoundParameters.ContainsKey('LogIntervalMinutes')) { $setupLogIntervalMinutes = $LogIntervalMinutes }
+$setupFullEveryHours = 24
+if ($PSBoundParameters.ContainsKey('FullEveryHours')) { $setupFullEveryHours = $FullEveryHours }
+
 $exitCode = 0
 $mutex = $null
 try {
@@ -3146,7 +3176,8 @@ try {
     Assert-SebElevated -Mode 'Setup'
     Invoke-SebSetup -PinnedInstance $Instance -Share $SharePath -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
-      -WindowsAuth:$UseWindowsAuth -SkipHash:$NoHashVerify
+      -WindowsAuth:$UseWindowsAuth -SkipHash:$NoHashVerify `
+      -RecoveryMode $setupRecoveryMode -LogIntervalMinutes $setupLogIntervalMinutes -FullEveryHours $setupFullEveryHours
   }
   elseif ($Install) {
     Assert-SebElevated -Mode 'Install'
@@ -3173,6 +3204,15 @@ try {
     if ($PSBoundParameters.ContainsKey('IntervalHours')) { $config.IntervalHours = [int]$IntervalHours }
     if ($PSBoundParameters.ContainsKey('HourlyKeep'))    { $config.HourlyKeep    = [int]$HourlyKeep }
     if ($PSBoundParameters.ContainsKey('DailyKeepDays')) { $config.DailyKeepDays = [int]$DailyKeepDays }
+    # Add-Member -Force, not plain assignment: every config.json written before this
+    # feature existed has none of these three properties, and PowerShell throws
+    # "property ... cannot be found" assigning a property that is not already there -
+    # unlike IntervalHours/HourlyKeep/DailyKeepDays above, which Setup has always
+    # written. Force makes this the same call whether the property is new or already
+    # present, so a second -Reschedule behaves exactly like the first.
+    if ($PSBoundParameters.ContainsKey('RecoveryMode')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'RecoveryMode' -Value $RecoveryMode -Force }
+    if ($PSBoundParameters.ContainsKey('LogIntervalMinutes')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'LogIntervalMinutes' -Value ([int]$LogIntervalMinutes) -Force }
+    if ($PSBoundParameters.ContainsKey('FullEveryHours')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'FullEveryHours' -Value ([int]$FullEveryHours) -Force }
     Write-SebConfig -Config $config
     $schedule = Get-SebScheduleState
     $scriptPath = Get-SebScriptPath
@@ -3184,6 +3224,18 @@ try {
         try { Unregister-ScheduledTask -TaskName $script:SebTaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
       }
       Install-SebTask -ScriptPath $scriptPath -ConfigDirectory $script:SebConfigDir -Hours ([int]$config.IntervalHours)
+      # Install-SebTask (above) reads the config just written and stands the log task
+      # up when RecoveryMode is now Full, but it only ever ADDS that task. Tear it
+      # down here for the reverse transition, Full -> Simple, using the same
+      # existence-guarded Unregister-ScheduledTask call Uninstall-SebSchedule uses -
+      # a Simple config that never had the task is the ordinary case, not an error.
+      if ([string]$config.RecoveryMode -ne 'Full') {
+        $logTaskName = Get-SebLogTaskName -Base $script:SebTaskName
+        if (Get-ScheduledTask -TaskName $logTaskName -ErrorAction SilentlyContinue) {
+          Unregister-ScheduledTask -TaskName $logTaskName -Confirm:$false -ErrorAction SilentlyContinue
+          Write-SebLog ('scheduled task "{0}" removed' -f $logTaskName)
+        }
+      }
     }
     Write-Host (ConvertTo-Json @{ Ok = $true; IntervalHours = [int]$config.IntervalHours; HourlyKeep = [int]$config.HourlyKeep; DailyKeepDays = [int]$config.DailyKeepDays } -Compress)
   }
@@ -3351,7 +3403,8 @@ try {
     Write-Host '== 2/5  setup ========================================================='
     Invoke-SebSetup -PinnedInstance $Instance -Share $unc -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
-      -WindowsAuth -SkipHash:$NoHashVerify
+      -WindowsAuth -SkipHash:$NoHashVerify `
+      -RecoveryMode $setupRecoveryMode -LogIntervalMinutes $setupLogIntervalMinutes -FullEveryHours $setupFullEveryHours
 
     Write-Host ''
     Write-Host '== 3/5  schedule ======================================================'

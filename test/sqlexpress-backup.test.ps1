@@ -1284,4 +1284,10 @@ Assert ((Get-SebLogPassExitCode -Succeeded 0 -Failed 2 -Pending 0) -eq 2) 'every
 Assert ((Get-SebLogTaskName -Base 'SqlExpressBackup') -eq 'SqlExpressBackup-Log') 'the log task is the base task name plus -Log'
 Assert ((Get-SebLogTaskName -Base 'X') -eq 'X-Log') 'the -Log suffix is appended to whatever the base name is'
 
+# ---- D3. the log-growth probe warns only on a LOG_BACKUP wait past the threshold ----
+Assert (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct 85 -ThresholdPct 70) 'a LOG_BACKUP wait over threshold warns'
+Assert (-not (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct 40 -ThresholdPct 70)) 'a LOG_BACKUP wait under threshold does not warn'
+Assert (-not (Get-SebLogGrowthWarning -Wait 'NOTHING' -UsedPct 95 -ThresholdPct 70)) 'a full log NOT waiting on a backup is a different problem, not our warning'
+Assert (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct 70 -ThresholdPct 70) 'exactly at the threshold warns'
+
 Write-Host 'ALL PASS'
