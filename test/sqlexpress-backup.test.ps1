@@ -1316,5 +1316,8 @@ $sumNone = Get-SebChainSummary -Fulls @() -Diffs @() -Logs @() -Now $nowCS
 Assert ($sumNone.Health -eq 'no backups' -and $sumNone.RpoMinutes -eq -1) 'no backups at all is reported, RPO -1'
 $sumOrphan = Get-SebChainSummary -Fulls @() -Diffs @() -Logs @((New-CS $nowCS.AddMinutes(-5))) -Now $nowCS
 Assert ($sumOrphan.Health -eq 'no base full') 'logs without a base full is flagged'
+$sumDiffOnly = Get-SebChainSummary -Fulls @() -Diffs @((New-CS $nowCS.AddHours(-3))) -Logs @() -Now $nowCS
+Assert ($sumDiffOnly.Health -eq 'no base full') 'diffs present but no base full is flagged (not "no backups")'
+Assert ($sumDiffOnly.LastDiff -eq $nowCS.AddHours(-3)) 'the last diff time is surfaced'
 
 Write-Host 'ALL PASS'
