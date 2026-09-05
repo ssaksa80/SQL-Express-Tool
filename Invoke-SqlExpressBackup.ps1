@@ -1919,7 +1919,11 @@ function Install-SebTask {
     # main task's action above - only the mode flag changes.
     $logArguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -BackupLog -ConfigDir "{1}"' -f $ScriptPath, $ConfigDirectory)
     $logAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $logArguments
-    $logTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes $logMinutes)
+    # Stagger the log task's start off the main task's so their firings do not stay
+    # harmonically locked (a 6h interval is a multiple of 15min); otherwise the coincident
+    # tick would lose the shared mutex to the main pass every interval and skip a log backup.
+    $logOffset = 2 + [math]::Ceiling($logMinutes / 2)
+    $logTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($logOffset) -RepetitionInterval (New-TimeSpan -Minutes $logMinutes)
     $logSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
       -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
       -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
