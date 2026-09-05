@@ -1597,7 +1597,8 @@ function Invoke-SebBackupLogPass {
     [string]$InstanceLabel,
     [string]$StagingPath,
     [string]$OnlyDatabase = '',
-    [switch]$NoHash
+    [switch]$NoHash,
+    [bool]$Compress = $false
   )
   # Drain first, exactly as Invoke-SebPass does: a share that came back catches up before
   # this pass stages anything new, so a long outage cannot let staging grow unbounded. The
@@ -1615,9 +1616,7 @@ function Invoke-SebBackupLogPass {
     # with. This sweep runs BEFORE anything is staged this pass, so a database that fails
     # below still leaves its own staged file in place - the loud evidence D1a keeps.
     $keepPaths = @($pendingList.ToArray() | ForEach-Object { [string]$_.Staged })
-    Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction SilentlyContinue |
-      Where-Object { ($_.Extension -eq '.trn' -or $_.Extension -eq '.bak') -and $keepPaths -notcontains $_.FullName } |
-      ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    Clear-SebStagedExcept -StagingPath $StagingPath -KeepPaths $keepPaths
   }
 
   $rows = Invoke-SebSqlTable -Connection $Connection -Sql @'
@@ -1653,18 +1652,24 @@ FROM sys.databases AS d
         $anchorStaged = Join-Path $StagingPath $anchorName
         Invoke-SebBackupDatabase -Connection $Connection -Database $db -TargetFile $anchorStaged -Kind 'full'
         Test-SebBackupFile -Connection $Connection -TargetFile $anchorStaged
-        $anchorDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'hourly') $anchorName
+        $anchorDir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'hourly'
         # The anchor is the log chain's base. If the share refuses it, record and keep it
         # (do not orphan it) and still take the log: the base is safe locally, and the anchor
         # and the log then drain to the share together on the next run.
-        Save-SebCopyOrPend -Staged $anchorStaged -Dest $anchorDest -Database $db -Kind 'hourly' -PendingList $pendingList -NoHash:$NoHash
+        foreach ($art in @(Get-SebPublishSet -Connection $Connection -StagedPlain $anchorStaged -PlainName $anchorName -Kind 'full' -Compress $Compress)) {
+          Save-SebCopyOrPend -Staged $art.Src -Dest (Join-Path $anchorDir $art.Name) -Database $db -Kind 'hourly' -PendingList $pendingList -NoHash:$NoHash
+        }
+        if ($Compress) { Remove-Item -LiteralPath $anchorStaged -Force -ErrorAction SilentlyContinue }
         Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged
       }
-      $logDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'log') $logName
+      $logDir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'log'
       # BACKUP LOG has already truncated the chain, so a refused copy must not throw the .trn
       # away: record it and keep it staged for the next run's drain instead of losing the
       # interval. A pending copy is not a per-database failure - the log itself was taken.
-      Save-SebCopyOrPend -Staged $logStaged -Dest $logDest -Database $db -Kind 'log' -PendingList $pendingList -NoHash:$NoHash
+      foreach ($art in @(Get-SebPublishSet -Connection $Connection -StagedPlain $logStaged -PlainName $logName -Kind 'log' -Compress $Compress)) {
+        Save-SebCopyOrPend -Staged $art.Src -Dest (Join-Path $logDir $art.Name) -Database $db -Kind 'log' -PendingList $pendingList -NoHash:$NoHash
+      }
+      if ($Compress) { Remove-Item -LiteralPath $logStaged -Force -ErrorAction SilentlyContinue }
       Write-SebLog ('log backup of {0} taken' -f $db) 'INFO'
       $succeeded++
     }
@@ -1703,6 +1708,8 @@ function Invoke-SebPass {
   $state = Read-SebState
   $pending = @($state.Pending)
   $noHash = [bool]$Config.NoHashVerify
+  $compress = $false
+  if ($Config.PSObject.Properties['CompressBackups']) { $compress = [bool]$Config.CompressBackups }
 
   # Drain first. A share that came back should catch up before this pass adds to
   # the pile, otherwise a long outage means staging grows until the disk fills.
@@ -1728,9 +1735,7 @@ function Invoke-SebPass {
     $pending = @($stillPending.ToArray())
     # Staged files with no pending entry left are done with.
     $keepPaths = @($pending | ForEach-Object { $_.Staged })
-    Get-ChildItem -LiteralPath $staging -Filter '*.bak' -File -ErrorAction SilentlyContinue |
-      Where-Object { $keepPaths -notcontains $_.FullName } |
-      ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    Clear-SebStagedExcept -StagingPath $staging -KeepPaths $keepPaths
   }
 
   $password = $null
@@ -1859,24 +1864,29 @@ GROUP BY database_id
           $destKind = 'hourly'
           if ($kind -eq 'diff') { $destKind = 'diff' }
           $destDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind $destKind
-          $dest = Join-Path $destDir $fileName
           Write-SebStage -Database $database -Stage ('copy-' + $kind)
           $copyOk = $true
-          try {
-            Copy-SebVerified -Source $staged -Destination $dest -NoHash:$noHash
-            Write-SebLog ('copied to {0}' -f $dest)
-            if (Test-SebStagedStillNeeded -Staged $staged -Pending @($pendingList.ToArray())) {
-              Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $staged)
+          foreach ($art in @(Get-SebPublishSet -Connection $connection -StagedPlain $staged -PlainName $fileName -Kind $kind -Compress $compress)) {
+            $dest = Join-Path $destDir $art.Name
+            try {
+              Copy-SebVerified -Source $art.Src -Destination $dest -NoHash:$noHash
+              Write-SebLog ('copied to {0}' -f $dest)
+              if (Test-SebStagedStillNeeded -Staged $art.Src -Pending @($pendingList.ToArray())) {
+                Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $art.Src)
+              }
+              else {
+                Remove-Item -LiteralPath $art.Src -Force -ErrorAction SilentlyContinue
+              }
             }
-            else {
-              Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            catch {
+              $copyOk = $false
+              Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
+              [void]$pendingList.Add([pscustomobject]@{ Staged = $art.Src; Dest = $dest; Database = $database; Kind = $destKind })
             }
           }
-          catch {
-            $copyOk = $false
-            Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
-            [void]$pendingList.Add([pscustomobject]@{ Staged = $staged; Dest = $dest; Database = $database; Kind = $destKind })
-          }
+          # When compressing, the plain staged file is now redundant (the .zip carries its
+          # bytes and was published/pended in its place); nothing pending references the plain.
+          if ($compress) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
 
           # Chain-safe pruning: never delete a full/diff/log a retained recovery point still
           # needs (Get-SebChainRetentionPlan guarantees this). Runs only in Full mode; Simple
@@ -1920,41 +1930,49 @@ GROUP BY database_id
           $hourlyDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
           $dailyDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'daily'
 
+          $currentName = $fileName
+          if ($compress) { $currentName = Get-SebCompressedName $fileName }
           $hourlyFacts = @(Get-SebFolderFacts -Directory $hourlyDir)
-          $hourlyFacts += [pscustomobject]@{ Name = $fileName; FullName = (Join-Path $hourlyDir $fileName); Timestamp = $stamp }
+          $hourlyFacts += [pscustomobject]@{ Name = $currentName; FullName = (Join-Path $hourlyDir $currentName); Timestamp = $stamp }
           $dailyFacts = @(Get-SebFolderFacts -Directory $dailyDir)
           $plan = Get-SebRetentionPlan -HourlyFiles $hourlyFacts -DailyFiles $dailyFacts -Now $stamp `
             -HourlyKeep ([int]$Config.HourlyKeep) -DailyKeepDays ([int]$Config.DailyKeepDays)
 
           Write-SebStage -Database $database -Stage 'copy'
+          $publishSet = @(Get-SebPublishSet -Connection $connection -StagedPlain $staged -PlainName $fileName -Kind $kind -Compress $compress)
           $targets = @(@{ Dir = $hourlyDir; Kind = 'hourly' })
           if ($plan.PromoteToDaily) { $targets += @{ Dir = $dailyDir; Kind = 'daily' } }
 
           $copiedAll = $true
           foreach ($target in $targets) {
-            $dest = Join-Path $target.Dir $fileName
-            try {
-              Copy-SebVerified -Source $staged -Destination $dest -NoHash:$noHash
-              Write-SebLog ('copied to {0}' -f $dest)
-            }
-            catch {
-              $copiedAll = $false
-              Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
-              [void]$pendingList.Add([pscustomobject]@{
-                  Staged = $staged; Dest = $dest; Database = $database; Kind = $target.Kind
-                })
+            foreach ($art in $publishSet) {
+              $dest = Join-Path $target.Dir $art.Name
+              try {
+                Copy-SebVerified -Source $art.Src -Destination $dest -NoHash:$noHash
+                Write-SebLog ('copied to {0}' -f $dest)
+              }
+              catch {
+                $copiedAll = $false
+                Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
+                [void]$pendingList.Add([pscustomobject]@{
+                    Staged = $art.Src; Dest = $dest; Database = $database; Kind = $target.Kind
+                  })
+              }
             }
           }
 
           if ($copiedAll) {
             Remove-SebNamed -Directory $hourlyDir -Names $plan.HourlyDelete
             Remove-SebNamed -Directory $dailyDir -Names $plan.DailyDelete
-            if (Test-SebStagedStillNeeded -Staged $staged -Pending @($pendingList.ToArray())) {
-              Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $staged)
+            foreach ($art in $publishSet) {
+              if (Test-SebStagedStillNeeded -Staged $art.Src -Pending @($pendingList.ToArray())) {
+                Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $art.Src)
+              }
+              else {
+                Remove-Item -LiteralPath $art.Src -Force -ErrorAction SilentlyContinue
+              }
             }
-            else {
-              Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
-            }
+            if ($compress) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
           }
         }
         $succeeded++
@@ -3813,6 +3831,8 @@ try {
     $only = ''
     if ($config.PSObject.Properties['OnlyDatabase']) { $only = [string]$config.OnlyDatabase }
     $noHash = [bool]$config.NoHashVerify
+    $compress = $false
+    if ($config.PSObject.Properties['CompressBackups']) { $compress = [bool]$config.CompressBackups }
 
     $password = $null
     $connection = $null
@@ -3832,7 +3852,7 @@ try {
       Write-SebLog ('connected to {0}' -f $config.DataSource)
 
       $result = Invoke-SebBackupLogPass -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME `
-        -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath -OnlyDatabase $only -NoHash:$noHash
+        -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath -OnlyDatabase $only -NoHash:$noHash -Compress $compress
       Write-SebLog ('log pass finished: {0} succeeded, {1} failed, {2} copy(s) pending' -f $result.Succeeded, $result.Failed, $result.Pending)
 
       # Mirror -Run/Invoke-SebPass's ok/partial/failed -> exit-code mapping (Get-SebLogPassExitCode):
