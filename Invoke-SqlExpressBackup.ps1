@@ -1344,6 +1344,60 @@ function Remove-SebNamed {
   }
 }
 
+# Drain a Pending list once: for each {Staged,Dest} whose paths both stay inside the
+# configured staging and share folders (Test-SebPendingEntry - a writable state file is
+# otherwise a "copy anywhere as SYSTEM" primitive), copy the staged file to its destination.
+# Returns the entries that still could not be copied, to be written back to state and retried
+# next run. File I/O only - no SQL, no state access - so the -BackupLog pass and the data pass
+# can share it and it is unit testable. Mirrors the drain Invoke-SebPass runs inline up top.
+function Sync-SebPending {
+  param([object[]]$Pending = @(), [string]$StagingPath, [string]$SharePath, [switch]$NoHash)
+  $still = New-Object System.Collections.ArrayList
+  foreach ($item in $Pending) {
+    if ($null -eq $item) { continue }
+    $staged = [string]$item.Staged
+    $dest = [string]$item.Dest
+    if (-not (Test-SebPendingEntry -Staged $staged -Dest $dest -StagingPath $StagingPath -SharePath $SharePath)) {
+      Write-SebLog ('refusing a pending entry that points outside the configured folders: {0} -> {1}' -f $staged, $dest) 'WARN'
+      continue
+    }
+    if (-not (Test-Path -LiteralPath $staged)) { continue }
+    try {
+      Copy-SebVerified -Source $staged -Destination $dest -NoHash:$NoHash
+      Write-SebLog ('recovered {0}' -f $dest)
+    }
+    catch {
+      Write-SebLog ('still cannot copy {0}: {1}' -f $dest, $_.Exception.Message) 'WARN'
+      [void]$still.Add($item)
+    }
+  }
+  return @($still.ToArray())
+}
+
+# Copy one freshly-staged backup to the share, or record it for the next run's drain. On
+# success the staged file is removed (unless a still-pending entry names it too); on failure
+# it is kept in staging and added to $PendingList as {Staged,Dest,Database,Kind}. The
+# -BackupLog pass calls this for its log copy and its anchoring-full copy, so a share that
+# refuses either leaves it recorded and retryable instead of orphaning a .trn whose BACKUP
+# LOG already truncated the chain. Mirrors the copy-or-pend block in Invoke-SebPass.
+function Save-SebCopyOrPend {
+  param([string]$Staged, [string]$Dest, [string]$Database, [string]$Kind, $PendingList, [switch]$NoHash)
+  try {
+    Copy-SebVerified -Source $Staged -Destination $Dest -NoHash:$NoHash
+    Write-SebLog ('copied to {0}' -f $Dest)
+    if (Test-SebStagedStillNeeded -Staged $Staged -Pending @($PendingList.ToArray())) {
+      Write-SebLog ('keeping {0} in staging - an earlier copy of it is still waiting for the share' -f $Staged)
+    }
+    else {
+      Remove-Item -LiteralPath $Staged -Force -ErrorAction SilentlyContinue
+    }
+  }
+  catch {
+    Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $Dest, $_.Exception.Message) 'WARN'
+    [void]$PendingList.Add([pscustomobject]@{ Staged = $Staged; Dest = $Dest; Database = $Database; Kind = $Kind })
+  }
+}
+
 # =====================================================================
 # The pass
 # =====================================================================
@@ -1387,6 +1441,18 @@ function Get-SebBackupKindDue {
   return 'diff'
 }
 
+# Map a -BackupLog tally to a process exit code, exactly as Invoke-SebPass maps a data pass:
+# nothing succeeded although something was attempted is a total failure (2); a copy still
+# pending or a database that failed alongside a success is partial (1); a clean run - including
+# "nothing was FULL recovery this cycle" (0 succeeded, 0 failed) - is ok (0). A pending copy is
+# NOT success: the log was taken but the offsite copy, the whole point, has not happened yet.
+function Get-SebLogPassExitCode {
+  param([int]$Succeeded, [int]$Failed, [int]$Pending)
+  if ($Succeeded -eq 0 -and $Failed -gt 0) { return 2 }
+  if ($Failed -gt 0 -or $Pending -gt 0) { return 1 }
+  return 0
+}
+
 # The -BackupLog task: one transaction-log backup of every FULL-recovery user database,
 # staged locally then copied to the share's log/ folder. If a database has no base yet
 # (SEB_LOG_NO_BASE), anchor it with a full first, then retry the log.
@@ -1406,6 +1472,27 @@ function Invoke-SebBackupLogPass {
     [string]$OnlyDatabase = '',
     [switch]$NoHash
   )
+  # Drain first, exactly as Invoke-SebPass does: a share that came back catches up before
+  # this pass stages anything new, so a long outage cannot let staging grow unbounded. The
+  # Pending list lives in the same state.json the data pass uses, and both passes run under
+  # the same Get-SebMutex, so this read-drain-write is race-free against the data pass.
+  $state = Read-SebState
+  $pending = @($state.Pending)
+  $pendingList = New-Object System.Collections.ArrayList
+  if ($pending.Count -gt 0) {
+    Write-SebLog ('{0} copy(s) pending from earlier runs - draining first' -f $pending.Count)
+    foreach ($item in @(Sync-SebPending -Pending $pending -StagingPath $StagingPath -SharePath $Root -NoHash:$NoHash)) {
+      [void]$pendingList.Add($item)
+    }
+    # A staged file no surviving pending entry points at has reached the share and is done
+    # with. This sweep runs BEFORE anything is staged this pass, so a database that fails
+    # below still leaves its own staged file in place - the loud evidence D1a keeps.
+    $keepPaths = @($pendingList.ToArray() | ForEach-Object { [string]$_.Staged })
+    Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction SilentlyContinue |
+      Where-Object { ($_.Extension -eq '.trn' -or $_.Extension -eq '.bak') -and $keepPaths -notcontains $_.FullName } |
+      ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+  }
+
   $rows = Invoke-SebSqlTable -Connection $Connection -Sql @'
 SELECT d.name, d.state, d.source_database_id, d.is_in_standby
 FROM sys.databases AS d
@@ -1440,14 +1527,18 @@ FROM sys.databases AS d
         Invoke-SebBackupDatabase -Connection $Connection -Database $db -TargetFile $anchorStaged -Kind 'full'
         Test-SebBackupFile -Connection $Connection -TargetFile $anchorStaged
         $anchorDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'hourly') $anchorName
-        Copy-SebVerified -Source $anchorStaged -Destination $anchorDest -NoHash:$NoHash
-        Remove-Item -LiteralPath $anchorStaged -Force -ErrorAction SilentlyContinue
+        # The anchor is the log chain's base. If the share refuses it, record and keep it
+        # (do not orphan it) and still take the log: the base is safe locally, and the anchor
+        # and the log then drain to the share together on the next run.
+        Save-SebCopyOrPend -Staged $anchorStaged -Dest $anchorDest -Database $db -Kind 'hourly' -PendingList $pendingList -NoHash:$NoHash
         Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged
       }
       $logDest = Join-Path (Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'log') $logName
-      Copy-SebVerified -Source $logStaged -Destination $logDest -NoHash:$NoHash
-      Remove-Item -LiteralPath $logStaged -Force -ErrorAction SilentlyContinue
-      Write-SebLog ('log backup of {0} taken and copied' -f $db) 'INFO'
+      # BACKUP LOG has already truncated the chain, so a refused copy must not throw the .trn
+      # away: record it and keep it staged for the next run's drain instead of losing the
+      # interval. A pending copy is not a per-database failure - the log itself was taken.
+      Save-SebCopyOrPend -Staged $logStaged -Dest $logDest -Database $db -Kind 'log' -PendingList $pendingList -NoHash:$NoHash
+      Write-SebLog ('log backup of {0} taken' -f $db) 'INFO'
       $succeeded++
     }
     catch {
@@ -1455,7 +1546,15 @@ FROM sys.databases AS d
       Write-SebLog ('{0} FAILED: {1}' -f $db, $_.Exception.Message) 'ERROR'
     }
   }
-  return [pscustomobject]@{ Succeeded = $succeeded; Failed = $failed }
+
+  # Persist the merged Pending so the next run drains it. Pending is all this pass owns of
+  # state.json - preserve the data pass's LastRunUtc/LastResult, which drive the status view.
+  Write-SebState ([pscustomobject]@{
+      LastRunUtc = $state.LastRunUtc
+      LastResult = $state.LastResult
+      Pending    = @($pendingList.ToArray())
+    })
+  return [pscustomobject]@{ Succeeded = $succeeded; Failed = $failed; Pending = $pendingList.Count }
 }
 
 function Invoke-SebPass {
@@ -3283,16 +3382,16 @@ try {
 
       $result = Invoke-SebBackupLogPass -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME `
         -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath -OnlyDatabase $only -NoHash:$noHash
-      Write-SebLog ('log pass finished: {0} succeeded, {1} failed' -f $result.Succeeded, $result.Failed)
+      Write-SebLog ('log pass finished: {0} succeeded, {1} failed, {2} copy(s) pending' -f $result.Succeeded, $result.Failed, $result.Pending)
 
-      # Mirror -Run/Invoke-SebPass's ok/partial/failed -> exit-code mapping: nothing
-      # succeeded although something was attempted is a total failure (2); some failed
-      # alongside a success is partial (1); zero failures - including "nothing was FULL
-      # recovery this cycle" - is ok (0, the $exitCode default).
-      $ok = ($result.Failed -eq 0)
-      Write-Host (ConvertTo-Json @{ Ok = $ok; Mode = 'BackupLog'; Succeeded = $result.Succeeded; Failed = $result.Failed } -Compress)
-      if ($result.Succeeded -eq 0 -and $result.Failed -gt 0) { $exitCode = 2 }
-      elseif ($result.Failed -gt 0) { $exitCode = 1 }
+      # Mirror -Run/Invoke-SebPass's ok/partial/failed -> exit-code mapping (Get-SebLogPassExitCode):
+      # nothing succeeded although something was attempted is a total failure (2); a database that
+      # failed OR a copy still pending alongside a success is partial (1); zero of both - including
+      # "nothing was FULL recovery this cycle" - is ok (0). A pending copy is NOT success: the log
+      # was taken but has not reached the share, so a week-long outage must not keep reporting 0.
+      $ok = ($result.Failed -eq 0 -and $result.Pending -eq 0)
+      Write-Host (ConvertTo-Json @{ Ok = $ok; Mode = 'BackupLog'; Succeeded = $result.Succeeded; Failed = $result.Failed; Pending = $result.Pending } -Compress)
+      $exitCode = Get-SebLogPassExitCode -Succeeded $result.Succeeded -Failed $result.Failed -Pending $result.Pending
     }
     finally {
       if ($null -ne $connection) { $connection.Dispose() }

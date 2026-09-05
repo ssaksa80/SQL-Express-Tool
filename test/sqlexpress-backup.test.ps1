@@ -1202,4 +1202,82 @@ $cfOld = Get-SebChainFactsFromCatalogue -Catalogue $catOld
 $rpOld = Get-SebChainRetentionPlan -Fulls $cfOld.Fulls -Diffs $cfOld.Diffs -Logs $cfOld.Logs -Now ([datetime]'2026-09-05 12:00:00') -DailyKeepDays 7
 Assert ($rpOld.FullDelete -contains 'db_20260820-000000.bak') 'a full older than the horizon is pruned (positive control)'
 
+# ---- D1d. -BackupLog copy-resilience: a share outage drains on the next run ----------
+# The transaction-log pass now carries the same Pending/state resilience the data pass has:
+# a .trn (or its anchoring full) whose share copy fails is recorded, kept in staging, and
+# copied on the next run instead of being orphaned. BACKUP LOG truncates the chain on
+# success, so an orphaned .trn is a permanent point-in-time gap - this is what prevents it.
+# Mirrors Invoke-SebSelfTest's "share is unreachable" pass, but as a pure unit (no SQL):
+# Sync-SebPending is the drain both passes run, exercised here against real files.
+$d1dRoot = Join-Path $env:TEMP ('seb-d1d-' + [Guid]::NewGuid().ToString('N'))
+try {
+  $d1dStage = Join-Path $d1dRoot 'staging'
+  $d1dShare = Join-Path $d1dRoot 'share'
+  [void](New-Item -ItemType Directory -Force -Path $d1dStage)
+  [void](New-Item -ItemType Directory -Force -Path $d1dShare)
+  # A blocker FILE where the share root should be: any copy/mkdir under it fails - the same
+  # stand-in Invoke-SebSelfTest uses for an unreachable share.
+  $d1dBlocker = Join-Path $d1dRoot 'not-a-directory.txt'
+  Set-Content -LiteralPath $d1dBlocker -Value 'stands in for an unreachable share' -Encoding ASCII
+  $d1dShareDown = Join-Path $d1dBlocker 'share'
+
+  # A taken-and-truncated .trn sitting in staging, waiting to reach the share's log/ folder.
+  $trnName = Get-SebFileName -Database 'APPDB' -Stamp ([datetime]'2026-09-05 03:15:00') -Extension 'trn'
+  $trnStaged = Join-Path $d1dStage $trnName
+  Set-Content -LiteralPath $trnStaged -Value 'transaction-log-backup-bytes' -Encoding ASCII
+
+  $destDown = Join-Path (Get-SebBackupPath -Root $d1dShareDown -HostName 'HOST' -InstanceLabel 'INST' -Database 'APPDB' -Kind 'log') $trnName
+  $pendingDown = @([pscustomobject]@{ Staged = $trnStaged; Dest = $destDown; Database = 'APPDB'; Kind = 'log' })
+
+  # Run 1 - the share is down: the copy fails, the entry stays pending, the .trn is kept.
+  $still1 = @(Sync-SebPending -Pending $pendingDown -StagingPath $d1dStage -SharePath $d1dShareDown)
+  Assert ($still1.Count -eq 1) 'a log copy the share refused stays pending for the next run'
+  Assert ([string]$still1[0].Staged -eq $trnStaged) 'the pending entry still names the staged .trn'
+  Assert (Test-Path -LiteralPath $trnStaged) 'the truncated .trn is held in staging, not lost, while the share is down'
+
+  # Run 2 - the share is back: re-point the same staged file at the real share; it drains.
+  $destUp = Join-Path (Get-SebBackupPath -Root $d1dShare -HostName 'HOST' -InstanceLabel 'INST' -Database 'APPDB' -Kind 'log') $trnName
+  $pendingUp = @([pscustomobject]@{ Staged = $trnStaged; Dest = $destUp; Database = 'APPDB'; Kind = 'log' })
+  $still2 = @(Sync-SebPending -Pending $pendingUp -StagingPath $d1dStage -SharePath $d1dShare)
+  Assert ($still2.Count -eq 0) 'when the share returns the pending log copy drains and nothing stays pending'
+  Assert (Test-Path -LiteralPath $destUp) 'the .trn recovered onto the share log/ folder on the next run'
+  Assert ((Get-FileHash -LiteralPath $destUp).Hash -eq (Get-FileHash -LiteralPath $trnStaged).Hash) 'the recovered copy is byte-for-byte the staged .trn'
+
+  # The write-anywhere guard: a pending entry aimed outside the share is refused, not
+  # honoured and not retried - a writable state file must not become "copy anywhere as SYSTEM".
+  $evil = @([pscustomobject]@{ Staged = $trnStaged; Dest = 'C:\Windows\System32\seb-evil.trn'; Database = 'APPDB'; Kind = 'log' })
+  $stillEvil = @(Sync-SebPending -Pending $evil -StagingPath $d1dStage -SharePath $d1dShare)
+  Assert ($stillEvil.Count -eq 0 -and -not (Test-Path 'C:\Windows\System32\seb-evil.trn')) 'a pending copy aimed outside the share is refused, not written and not retried'
+
+  # Save-SebCopyOrPend is the record-on-failure half the pass uses for each anchor and log
+  # copy: a copy the share accepts is verified and its staged file cleaned up; a copy the
+  # share refuses is recorded as a Pending entry and the staged file is kept for the drain.
+  $cp = New-Object System.Collections.ArrayList
+  $okName = Get-SebFileName -Database 'APPDB' -Stamp ([datetime]'2026-09-05 04:00:00') -Extension 'trn'
+  $okStaged = Join-Path $d1dStage $okName; Set-Content -LiteralPath $okStaged -Value 'log-bytes' -Encoding ASCII
+  $okDest = Join-Path (Get-SebBackupPath -Root $d1dShare -HostName 'HOST' -InstanceLabel 'INST' -Database 'APPDB' -Kind 'log') $okName
+  Save-SebCopyOrPend -Staged $okStaged -Dest $okDest -Database 'APPDB' -Kind 'log' -PendingList $cp -NoHash
+  Assert ($cp.Count -eq 0) 'a copy the share accepts adds nothing to the pending list'
+  Assert ((Test-Path -LiteralPath $okDest) -and -not (Test-Path -LiteralPath $okStaged)) 'an accepted copy lands on the share and its staged file is cleaned up'
+
+  $badName = Get-SebFileName -Database 'APPDB' -Stamp ([datetime]'2026-09-05 05:00:00') -Extension 'trn'
+  $badStaged = Join-Path $d1dStage $badName; Set-Content -LiteralPath $badStaged -Value 'log-bytes' -Encoding ASCII
+  $badDest = Join-Path (Get-SebBackupPath -Root $d1dShareDown -HostName 'HOST' -InstanceLabel 'INST' -Database 'APPDB' -Kind 'log') $badName
+  Save-SebCopyOrPend -Staged $badStaged -Dest $badDest -Database 'APPDB' -Kind 'log' -PendingList $cp -NoHash
+  Assert ($cp.Count -eq 1 -and [string]$cp[0].Dest -eq $badDest) 'a copy the share refuses is recorded as a pending entry'
+  Assert (Test-Path -LiteralPath $badStaged) 'a refused copy keeps its .trn staged for the next run (BACKUP LOG already truncated the chain)'
+}
+finally {
+  Remove-Item -LiteralPath $d1dRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# The dispatch maps the log pass tally to an exit code exactly as -Run's data pass does:
+# a copy still pending is partial (1), not success - a share down for a week must not keep
+# reporting 0. Nothing FULL-recovery this cycle is still ok (0); every attempt failing is 2.
+Assert ((Get-SebLogPassExitCode -Succeeded 2 -Failed 0 -Pending 0) -eq 0) 'all logs copied, nothing pending -> ok (0)'
+Assert ((Get-SebLogPassExitCode -Succeeded 0 -Failed 0 -Pending 0) -eq 0) 'nothing was FULL-recovery this cycle -> still ok (0)'
+Assert ((Get-SebLogPassExitCode -Succeeded 2 -Failed 0 -Pending 1) -eq 1) 'a log taken but not yet on the share -> partial (1), not success'
+Assert ((Get-SebLogPassExitCode -Succeeded 1 -Failed 1 -Pending 0) -eq 1) 'one database failed alongside a success -> partial (1)'
+Assert ((Get-SebLogPassExitCode -Succeeded 0 -Failed 2 -Pending 0) -eq 2) 'every attempted database failed -> hard failure (2)'
+
 Write-Host 'ALL PASS'
