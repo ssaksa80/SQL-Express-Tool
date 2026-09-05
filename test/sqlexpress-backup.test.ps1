@@ -1411,4 +1411,37 @@ $threw = $false
 try { [void](Get-SebFactsForFile -Connection $null -File 'C:\s\APPDB.bak' -Kind 'full' -SidecarReader $readerNone) } catch { $threw = $true }
 Assert $threw 'with no sidecar it falls through to RESTORE HEADERONLY (which needs a real connection)'
 
+# ---- COMP-5. CompressBackups config flag rides the same rails as RecoveryMode -------
+# Mirrors RecoveryMode's plumbing (PITR D3): a config predating this feature has no
+# CompressBackups key at all, and that must read as off, not throw or default on. There
+# is no centralized config-normalizer/coercion function in this engine (Read-SebConfig
+# is a bare ConvertFrom-Json) - every caller casts inline with PSObject.Properties guards
+# like the one below, so that inline idiom IS the "coercion step" and is what this pins.
+$cfgNo = [pscustomobject]@{ RecoveryMode = 'Simple' }   # a config predating this feature
+$compNo = $false
+if ($cfgNo.PSObject.Properties['CompressBackups']) { $compNo = [bool]$cfgNo.CompressBackups }
+Assert (-not $compNo) 'a config without CompressBackups reads as off (existing installs unchanged)'
+$cfgYes = [pscustomobject]@{ CompressBackups = $true }
+Assert ([bool]$cfgYes.CompressBackups) 'CompressBackups=$true is read as on'
+
+# $SebShowKeys is the one allow-list Format-SebConfigFacts (the -Status display) AND
+# Write-SebPublicSummary (public.json, read unelevated by the dashboard) both consult -
+# see the comment above Write-SebPublicSummary. One membership check pins both at once.
+Assert ($script:SebShowKeys -contains 'CompressBackups') 'CompressBackups is on the SebShowKeys allow-list (shown by -Status AND written to public.json), like RecoveryMode'
+
+# Behavioural proof of the same claim, through the real consuming function rather than
+# just reading the array - same idiom as test 7 ("redaction is an allow-list"). An
+# allow-listed field's VALUE is printed; a field nobody put on the list is named but
+# redacted. RecoveryMode and a non-allow-listed secret ride along as positive controls,
+# so a probe that found nothing would be caught rather than trusted.
+$compConfig = [pscustomobject]@{
+  RecoveryMode    = 'Simple'
+  CompressBackups = $true
+  SealedSecret    = 'SUPERSECRETVALUE'
+}
+$compFacts = (Format-SebConfigFacts -Config $compConfig) -join "`n"
+Assert ($compFacts -match 'CompressBackups = True') 'CompressBackups is shown by name AND value, like RecoveryMode - not redacted as "(value hidden)"'
+Assert ($compFacts -match 'RecoveryMode = Simple') 'positive control: the RecoveryMode allow-list entry this test is modeled on still shows its value too'
+Assert (-not ($compFacts -match 'SUPERSECRETVALUE')) 'positive control: a field NOT on the allow-list is still redacted here - the probe can tell the difference'
+
 Write-Host 'ALL PASS'

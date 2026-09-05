@@ -106,6 +106,7 @@ param(
   [string]$RecoveryMode = 'Simple', # point-in-time recovery mode; -Reschedule still gates on ContainsKey, so omitting it there means "leave as-is"
   [int]$LogIntervalMinutes = 15,    # Full mode only: how often -BackupLog runs; same ContainsKey gating in -Reschedule
   [int]$FullEveryHours = 24,        # Full mode only: how often the data pass takes a full instead of a diff; same ContainsKey gating in -Reschedule
+  [switch]$CompressBackups,       # zip every .bak/.dif/.trn to the share, with a facts sidecar; same ContainsKey gating in -Reschedule
   [switch]$UseWindowsAuth,
   [switch]$NoHashVerify,          # verify copies by length only (very large databases)
   [string]$NssmPath,
@@ -128,7 +129,7 @@ $script:SebCompression = 'unknown'   # unknown | on | off, probed once per pass
 $script:SebShowKeys = @(
   'Instance', 'InstanceName', 'DataSource', 'SharePath', 'StagingPath',
   'IntervalHours', 'HourlyKeep', 'DailyKeepDays', 'RecoveryMode', 'LogIntervalMinutes',
-  'FullEveryHours', 'SqlUser', 'UseWindowsAuth',
+  'FullEveryHours', 'CompressBackups', 'SqlUser', 'UseWindowsAuth',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -2165,7 +2166,7 @@ function Uninstall-SebSchedule {
 # =====================================================================
 
 function Invoke-SebSetup {
-  param([string]$PinnedInstance, [string]$Share, [string]$Staging, [int]$Hours, [int]$Hourly, [int]$DailyDays, [switch]$WindowsAuth, [switch]$SkipHash, [string]$RecoveryMode = 'Simple', [int]$LogIntervalMinutes = 15, [int]$FullEveryHours = 24)
+  param([string]$PinnedInstance, [string]$Share, [string]$Staging, [int]$Hours, [int]$Hourly, [int]$DailyDays, [switch]$WindowsAuth, [switch]$SkipHash, [string]$RecoveryMode = 'Simple', [int]$LogIntervalMinutes = 15, [int]$FullEveryHours = 24, [switch]$CompressBackups)
 
   if (-not (Test-Path -LiteralPath $script:SebConfigDir)) {
     [void](New-Item -ItemType Directory -Path $script:SebConfigDir -Force)
@@ -2317,6 +2318,7 @@ function Invoke-SebSetup {
       RecoveryMode       = $RecoveryMode
       LogIntervalMinutes = $LogIntervalMinutes
       FullEveryHours     = $FullEveryHours
+      CompressBackups    = [bool]$CompressBackups
       SqlUser       = $sqlUser
       SqlServiceAccount = $sqlAccount
       UseWindowsAuth = [bool]$WindowsAuth
@@ -3461,7 +3463,8 @@ try {
     Invoke-SebSetup -PinnedInstance $Instance -Share $SharePath -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
       -WindowsAuth:$UseWindowsAuth -SkipHash:$NoHashVerify `
-      -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours
+      -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours `
+      -CompressBackups:$CompressBackups
   }
   elseif ($Install) {
     Assert-SebElevated -Mode 'Install'
@@ -3497,6 +3500,12 @@ try {
     if ($PSBoundParameters.ContainsKey('RecoveryMode')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'RecoveryMode' -Value $RecoveryMode -Force }
     if ($PSBoundParameters.ContainsKey('LogIntervalMinutes')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'LogIntervalMinutes' -Value ([int]$LogIntervalMinutes) -Force }
     if ($PSBoundParameters.ContainsKey('FullEveryHours')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'FullEveryHours' -Value ([int]$FullEveryHours) -Force }
+    # Add-Member -Force, same reason as RecoveryMode/LogIntervalMinutes/FullEveryHours above:
+    # a pre-D3 (or pre-this-feature) config.json has no CompressBackups property, and plain
+    # assignment throws on a ConvertFrom-Json object for a property that is not already there.
+    # $CompressBackups is a [switch]; persist its .IsPresent (a real bool), not the switch
+    # object itself - ConvertTo-Json would not serialize a SwitchParameter as a plain true/false.
+    if ($PSBoundParameters.ContainsKey('CompressBackups')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'CompressBackups' -Value $CompressBackups.IsPresent -Force }
     Write-SebConfig -Config $config
     $schedule = Get-SebScheduleState
     $scriptPath = Get-SebScriptPath
@@ -3533,6 +3542,8 @@ try {
     if ($config.PSObject.Properties['LogIntervalMinutes']) { $echoLogIntervalMinutes = [int]$config.LogIntervalMinutes }
     $echoFullEveryHours = 24
     if ($config.PSObject.Properties['FullEveryHours']) { $echoFullEveryHours = [int]$config.FullEveryHours }
+    $echoCompressBackups = $false
+    if ($config.PSObject.Properties['CompressBackups']) { $echoCompressBackups = [bool]$config.CompressBackups }
     Write-Host (ConvertTo-Json @{
         Ok                 = $true
         IntervalHours      = [int]$config.IntervalHours
@@ -3541,6 +3552,7 @@ try {
         RecoveryMode       = $echoRecoveryMode
         LogIntervalMinutes = $echoLogIntervalMinutes
         FullEveryHours     = $echoFullEveryHours
+        CompressBackups    = $echoCompressBackups
       } -Compress)
   }
   elseif ($RestoreList) {
@@ -3708,7 +3720,8 @@ try {
     Invoke-SebSetup -PinnedInstance $Instance -Share $unc -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
       -WindowsAuth -SkipHash:$NoHashVerify `
-      -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours
+      -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours `
+      -CompressBackups:$CompressBackups
 
     Write-Host ''
     Write-Host '== 3/5  schedule ======================================================'
