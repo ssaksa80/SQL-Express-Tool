@@ -48,7 +48,11 @@ class RestoreWindow
     ComboBox pointDbBox;
     DatePicker pointDate;
     TextBox pointHourBox, pointMinuteBox, pointAsBox;
+    TextBlock pointTimeError;
     CheckBox pointReplaceBox;
+    StackPanel pointConfirmRow;
+    TextBlock pointConfirmLabel;
+    TextBox pointConfirmBox;
     Border pointStartBtn;
     string pointAsDefaultFor;
 
@@ -750,7 +754,7 @@ class RestoreWindow
         pointDbBox.HorizontalAlignment = HorizontalAlignment.Left;
         foreach (string db in dbOrder) { pointDbBox.Items.Add(db); }
         pointDbBox.SelectedIndex = 0;
-        pointDbBox.SelectionChanged += delegate { SyncPointAsName(); UpdatePointStart(); };
+        pointDbBox.SelectionChanged += delegate { SyncPointAsName(); UpdatePointConfirm(); };
         detail.Children.Add(Margin(pointDbBox, 0, 6, 0, 16));
 
         detail.Children.Add(Ui.Eyebrow("Restore to this moment"));
@@ -770,6 +774,10 @@ class RestoreWindow
         TextBlock hintLbl = Ui.Text("(24h, local time)", 11, Theme.Ink3); hintLbl.VerticalAlignment = VerticalAlignment.Center; hintLbl.Margin = new Thickness(8, 0, 0, 0);
         timeRow.Children.Add(hintLbl);
         detail.Children.Add(timeRow);
+        pointTimeError = Ui.Text("", 11.5, Theme.Bad);
+        pointTimeError.Margin = new Thickness(0, 4, 0, 0);
+        pointTimeError.Visibility = Visibility.Collapsed;
+        detail.Children.Add(pointTimeError);
         detail.Children.Add(Margin(Ui.Text(
             "The engine works out the restore chain itself and reports a clear error here if the target is outside the recoverable range or a backup is missing.",
             11.5, Theme.Ink3), 0, 6, 0, 18));
@@ -780,20 +788,38 @@ class RestoreWindow
         string firstDb = pointDbBox.SelectedItem.ToString();
         pointAsBox.Text = PointDefaultName(firstDb);
         pointAsDefaultFor = firstDb;
-        pointAsBox.TextChanged += delegate { UpdatePointStart(); };
+        pointAsBox.TextChanged += delegate { UpdatePointConfirm(); };
         detail.Children.Add(Margin(pointAsBox, 0, 6, 0, 12));
 
         pointReplaceBox = new CheckBox();
         pointReplaceBox.Content = "Overwrite if a database with this name already exists";
         pointReplaceBox.Foreground = Theme.Ink2; pointReplaceBox.FontFamily = Ui.Face; pointReplaceBox.FontSize = 12.5;
-        detail.Children.Add(Margin(pointReplaceBox, 0, 0, 0, 18));
+        pointReplaceBox.Checked += delegate { UpdatePointConfirm(); };
+        pointReplaceBox.Unchecked += delegate { UpdatePointConfirm(); };
+        detail.Children.Add(Margin(pointReplaceBox, 0, 8, 0, 0));
 
-        StackPanel act = new StackPanel(); act.Orientation = Orientation.Horizontal;
+        // REPLACE can destroy an existing database in one click - same guard as the
+        // backup-set restore mode (see ApplyInspect/UpdateConfirm): checking "overwrite"
+        // reveals a row that requires typing the target name before Restore enables. The
+        // warning is stronger (and still gated the same way) when the restore-as name IS
+        // the live source database, since that is the one REPLACE that destroys data the
+        // operator almost certainly still needs.
+        pointConfirmRow = new StackPanel(); pointConfirmRow.Orientation = Orientation.Horizontal;
+        pointConfirmRow.Margin = new Thickness(0, 8, 0, 0); pointConfirmRow.Visibility = Visibility.Collapsed;
+        pointConfirmLabel = Ui.Text("", 12, Theme.Bad);
+        pointConfirmLabel.Margin = new Thickness(0, 4, 8, 0);
+        pointConfirmRow.Children.Add(pointConfirmLabel);
+        pointConfirmBox = new TextBox(); pointConfirmBox.Width = 150; pointConfirmBox.FontSize = 12.5; pointConfirmBox.FontFamily = Ui.Face;
+        pointConfirmBox.TextChanged += delegate { UpdatePointStart(); };
+        pointConfirmRow.Children.Add(pointConfirmBox);
+        detail.Children.Add(pointConfirmRow);
+
+        StackPanel act = new StackPanel(); act.Orientation = Orientation.Horizontal; act.Margin = new Thickness(0, 18, 0, 4);
         pointStartBtn = Ui.PrimaryButton("Restore to this point", delegate { StartPointRestore(); });
         act.Children.Add(pointStartBtn);
         detail.Children.Add(act);
 
-        UpdatePointStart();
+        UpdatePointConfirm();
     }
 
     // Only overwrite the "restore as" box when it still holds the default we last set - so
@@ -828,19 +854,56 @@ class RestoreWindow
         stopAt = DateTime.MinValue; error = "";
         if (pointDate == null || pointDate.SelectedDate == null) { error = "pick a date"; return false; }
         int hour, minute;
-        if (pointHourBox == null || !int.TryParse(pointHourBox.Text.Trim(), out hour) || hour < 0 || hour > 23) { error = "hour must be 0-23"; return false; }
-        if (pointMinuteBox == null || !int.TryParse(pointMinuteBox.Text.Trim(), out minute) || minute < 0 || minute > 59) { error = "minute must be 0-59"; return false; }
+        NumberStyles ns = NumberStyles.Integer;
+        if (pointHourBox == null || !int.TryParse(pointHourBox.Text.Trim(), ns, CultureInfo.InvariantCulture, out hour) || hour < 0 || hour > 23) { error = "hour must be 0-23"; return false; }
+        if (pointMinuteBox == null || !int.TryParse(pointMinuteBox.Text.Trim(), ns, CultureInfo.InvariantCulture, out minute) || minute < 0 || minute > 59) { error = "minute must be 0-59"; return false; }
         DateTime d = pointDate.SelectedDate.Value.Date;
         stopAt = new DateTime(d.Year, d.Month, d.Day, hour, minute, 0);
         return true;
     }
 
+    // Shows/hides the typed-confirmation row and re-labels it. Any REPLACE gets a typed
+    // confirmation (a fresh restore-as name has nothing of its own to overwrite, but the
+    // operator can still type an existing database's name here); the wording escalates
+    // when the restore-as name matches the live source, since that is the case that
+    // actually destroys the database the backups came from.
+    void UpdatePointConfirm()
+    {
+        if (pointReplaceBox == null || pointConfirmRow == null) { UpdatePointStart(); return; }
+        string src = (pointDbBox != null && pointDbBox.SelectedItem != null) ? pointDbBox.SelectedItem.ToString() : "";
+        string asName = pointAsBox != null ? pointAsBox.Text.Trim() : "";
+        bool overwrite = pointReplaceBox.IsChecked == true && asName.Length > 0;
+        if (!overwrite)
+        {
+            pointConfirmRow.Visibility = Visibility.Collapsed;
+            UpdatePointStart();
+            return;
+        }
+        bool isLive = string.Equals(asName, src, StringComparison.OrdinalIgnoreCase);
+        pointConfirmLabel.Text = isLive
+            ? ("This REPLACES THE LIVE SOURCE DATABASE " + asName + ". Type " + asName + " to confirm:")
+            : ("This overwrites the existing database " + asName + ". Type " + asName + " to confirm:");
+        pointConfirmLabel.Foreground = isLive ? Theme.Bad : Theme.Warn;
+        pointConfirmRow.Visibility = Visibility.Visible;
+        UpdatePointStart();
+    }
+
     void UpdatePointStart()
     {
         DateTime stopAt; string err;
+        bool timeOk = TryBuildStopAt(out stopAt, out err);
+        if (pointTimeError != null)
+        {
+            if (!timeOk && err.Length > 0) { pointTimeError.Text = err; pointTimeError.Visibility = Visibility.Visible; }
+            else { pointTimeError.Text = ""; pointTimeError.Visibility = Visibility.Collapsed; }
+        }
         bool ok = !busy && pointDbBox != null && pointDbBox.SelectedItem != null
             && pointAsBox != null && pointAsBox.Text.Trim().Length > 0
-            && TryBuildStopAt(out stopAt, out err);
+            && timeOk;
+        if (pointConfirmRow != null && pointConfirmRow.Visibility == Visibility.Visible)
+        {
+            ok = ok && pointConfirmBox != null && string.Equals(pointConfirmBox.Text.Trim(), pointAsBox.Text.Trim(), StringComparison.Ordinal);
+        }
         if (pointStartBtn != null)
         {
             pointStartBtn.Opacity = ok ? 1.0 : 0.45;
@@ -878,7 +941,7 @@ class RestoreWindow
                 else if (line.StartsWith("[STAGE]")) { stage = FieldRest(line, "stage"); marker = true; }
                 else if (line.StartsWith("[PROGRESS]")) { pct = FieldInt(line, "pct", pct); marker = true; }
                 if (line.IndexOf("[ERROR]", StringComparison.OrdinalIgnoreCase) >= 0) { lastError = line; }
-                double overall = Overall(index, total, stage, pct);
+                double overall = PointOverall(stage);
                 Dispatch(delegate
                 {
                     if (marker) { glow.Update(overall, "Restoring " + asName + "  ·  " + stage); }
@@ -901,6 +964,31 @@ class RestoreWindow
         int i = line.IndexOf("[ERROR]", StringComparison.OrdinalIgnoreCase);
         if (i < 0) { return line; }
         return line.Substring(i + 7).Trim();
+    }
+
+    // -RestoreToPoint has no [PROGRESS] percent inside a step (a RESTORE DATABASE/LOG
+    // statement gives nothing to hook, unlike -RestoreRun's BACKUP), so Overall()'s
+    // backup/verify/copy/prune vocabulary never matches its stage text and progress read
+    // as a permanent 0% - which GlowBar's 5-second stall detector then flagged on every
+    // healthy restore. The engine reports its own step count instead: "restore <kind>
+    // i/total" per plan step (Invoke-SebRestoreToPoint), then a terminal "restore
+    // complete" - drive the fraction from that rather than from Overall().
+    static double PointOverall(string stage)
+    {
+        if (stage == null) { return 0; }
+        if (stage == "restore complete") { return 1.0; }
+        int slash = stage.LastIndexOf('/');
+        if (slash < 0) { return 0; }
+        int sp = stage.LastIndexOf(' ', slash);
+        if (sp < 0) { return 0; }
+        int i, total;
+        if (!int.TryParse(stage.Substring(sp + 1, slash - sp - 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out i)) { return 0; }
+        if (!int.TryParse(stage.Substring(slash + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out total)) { return 0; }
+        if (total <= 0) { return 0; }
+        double v = (double)i / total;
+        if (v < 0) { return 0; }
+        if (v > 1) { return 1; }
+        return v;
     }
 
     // ---- small builders -----------------------------------------------------------

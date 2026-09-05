@@ -101,6 +101,7 @@ class GlowBar : Border
         started = DateTime.Now; lastAdvance = DateTime.Now;
         stageText = "";
         caption.Text = caption0 + " starting…";
+        caption.Foreground = Theme.Ink2;
         stat.Text = "";
         fill.Background = Theme.Ok; fill.Width = 0;
         timer.Start();
@@ -113,7 +114,9 @@ class GlowBar : Border
         overall = ok ? 1.0 : overall;
         timer.Stop();
         sheen.RenderTransform = new TranslateTransform(-60, 0);
+        fill.Background = ok ? Theme.Ok : Theme.Bad;
         caption.Text = message;
+        caption.Foreground = ok ? Theme.Ink2 : Theme.Bad;
         Relayout();
     }
 
