@@ -1512,7 +1512,7 @@ function Invoke-SebBackupLogPass {
 SELECT d.name, d.state, d.source_database_id, d.is_in_standby
 FROM sys.databases AS d
 '@
-  $databases = @(Select-SebDatabase -Rows $rows)
+  $databases = Select-SebDatabase -Rows $rows
   if (-not [string]::IsNullOrWhiteSpace($OnlyDatabase)) {
     $databases = @($databases | Where-Object { $_ -eq $OnlyDatabase })
     if ($databases.Count -eq 0) { throw ("database '$OnlyDatabase' is not on this instance, or is not eligible for backup") }
