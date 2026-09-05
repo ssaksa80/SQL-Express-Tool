@@ -1290,4 +1290,16 @@ Assert (-not (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct 40 -ThresholdP
 Assert (-not (Get-SebLogGrowthWarning -Wait 'NOTHING' -UsedPct 95 -ThresholdPct 70)) 'a full log NOT waiting on a backup is a different problem, not our warning'
 Assert (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct 70 -ThresholdPct 70) 'exactly at the threshold warns'
 
+# ---- D3b-2. log-space lookup feeds the growth warning -------------------------------
+$lsRows = @(
+  [pscustomobject]@{ 'Database Name' = 'APPDB'; 'Log Size (MB)' = 100.0; 'Log Space Used (%)' = 85.0; 'Status' = 0 },
+  [pscustomobject]@{ 'Database Name' = 'Other'; 'Log Size (MB)' = 50.0;  'Log Space Used (%)' = 10.0; 'Status' = 0 }
+)
+Assert ((Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'APPDB') -eq 85.0) 'the log %-used is pulled for the named database'
+Assert ((Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'Missing') -eq 0) 'a database absent from the row set reads 0% (no false warning)'
+Assert ((Get-SebLogSpaceUsedPct -Rows @([pscustomobject]@{ 'Database Name' = 'X'; 'Log Space Used (%)' = [System.DBNull]::Value }) -Database 'X') -eq 0) 'a DBNull log %-used reads 0, not a thrown cast'
+# Compose with the growth predicate: high used% on a LOG_BACKUP wait warns; low used% does not (positive control both ways).
+Assert (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct (Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'APPDB') -ThresholdPct 70) 'APPDB (85% on a LOG_BACKUP wait) warns'
+Assert (-not (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct (Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'Other') -ThresholdPct 70)) 'Other (10%) does not warn'
+
 Write-Host 'ALL PASS'

@@ -1468,6 +1468,18 @@ function Get-SebLogGrowthWarning {
   return ($Wait -eq 'LOG_BACKUP' -and $UsedPct -ge $ThresholdPct)
 }
 
+# Pull one database's "Log Space Used (%)" out of a DBCC SQLPERF(LOGSPACE) row set.
+# Returns 0 when the database isn't found or the value is null (no false warning).
+function Get-SebLogSpaceUsedPct {
+  param([object[]]$Rows = @(), [string]$Database)
+  foreach ($r in $Rows) {
+    if ([string](Get-SebValue $r.'Database Name') -eq $Database) {
+      return [double](Get-SebValue $r.'Log Space Used (%)')
+    }
+  }
+  return 0
+}
+
 # The -BackupLog task: one transaction-log backup of every FULL-recovery user database,
 # staged locally then copied to the share's log/ folder. If a database has no base yet
 # (SEB_LOG_NO_BASE), anchor it with a full first, then retry the log.
@@ -1697,6 +1709,22 @@ GROUP BY database_id
     $pendingList = New-Object System.Collections.ArrayList
     foreach ($item in $pending) { [void]$pendingList.Add($item) }
 
+    # Log-growth WARN inputs, read ONCE per pass rather than once per database: both
+    # queries already return every database's row in a single result set, so the
+    # per-database work below is a local lookup, not a second SQL round trip. Full
+    # mode only - Simple mode never runs a log-backup task, so warning that one is
+    # overdue would be noise about a task that was never supposed to be running.
+    $logWaitByDb = @{}
+    $logSpaceRows = @()
+    if ($isFullMode) {
+      $logWaitRows = Invoke-SebSqlTable -Connection $connection -Sql 'SELECT name, log_reuse_wait_desc FROM sys.databases'
+      foreach ($row in $logWaitRows) {
+        $dbName = [string](Get-SebValue $row.name)
+        if ($dbName) { $logWaitByDb[$dbName] = [string](Get-SebValue $row.log_reuse_wait_desc) }
+      }
+      $logSpaceRows = @(Invoke-SebSqlTable -Connection $connection -Sql 'DBCC SQLPERF(LOGSPACE)')
+    }
+
     $dbIndex = 0
     foreach ($database in $databases) {
       $dbIndex++
@@ -1772,6 +1800,20 @@ GROUP BY database_id
                 Write-SebLog ('pruned {0}' -f $leaf) 'INFO'
               }
             }
+          }
+
+          # Log-growth WARN: this database is FULL recovery (isFullMode forced it above)
+          # and waiting on LOG_BACKUP with its log mostly full means the -BackupLog task
+          # has stalled. WARN only - auto-taking a catch-up log here would hide a stopped
+          # or misconfigured task instead of surfacing it; this pass's job is the data
+          # backup, not the log. Probed from the once-per-pass caches read before the
+          # loop; kept inside this per-database try so a probe failure cannot abort the
+          # rest of the pass.
+          $logWait = ''
+          if ($logWaitByDb.ContainsKey($database)) { $logWait = $logWaitByDb[$database] }
+          $usedPct = Get-SebLogSpaceUsedPct -Rows $logSpaceRows -Database $database
+          if (Get-SebLogGrowthWarning -Wait $logWait -UsedPct $usedPct) {
+            Write-SebLog ('WARNING: {0} log is {1}% full and waiting on a log backup - is the -BackupLog task running?' -f $database, $usedPct) 'WARN'
           }
         }
         else {
@@ -3178,6 +3220,77 @@ function Show-SebStatus {
   Write-Host ('   pending : {0} copy(s) waiting for the share' -f @($state.Pending).Count)
 
   if ($null -eq $config) { return }
+
+  # Same warning the data pass raises mid-run, surfaced here too so a WARN nobody was
+  # watching the console for is still one -Status call away. Full mode only, mirroring
+  # Invoke-SebPass: Simple mode never runs a log-backup task, so nothing here would be
+  # anything but noise about a task that was never supposed to be running. A SQL probe
+  # failure (server unreachable, stale credential) must not take the rest of -Status
+  # down with it, so it is caught and reported as a line rather than thrown.
+  $recoveryMode = 'Simple'
+  if ($config.PSObject.Properties['RecoveryMode']) { $recoveryMode = [string]$config.RecoveryMode }
+  if ($recoveryMode -eq 'Full') {
+    Write-Host ''
+    Write-Host '== Log growth =========================================================='
+    $statusConnection = $null
+    try {
+      if ($config.UseWindowsAuth) {
+        $statusConnection = New-SebSqlConnection -DataSource $config.DataSource -WindowsAuth
+      }
+      else {
+        $master = Get-SebMasterKey
+        try {
+          $blob = Get-Content -LiteralPath (Get-SebCredPath) -Raw
+          $statusPassword = Unprotect-SebSecureString -Blob $blob.Trim() -Master $master
+        }
+        finally { [System.Array]::Clear($master, 0, $master.Length) }
+        $statusConnection = New-SebSqlConnection -DataSource $config.DataSource -User $config.SqlUser -Password $statusPassword
+      }
+
+      # The same two SQL inputs the data pass reads, read once here too: recovery_model_desc
+      # (which databases are FULL) rides along with log_reuse_wait_desc on one sys.databases
+      # round trip, and DBCC SQLPERF(LOGSPACE) is the second and last query.
+      $dbRows = Invoke-SebSqlTable -Connection $statusConnection -Sql @'
+SELECT name, state, source_database_id, is_in_standby, recovery_model_desc, log_reuse_wait_desc
+FROM sys.databases
+'@
+      $eligible = Select-SebDatabase -Rows $dbRows
+      $waitByDb = @{}
+      $modelByDb = @{}
+      foreach ($row in $dbRows) {
+        $dbName = [string](Get-SebValue $row.name)
+        if (-not $dbName) { continue }
+        $modelByDb[$dbName] = [string](Get-SebValue $row.recovery_model_desc)
+        $waitByDb[$dbName] = [string](Get-SebValue $row.log_reuse_wait_desc)
+      }
+      $logSpaceRows = @(Invoke-SebSqlTable -Connection $statusConnection -Sql 'DBCC SQLPERF(LOGSPACE)')
+      $fullDatabases = @($eligible | Where-Object { $modelByDb.ContainsKey($_) -and $modelByDb[$_] -eq 'FULL' })
+
+      if ($fullDatabases.Count -eq 0) {
+        Write-Host '   no FULL-recovery databases found'
+      }
+      else {
+        foreach ($db in $fullDatabases) {
+          $wait = ''
+          if ($waitByDb.ContainsKey($db)) { $wait = $waitByDb[$db] }
+          $usedPct = Get-SebLogSpaceUsedPct -Rows $logSpaceRows -Database $db
+          if (Get-SebLogGrowthWarning -Wait $wait -UsedPct $usedPct) {
+            Write-Host ('   [WARN] {0,-30} {1}% full, waiting on a log backup - is the -BackupLog task running?' -f $db, $usedPct)
+          }
+          else {
+            Write-Host ('   {0,-30} log healthy ({1}% used)' -f $db, $usedPct)
+          }
+        }
+      }
+    }
+    catch {
+      Write-Host ('   could not probe log growth: {0}' -f $_.Exception.Message)
+    }
+    finally {
+      if ($null -ne $statusConnection) { $statusConnection.Close() }
+    }
+  }
+
   Write-Host ''
   Write-Host '== On the share ======================================================='
   $root = Join-Path (Join-Path $config.SharePath (Get-SebSafeName $env:COMPUTERNAME)) (Get-SebSafeName $config.InstanceName)
