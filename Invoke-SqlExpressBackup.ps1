@@ -1733,6 +1733,7 @@ GROUP BY database_id
           $destDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind $destKind
           $dest = Join-Path $destDir $fileName
           Write-SebStage -Database $database -Stage ('copy-' + $kind)
+          $copyOk = $true
           try {
             Copy-SebVerified -Source $staged -Destination $dest -NoHash:$noHash
             Write-SebLog ('copied to {0}' -f $dest)
@@ -1744,25 +1745,32 @@ GROUP BY database_id
             }
           }
           catch {
+            $copyOk = $false
             Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
             [void]$pendingList.Add([pscustomobject]@{ Staged = $staged; Dest = $dest; Database = $database; Kind = $destKind })
           }
 
           # Chain-safe pruning: never delete a full/diff/log a retained recovery point still
           # needs (Get-SebChainRetentionPlan guarantees this). Runs only in Full mode; Simple
-          # keeps its hourly/daily count-based retention untouched.
-          Write-SebStage -Database $database -Stage 'retention'
-          $catFull = @(Get-SebPointCatalogue -Connection $connection -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database)
-          $chainFacts = Get-SebChainFactsFromCatalogue -Catalogue $catFull
-          $rplan = Get-SebChainRetentionPlan -Fulls $chainFacts.Fulls -Diffs $chainFacts.Diffs -Logs $chainFacts.Logs -Now $stamp -DailyKeepDays ([int]$Config.DailyKeepDays)
-          foreach ($entry in $catFull) {
-            $leaf = Split-Path -Leaf $entry.File
-            $prune = ($entry.Kind -eq 'full' -and $rplan.FullDelete -contains $leaf) -or `
-                     ($entry.Kind -eq 'diff' -and $rplan.DiffDelete -contains $leaf) -or `
-                     ($entry.Kind -eq 'log'  -and $rplan.LogDelete  -contains $leaf)
-            if ($prune) {
-              Remove-Item -LiteralPath $entry.File -Force -ErrorAction SilentlyContinue
-              Write-SebLog ('pruned {0}' -f $leaf) 'INFO'
+          # keeps its hourly/daily count-based retention untouched. Gated to full+copied passes:
+          # chain-retention eligibility only changes when a full lands or ages out (~daily), so
+          # re-reading every backup header on a diff-only pass is wasted work, and when the share
+          # copy above just failed the catalogue read would only hammer a share that is already
+          # down - skip it here and let the next successful full pass prune instead.
+          if ($kind -eq 'full' -and $copyOk) {
+            Write-SebStage -Database $database -Stage 'retention'
+            $catFull = @(Get-SebPointCatalogue -Connection $connection -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database)
+            $chainFacts = Get-SebChainFactsFromCatalogue -Catalogue $catFull
+            $rplan = Get-SebChainRetentionPlan -Fulls $chainFacts.Fulls -Diffs $chainFacts.Diffs -Logs $chainFacts.Logs -Now $stamp -DailyKeepDays ([int]$Config.DailyKeepDays)
+            foreach ($entry in $catFull) {
+              $leaf = Split-Path -Leaf $entry.File
+              $prune = ($entry.Kind -eq 'full' -and $rplan.FullDelete -contains $leaf) -or `
+                       ($entry.Kind -eq 'diff' -and $rplan.DiffDelete -contains $leaf) -or `
+                       ($entry.Kind -eq 'log'  -and $rplan.LogDelete  -contains $leaf)
+              if ($prune) {
+                Remove-Item -LiteralPath $entry.File -Force -ErrorAction SilentlyContinue
+                Write-SebLog ('pruned {0}' -f $leaf) 'INFO'
+              }
             }
           }
         }
@@ -1979,6 +1987,41 @@ function Install-SebService {
   & $Nssm set $script:SebServiceName Description "Backs up every SQL Server database on this host to a file share every $Hours hour(s)." | Out-Null
   Start-Service -Name $script:SebServiceName
   Write-SebLog ('service "{0}" installed and started - one pass every {1} hour(s)' -f $script:SebServiceName, $Hours)
+
+  # A second SYSTEM task, registered ONLY for a Full-recovery install: -BackupLog
+  # takes a transaction-log backup every few minutes, so the recovery point never
+  # drifts far behind "now". RecoveryMode and LogIntervalMinutes are config keys a
+  # LATER feature (D3) adds - an install made before that, or a Simple-recovery
+  # install, has neither key, and that must read as Simple (no log task) rather
+  # than throw. Same guard style as Invoke-SebPass uses for this same key. The log
+  # backup is always a scheduled task, even for a Service install - the main loop
+  # runs as the NSSM service, but -BackupLog is a separate short-lived invocation,
+  # same as the Task install registers below.
+  $config = Read-SebConfig
+  $isFullMode = ([string]$config.RecoveryMode -eq 'Full')
+  if ($isFullMode) {
+    $logMinutes = 15
+    if ($config.PSObject.Properties['LogIntervalMinutes']) { $logMinutes = [int]$config.LogIntervalMinutes }
+
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $logTaskName = Get-SebLogTaskName -Base $script:SebTaskName
+    # Same script path, same "-NoProfile ... -File" shape, same -ConfigDir as the
+    # Task install's log action - only the mode flag changes.
+    $logArguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -BackupLog -ConfigDir "{1}"' -f $ScriptPath, $ConfigDirectory)
+    $logAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $logArguments
+    # Stagger the log task's start off the main pass's so their firings do not stay
+    # harmonically locked (a 6h interval is a multiple of 15min); otherwise the coincident
+    # tick would lose the shared mutex to the main pass every interval and skip a log backup.
+    $logOffset = 2 + [math]::Ceiling($logMinutes / 2)
+    $logTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes($logOffset) -RepetitionInterval (New-TimeSpan -Minutes $logMinutes)
+    $logSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
+      -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+      -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+
+    [void](Register-ScheduledTask -TaskName $logTaskName -Action $logAction `
+        -Trigger $logTrigger -Principal $principal -Settings $logSettings -Force)
+    Write-SebLog ('scheduled task "{0}" registered - every {1} minute(s), transaction-log backups for Full-recovery databases' -f $logTaskName, $logMinutes)
+  }
 }
 
 function Uninstall-SebSchedule {
@@ -3225,7 +3268,26 @@ try {
         }
       }
     }
-    Write-Host (ConvertTo-Json @{ Ok = $true; IntervalHours = [int]$config.IntervalHours; HourlyKeep = [int]$config.HourlyKeep; DailyKeepDays = [int]$config.DailyKeepDays } -Compress)
+    # RecoveryMode/LogIntervalMinutes/FullEveryHours are read back off $config rather than
+    # off the -Reschedule parameters themselves: a call that did not pass one of them must
+    # echo the value already on disk, not that parameter's own default. Same PSObject.Properties
+    # guard (and the same defaults) Invoke-SebPass and Install-SebTask use for these same keys,
+    # since a pre-D3 config on disk may still have none of them.
+    $echoRecoveryMode = 'Simple'
+    if ($config.PSObject.Properties['RecoveryMode']) { $echoRecoveryMode = [string]$config.RecoveryMode }
+    $echoLogIntervalMinutes = 15
+    if ($config.PSObject.Properties['LogIntervalMinutes']) { $echoLogIntervalMinutes = [int]$config.LogIntervalMinutes }
+    $echoFullEveryHours = 24
+    if ($config.PSObject.Properties['FullEveryHours']) { $echoFullEveryHours = [int]$config.FullEveryHours }
+    Write-Host (ConvertTo-Json @{
+        Ok                 = $true
+        IntervalHours      = [int]$config.IntervalHours
+        HourlyKeep         = [int]$config.HourlyKeep
+        DailyKeepDays      = [int]$config.DailyKeepDays
+        RecoveryMode       = $echoRecoveryMode
+        LogIntervalMinutes = $echoLogIntervalMinutes
+        FullEveryHours     = $echoFullEveryHours
+      } -Compress)
   }
   elseif ($RestoreList) {
     $config = Read-SebRestoreContext
