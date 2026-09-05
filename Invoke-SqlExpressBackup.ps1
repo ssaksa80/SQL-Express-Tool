@@ -1466,10 +1466,11 @@ function Get-SebMutex {
 
 # How many hours old the newest full backup in a folder's facts is, as of Now. Infinity
 # when there is no full yet, so Get-SebBackupKindDue always reads that as "a full is due."
-# Only .bak entries count - a .dif or .trn sitting in the same folder facts is not a base.
+# Only .bak entries count, plain or the .bak.zip a compressed pass writes - a .dif or
+# .trn sitting in the same folder facts is not a base, zipped or not.
 function Get-SebHoursSinceNewestFull {
   param([object[]]$Facts = @(), [datetime]$Now)
-  $fulls = @($Facts | Where-Object { $_.Name -like '*.bak' })
+  $fulls = @($Facts | Where-Object { $_.Name -match '\.bak(\.zip)?$' })
   if ($fulls.Count -eq 0) { return [double]::PositiveInfinity }
   $newest = @($fulls | Sort-Object Timestamp)[-1]
   return ($Now - $newest.Timestamp).TotalHours
@@ -2757,8 +2758,8 @@ function Get-SebRestoreCatalogue {
   catch { $Root = Resolve-SebLocalShare -Root $Root }
   try { if (-not (Test-Path -LiteralPath $Root)) { return $sets } }
   catch { return $sets }
-  # <root>\<host>\<instance>\<database>\<kind>\<db>_<stamp>.bak
-  foreach ($f in @(Get-ChildItem -LiteralPath $Root -Recurse -Filter '*.bak' -File -ErrorAction SilentlyContinue)) {
+  # <root>\<host>\<instance>\<database>\<kind>\<db>_<stamp>.bak (or .bak.zip, compressed)
+  foreach ($f in @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.bak(\.zip)?$' })) {
     $kind = Split-Path -Leaf (Split-Path -Parent $f.FullName)
     $db = Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $f.FullName))
     $stamp = Get-SebStampFromName -Name $f.Name -Fallback $f.LastWriteTime

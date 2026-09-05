@@ -1182,6 +1182,12 @@ $hsFacts = @(
   [pscustomobject]@{ Name='X_20260905-030000.trn'; Timestamp=[datetime]'2026-09-05 03:00:00' }
 )
 Assert ((Get-SebHoursSinceNewestFull -Facts $hsFacts -Now $nowHS) -eq 6) 'age is from the newest .bak (6h), ignoring .trn'
+$hsZip = @(
+  [pscustomobject]@{ Name='X_20260905-000000.bak'; Timestamp=[datetime]'2026-09-05 00:00:00' },
+  [pscustomobject]@{ Name='X_20260905-080000.bak.zip'; Timestamp=[datetime]'2026-09-05 08:00:00' },
+  [pscustomobject]@{ Name='X_20260905-030000.trn.zip'; Timestamp=[datetime]'2026-09-05 03:00:00' }
+)
+Assert ((Get-SebHoursSinceNewestFull -Facts $hsZip -Now ([datetime]'2026-09-05 12:00:00')) -eq 4) 'a compressed full (.bak.zip) counts as a full (4h), and a .trn.zip is not a full'
 
 # ---- D1c. catalogue entries map to chain-retention facts, split by kind --------------
 $catD = @(
@@ -1359,5 +1365,22 @@ try {
   Assert (@($facts | Where-Object { $_.Name -like '*.meta.json' }).Count -eq 0) 'the .meta.json sidecar is excluded from folder facts'
 }
 finally { Remove-Item -LiteralPath $tmpF -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ---- COMP-3. Get-SebRestoreCatalogue (-RestoreList) recognises .bak.zip -----------
+$rcRoot = Join-Path $env:TEMP ('seb-rc-' + [Guid]::NewGuid().ToString('N'))
+$rcDir = Join-Path $rcRoot 'HOST1\INST1\APPDB\hourly'
+[void](New-Item -ItemType Directory -Force -Path $rcDir)
+try {
+  Set-Content -LiteralPath (Join-Path $rcDir 'APPDB_20260905-090000.bak') -Value 'x'
+  Set-Content -LiteralPath (Join-Path $rcDir 'APPDB2_20260905-100000.bak.zip') -Value 'x'
+  $rcCat = @(Get-SebRestoreCatalogue -Root $rcRoot)
+  Assert ($rcCat.Count -eq 2) "-RestoreList enumerates both the plain .bak and the .bak.zip (got $($rcCat.Count))"
+  $rcZip = @($rcCat | Where-Object { $_.Path -like '*.bak.zip' })
+  $rcPlain = @($rcCat | Where-Object { $_.Path -like '*.bak' -and $_.Path -notlike '*.bak.zip' })
+  Assert ($rcZip.Count -eq 1) 'the compressed full (.bak.zip) is in the restore catalogue'
+  Assert ($rcPlain.Count -eq 1) 'the plain full (.bak) is still in the restore catalogue (no regression)'
+  Assert ($rcZip[0].Database -eq 'APPDB' -and $rcZip[0].Kind -eq 'hourly') 'the .bak.zip entry still gets its Database/Kind from the folder path'
+}
+finally { Remove-Item -LiteralPath $rcRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
 Write-Host 'ALL PASS'
