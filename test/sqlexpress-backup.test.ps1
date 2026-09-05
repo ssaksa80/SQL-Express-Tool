@@ -1183,4 +1183,23 @@ $hsFacts = @(
 )
 Assert ((Get-SebHoursSinceNewestFull -Facts $hsFacts -Now $nowHS) -eq 6) 'age is from the newest .bak (6h), ignoring .trn'
 
+# ---- D1c. catalogue entries map to chain-retention facts, split by kind --------------
+$catD = @(
+  [pscustomobject]@{ Kind='full'; File='C:\s\host\INST\db\hourly\db_20260905-000000.bak'; FirstLSN=[decimal]100; LastLSN=[decimal]100; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]100; Finish=[datetime]'2026-09-05 00:00:00' },
+  [pscustomobject]@{ Kind='diff'; File='C:\s\host\INST\db\diff\db_20260905-060000.dif'; FirstLSN=[decimal]150; LastLSN=[decimal]150; DatabaseBackupLSN=[decimal]100; CheckpointLSN=[decimal]0; Finish=[datetime]'2026-09-05 06:00:00' },
+  [pscustomobject]@{ Kind='log'; File='C:\s\host\INST\db\log\db_20260905-001500.trn'; FirstLSN=[decimal]100; LastLSN=[decimal]160; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]0; Finish=[datetime]'2026-09-05 00:15:00' }
+)
+$cf = Get-SebChainFactsFromCatalogue -Catalogue $catD
+Assert ($cf.Fulls.Count -eq 1 -and $cf.Diffs.Count -eq 1 -and $cf.Logs.Count -eq 1) 'catalogue is split into fulls/diffs/logs by kind'
+Assert ($cf.Fulls[0].Name -eq 'db_20260905-000000.bak') 'a fact Name is the file leaf, not the full path'
+Assert ($cf.Fulls[0].Timestamp -eq ([datetime]'2026-09-05 00:00:00')) 'a fact Timestamp is the backup Finish time'
+Assert ($cf.Logs[0].LastLSN -eq 160 -and $cf.Fulls[0].FirstLSN -eq 100) 'LSNs carry through to the facts'
+# The mapped facts drive the real retention planner end to end (positive control below).
+$rp = Get-SebChainRetentionPlan -Fulls $cf.Fulls -Diffs $cf.Diffs -Logs $cf.Logs -Now ([datetime]'2026-09-05 12:00:00') -DailyKeepDays 7
+Assert ($rp.FullDelete.Count -eq 0 -and $rp.LogDelete.Count -eq 0) 'an in-horizon chain from a catalogue prunes nothing'
+$catOld = $catD + @([pscustomobject]@{ Kind='full'; File='C:\s\h\I\db\hourly\db_20260820-000000.bak'; FirstLSN=[decimal]5; LastLSN=[decimal]5; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]5; Finish=[datetime]'2026-08-20 00:00:00' })
+$cfOld = Get-SebChainFactsFromCatalogue -Catalogue $catOld
+$rpOld = Get-SebChainRetentionPlan -Fulls $cfOld.Fulls -Diffs $cfOld.Diffs -Logs $cfOld.Logs -Now ([datetime]'2026-09-05 12:00:00') -DailyKeepDays 7
+Assert ($rpOld.FullDelete -contains 'db_20260820-000000.bak') 'a full older than the horizon is pruned (positive control)'
+
 Write-Host 'ALL PASS'

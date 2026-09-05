@@ -1633,6 +1633,24 @@ GROUP BY database_id
             Write-SebLog ('share copy failed for {0}: {1} - kept in staging for the next run' -f $dest, $_.Exception.Message) 'WARN'
             [void]$pendingList.Add([pscustomobject]@{ Staged = $staged; Dest = $dest; Database = $database; Kind = $destKind })
           }
+
+          # Chain-safe pruning: never delete a full/diff/log a retained recovery point still
+          # needs (Get-SebChainRetentionPlan guarantees this). Runs only in Full mode; Simple
+          # keeps its hourly/daily count-based retention untouched.
+          Write-SebStage -Database $database -Stage 'retention'
+          $catFull = @(Get-SebPointCatalogue -Connection $connection -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database)
+          $chainFacts = Get-SebChainFactsFromCatalogue -Catalogue $catFull
+          $rplan = Get-SebChainRetentionPlan -Fulls $chainFacts.Fulls -Diffs $chainFacts.Diffs -Logs $chainFacts.Logs -Now $stamp -DailyKeepDays ([int]$Config.DailyKeepDays)
+          foreach ($entry in $catFull) {
+            $leaf = Split-Path -Leaf $entry.File
+            $prune = ($entry.Kind -eq 'full' -and $rplan.FullDelete -contains $leaf) -or `
+                     ($entry.Kind -eq 'diff' -and $rplan.DiffDelete -contains $leaf) -or `
+                     ($entry.Kind -eq 'log'  -and $rplan.LogDelete  -contains $leaf)
+            if ($prune) {
+              Remove-Item -LiteralPath $entry.File -Force -ErrorAction SilentlyContinue
+              Write-SebLog ('pruned {0}' -f $leaf) 'INFO'
+            }
+          }
         }
         else {
           $hourlyDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
@@ -2611,6 +2629,22 @@ function Get-SebPointCatalogue {
     }
   }
   return @($cat.ToArray())
+}
+
+# Pure. Turn a Get-SebPointCatalogue result into the {Name;Timestamp;FirstLSN;LastLSN}
+# facts Get-SebChainRetentionPlan expects, split by kind. Name is the file leaf so the
+# retention plan's delete lists can be matched back to files by leaf name.
+function Get-SebChainFactsFromCatalogue {
+  param([object[]]$Catalogue = @())
+  $mk = {
+    param($e)
+    [pscustomobject]@{ Name = (Split-Path -Leaf $e.File); Timestamp = $e.Finish; FirstLSN = $e.FirstLSN; LastLSN = $e.LastLSN }
+  }
+  return [pscustomobject]@{
+    Fulls = @($Catalogue | Where-Object { $_.Kind -eq 'full' } | ForEach-Object { & $mk $_ })
+    Diffs = @($Catalogue | Where-Object { $_.Kind -eq 'diff' } | ForEach-Object { & $mk $_ })
+    Logs  = @($Catalogue | Where-Object { $_.Kind -eq 'log' }  | ForEach-Object { & $mk $_ })
+  }
 }
 
 # Pure. Given a catalogue for ONE database and a target time, return the ordered
