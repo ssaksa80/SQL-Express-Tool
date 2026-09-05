@@ -1320,4 +1320,23 @@ $sumDiffOnly = Get-SebChainSummary -Fulls @() -Diffs @((New-CS $nowCS.AddHours(-
 Assert ($sumDiffOnly.Health -eq 'no base full') 'diffs present but no base full is flagged (not "no backups")'
 Assert ($sumDiffOnly.LastDiff -eq $nowCS.AddHours(-3)) 'the last diff time is surfaced'
 
+# ---- COMP-1. compress/expand round-trips a file byte-for-byte ----------------------
+$tmpC = Join-Path $env:TEMP ('seb-comp-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpC -Force)
+try {
+  $plain = Join-Path $tmpC 'APPDB_20260905-090000.bak'
+  $bytes = [byte[]](1..5000 | ForEach-Object { $_ % 256 })
+  [System.IO.File]::WriteAllBytes($plain, $bytes)
+  $zip = Join-Path $tmpC 'APPDB_20260905-090000.bak.zip'
+  Compress-SebFile -Source $plain -Destination $zip
+  Assert (Test-Path -LiteralPath $zip) 'Compress-SebFile writes the .zip'
+  Assert ((Get-Item -LiteralPath $zip).Length -gt 0) 'the .zip is non-empty'
+  $out = Join-Path $tmpC 'restored.bak'
+  Expand-SebFile -Source $zip -Destination $out
+  $a = (Get-FileHash -LiteralPath $plain -Algorithm SHA256).Hash
+  $b = (Get-FileHash -LiteralPath $out -Algorithm SHA256).Hash
+  Assert ($a -eq $b) 'Expand-SebFile restores byte-for-byte identical content'
+}
+finally { Remove-Item -LiteralPath $tmpC -Recurse -Force -ErrorAction SilentlyContinue }
+
 Write-Host 'ALL PASS'

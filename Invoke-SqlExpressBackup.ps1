@@ -1282,6 +1282,40 @@ function Copy-SebVerified {
   if ($sourceHash -ne $destHash) { throw ('copy of {0} does not match the source hash' -f $Destination) }
 }
 
+# Zip a single file (entry named after the source leaf). In-box System.IO.Compression,
+# NOT Compress-Archive (its ~2GB limit fails large .bak). CreateEntryFromFile streams;
+# .NET selects Zip64 automatically for entries over 4GB.
+function Compress-SebFile {
+  param([string]$Source, [string]$Destination)
+  # ZipArchiveMode/CompressionLevel live in System.IO.Compression, NOT in
+  # System.IO.Compression.FileSystem (that one only adds the ZipFile/ZipFileExtensions
+  # static helpers). PowerShell's type resolution does not walk assembly references, so
+  # loading only the FileSystem assembly leaves ZipArchiveMode unresolved - both are
+  # needed, and Add-Type is idempotent so loading either twice in a process is harmless.
+  Add-Type -AssemblyName System.IO.Compression
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
+  $entry = Split-Path -Leaf $Source
+  $zip = [System.IO.Compression.ZipFile]::Open($Destination, [System.IO.Compression.ZipArchiveMode]::Create)
+  try { [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $Source, $entry, [System.IO.Compression.CompressionLevel]::Optimal) }
+  finally { $zip.Dispose() }
+}
+
+# Extract the single entry of a .zip to a plain file.
+function Expand-SebFile {
+  param([string]$Source, [string]$Destination)
+  # Same split-assembly reason as Compress-SebFile: load both.
+  Add-Type -AssemblyName System.IO.Compression
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip = [System.IO.Compression.ZipFile]::OpenRead($Source)
+  try {
+    $entries = @($zip.Entries)
+    if ($entries.Count -eq 0) { throw ('the archive is empty: {0}' -f $Source) }
+    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entries[0], $Destination, $true)
+  }
+  finally { $zip.Dispose() }
+}
+
 function Get-SebFolderFacts {
   param([string]$Directory)
   if (-not (Test-Path -LiteralPath $Directory)) { return @() }
