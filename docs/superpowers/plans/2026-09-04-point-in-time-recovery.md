@@ -777,17 +777,18 @@ git commit -m "feat(engine): RecoveryMode config, log-growth probe, status + set
 - Modify: `wpf/Engine.cs` (new `RestoreToPoint`, `PointBounds`), `wpf/RestoreWindow.cs` (point-in-time mode), `wpf/ModernView.cs` (recovery model + RPO + chain health in the schedule/status pane)
 - Verify: build + live smoke.
 
-- [ ] **Step 1: Engine.cs — add the calls.** Add methods mirroring the existing `Run`/`RestoreList` pattern (elevated relaunch with `--live` tail):
+- [ ] **Step 1: Engine.cs — add the call.** SHIPPED NOTE: `-RestoreToPoint` is UNELEVATED (it reads the restore context / `public.json`, like `-RestoreRun`), so it is invoked via `Engine.Run`, NOT `Elevate.Run`; success is read from the streamed final `{"Ok":true}` line, not the exit code; and the flags are PowerShell single-dash (matching `-RestoreRun`), not the double-dash of this earlier draft.
 ```csharp
 // Restore <src> to a new database <asName> at point-in-time <stopAt> (local time).
-public static int RestoreToPoint(string src, string asName, DateTime stopAt, Action<string> onLine)
+public static bool RestoreToPoint(string src, string asName, DateTime stopAt, bool replace, Action<string> onLine)
 {
-    string args = "--restore-to-point --database \"" + src + "\" --restore-as \"" + asName +
-        "\" --stop-at \"" + stopAt.ToString("yyyy-MM-ddTHH:mm:ss") + "\"";
-    return Elevate.Run(args, 1800, onLine);
+    string args = "-RestoreToPoint -Database \"" + src + "\" -RestoreAs \"" + asName +
+        "\" -StopAt \"" + stopAt.ToString("yyyy-MM-ddTHH:mm:ss") + "\"" + (replace ? " -RestoreReplace" : "");
+    Run(args, onLine);               // unelevated, same path as -RestoreRun
+    return /* parse the streamed {"Ok":true} */ true;
 }
 ```
-Add a `PointBounds(string src)` that shells the engine for the earliest/newest recoverable time (a new `-PointBounds` engine sub-command returning `{Earliest,Latest}` JSON) so the picker can be bounded. If exposing that sub-command is more than a small addition, bound the picker instead to `[oldest file mtime, now]` from the existing catalogue call and validate on Verify — note which you chose in the commit message.
+The point-in-time picker shipped UNBOUNDED — the engine validates the recoverable range and reports out-of-range/gap errors, which the UI surfaces — so the `-PointBounds` sub-command and the read-only plan-preview were deferred (not built). The per-database status surface (Step 3) shipped in the `-Status` text output rather than in `ModernView`.
 
 - [ ] **Step 2: RestoreWindow.cs — add the mode.** Add a "Restore to a point in time" toggle. When on: a database `ComboBox` (from the existing set list), a `DatePicker` + hour/minute fields bounded by `PointBounds`, a read-only plan-preview `TextBlock`, the existing **Verify** button re-labelled to validate the chosen point (calls the engine planner and shows the step list or the bounded/gap error), and **Restore** enabled only after a clean Verify. Restore calls `Engine.RestoreToPoint` and streams onto the existing `GlowBar`/`LogPane`. Keep `Owner` set and re-activate the owner on close (the established pattern in this file).
 
