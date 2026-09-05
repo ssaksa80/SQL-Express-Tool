@@ -259,12 +259,15 @@ function Get-SebFileName {
   return ('{0}_{1}.{2}' -f (Get-SebSafeName $Database), $Stamp.ToString('yyyyMMdd-HHmmss'), $Extension)
 }
 
+function Get-SebCompressedName { param([string]$PlainName) return ($PlainName + '.zip') }
+function Get-SebSidecarName { param([string]$Name) return ($Name + '.meta.json') }
+
 # Trust the name over the mtime. Copying a file to a share can move LastWriteTime,
 # and retention that sorts on a timestamp the copy rewrote will delete the wrong
 # file. The stamp is baked into the name at BACKUP time and never changes after.
 function Get-SebStampFromName {
   param([string]$Name, [datetime]$Fallback)
-  $match = [regex]::Match($Name, '_(\d{8})-(\d{6})\.(bak|dif|trn)$')
+  $match = [regex]::Match($Name, '_(\d{8})-(\d{6})\.(bak|dif|trn)(\.zip)?$')
   if (-not $match.Success) { return $Fallback }
   $parsed = [datetime]::MinValue
   $ok = [datetime]::TryParseExact(
@@ -1320,7 +1323,7 @@ function Get-SebFolderFacts {
   param([string]$Directory)
   if (-not (Test-Path -LiteralPath $Directory)) { return @() }
   $items = Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -cmatch '\.(bak|dif|trn)$' }
+    Where-Object { $_.Name -cmatch '\.(bak|dif|trn)(\.zip)?$' }
   $facts = foreach ($item in $items) {
     [pscustomobject]@{
       Name      = $item.Name

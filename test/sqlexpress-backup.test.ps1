@@ -1339,4 +1339,25 @@ try {
 }
 finally { Remove-Item -LiteralPath $tmpC -Recurse -Force -ErrorAction SilentlyContinue }
 
+# ---- COMP-2. .zip naming + stamp + folder facts ------------------------------------
+Assert ((Get-SebCompressedName 'APPDB_20260905-090000.bak') -eq 'APPDB_20260905-090000.bak.zip') 'compressed name appends .zip'
+Assert ((Get-SebSidecarName 'APPDB_20260905-090000.bak.zip') -eq 'APPDB_20260905-090000.bak.zip.meta.json') 'sidecar name appends .meta.json'
+$fbZ = [datetime]'2000-01-01'
+$stZ = [datetime]'2026-09-05 09:00:00'
+Assert ((Get-SebStampFromName -Name 'APPDB_20260905-090000.bak.zip' -Fallback $fbZ) -eq $stZ) 'the stamp is read out of a .bak.zip name'
+Assert ((Get-SebStampFromName -Name 'APPDB_20260905-090000.trn.zip' -Fallback $fbZ) -eq $stZ) 'the stamp is read out of a .trn.zip name'
+Assert ((Get-SebStampFromName -Name 'APPDB_20260905-090000.bak' -Fallback $fbZ) -eq $stZ) 'a plain .bak stamp still parses (no regression)'
+Assert ((Get-SebStampFromName -Name 'APPDB_20260905-090000.bak.zip.meta.json' -Fallback $fbZ) -eq $fbZ) 'a .meta.json sidecar is NOT a backup (falls back)'
+$tmpF = Join-Path $env:TEMP ('seb-ff-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpF -Force)
+try {
+  Set-Content -LiteralPath (Join-Path $tmpF 'APPDB_20260905-090000.bak.zip') -Value 'x'
+  Set-Content -LiteralPath (Join-Path $tmpF 'APPDB_20260905-090000.bak.zip.meta.json') -Value 'x'
+  Set-Content -LiteralPath (Join-Path $tmpF 'APPDB_20260905-093000.bak') -Value 'x'
+  $facts = @(Get-SebFolderFacts -Directory $tmpF)
+  Assert ($facts.Count -eq 2) "folder facts count the .zip and the plain backup but NOT the sidecar (got $($facts.Count))"
+  Assert (@($facts | Where-Object { $_.Name -like '*.meta.json' }).Count -eq 0) 'the .meta.json sidecar is excluded from folder facts'
+}
+finally { Remove-Item -LiteralPath $tmpF -Recurse -Force -ErrorAction SilentlyContinue }
+
 Write-Host 'ALL PASS'
