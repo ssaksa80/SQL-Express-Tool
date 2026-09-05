@@ -1399,4 +1399,16 @@ Assert ($back.CheckpointLSN -eq 777) 'CheckpointLSN round-trips'
 Assert ($back.File -eq 'C:\s\APPDB.bak.zip' -and $back.Kind -eq 'full') 'File and Kind come from the parameters (folder-derived), not the JSON'
 Assert ($back.Finish -eq ([datetime]'2026-09-05 08:00:00')) 'Finish round-trips'
 
+# ---- COMP-4. the catalogue reads a sidecar when one exists (no decompress) ----------
+$factsS = [pscustomobject]@{ Kind='full'; File='x'; FirstLSN=[decimal]900; LastLSN=[decimal]900; DatabaseBackupLSN=[decimal]0; CheckpointLSN=[decimal]905; Finish=[datetime]'2026-09-05 07:00:00' }
+$jsonS = Get-SebSidecarJson -Facts $factsS
+$reader = { param($p) return $jsonS }   # pretend a sidecar exists with these facts
+$f = Get-SebFactsForFile -Connection $null -File 'C:\s\APPDB_20260905-070000.bak.zip' -Kind 'full' -SidecarReader $reader
+Assert ($f.CheckpointLSN -eq 905 -and $f.File -eq 'C:\s\APPDB_20260905-070000.bak.zip') 'a present sidecar supplies the facts (Connection never used)'
+Assert ((Get-Command Get-SebFactsForFile).Parameters.ContainsKey('SidecarReader')) 'Get-SebFactsForFile exposes an injectable SidecarReader'
+$readerNone = { param($p) return $null }  # no sidecar -> would fall through to HEADERONLY (Connection=$null so it would throw if reached)
+$threw = $false
+try { [void](Get-SebFactsForFile -Connection $null -File 'C:\s\APPDB.bak' -Kind 'full' -SidecarReader $readerNone) } catch { $threw = $true }
+Assert $threw 'with no sidecar it falls through to RESTORE HEADERONLY (which needs a real connection)'
+
 Write-Host 'ALL PASS'

@@ -2963,6 +2963,20 @@ function Get-SebRestoreHeaderFacts {
   return Get-SebHeaderFactsFromRow -Row $rows[0] -File $File -Kind $Kind
 }
 
+# Facts for one share file: if a .meta.json sidecar sits beside it (a compressed backup),
+# read the facts from the sidecar (no decompress); otherwise RESTORE HEADERONLY the plain
+# file. SidecarReader is injectable for testing (defaults to reading the sidecar file).
+function Get-SebFactsForFile {
+  param($Connection, [string]$File, [string]$Kind, [scriptblock]$SidecarReader)
+  $sidecar = Get-SebSidecarName $File
+  if (-not $SidecarReader) {
+    $SidecarReader = { param([string]$p) if (Test-Path -LiteralPath $p) { return (Get-Content -LiteralPath $p -Raw) } else { return $null } }
+  }
+  $json = & $SidecarReader $sidecar
+  if ($null -ne $json) { return (Get-SebHeaderFactsFromSidecar -Json $json -File $File -Kind $Kind) }
+  return (Get-SebRestoreHeaderFacts -Connection $Connection -File $File -Kind $Kind)
+}
+
 # Impure. Enumerate a database's backup folders on the share and read each file's header
 # into a catalogue for Get-SebRestorePlan. Fulls live in hourly/ and daily/, diffs in
 # diff/, logs in log/.
@@ -2974,7 +2988,7 @@ function Get-SebPointCatalogue {
     $dir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database -Kind $folderKind
     foreach ($fact in @(Get-SebFolderFacts -Directory $dir)) {
       try {
-        $h = Get-SebRestoreHeaderFacts -Connection $Connection -File $fact.FullName -Kind $map[$folderKind]
+        $h = Get-SebFactsForFile -Connection $Connection -File $fact.FullName -Kind $map[$folderKind]
         if ($null -ne $h) { [void]$cat.Add($h) }
       }
       catch {
