@@ -1320,6 +1320,19 @@ function Expand-SebFile {
   finally { $zip.Dispose() }
 }
 
+# Ensure a local PLAIN backup file to restore from: a .zip source is expanded into StagingDir
+# and the plain path returned; a plain source is returned unchanged (no copy, no decompress).
+# The expanded file lands in StagingDir so it is readable by the SQL service account (the same
+# account RESTORE runs as) and is cleaned up by the caller after the restore.
+function Resolve-SebRestoreSource {
+  param([string]$File, [string]$StagingDir)
+  if ($File -notlike '*.zip') { return $File }
+  if (-not (Test-Path -LiteralPath $StagingDir)) { [void](New-Item -ItemType Directory -Path $StagingDir -Force) }
+  $plain = Join-Path $StagingDir ([System.IO.Path]::GetFileNameWithoutExtension($File))  # strips the trailing .zip
+  Expand-SebFile -Source $File -Destination $plain
+  return $plain
+}
+
 function Get-SebFolderFacts {
   param([string]$Directory)
   if (-not (Test-Path -LiteralPath $Directory)) { return @() }
@@ -3128,9 +3141,11 @@ function Get-SebRestorePlan {
 # STOPAT at the target instant. ISO 8601 STOPAT so SQL parses it unambiguously
 # regardless of server locale.
 function Get-SebRestoreStepSql {
-  param($Step, [string]$RestoreAs, [bool]$Replace = $false, [string[]]$MoveClauses = @())
+  param($Step, [string]$RestoreAs, [bool]$Replace = $false, [string[]]$MoveClauses = @(), [string]$SourceFile = '')
   $target = Get-SebQuotedName $RestoreAs
-  $literal = Get-SebSqlLiteral $Step.File
+  $file = $Step.File
+  if (-not [string]::IsNullOrWhiteSpace($SourceFile)) { $file = $SourceFile }
+  $literal = Get-SebSqlLiteral $file
   if ($Step.Kind -eq 'full') {
     $with = @('NORECOVERY')
     if ($Replace) { $with += 'REPLACE' }
@@ -3168,40 +3183,51 @@ function Get-SebRestoreStepSql {
 function Invoke-SebRestoreToPoint {
   param($Connection, [string]$Root, [string]$HostName, [string]$InstanceLabel,
         [string]$Database, [string]$RestoreAs, [datetime]$StopAt,
-        [string]$DataDir, [string]$LogDir,
+        [string]$DataDir, [string]$LogDir, [string]$WorkDir = '',
         [bool]$Replace = $false, [bool]$CloseConnections = $false)
-  $cat = @(Get-SebPointCatalogue -Connection $Connection -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database)
-  $plan = Get-SebRestorePlan -Catalogue $cat -StopAt $StopAt
-  if ($plan.Error) { throw ('cannot restore to that point in time: ' + $plan.Error) }
+  $decompRoot = $WorkDir
+  if ([string]::IsNullOrWhiteSpace($decompRoot)) { $decompRoot = $env:TEMP }
+  $decompDir = Join-Path $decompRoot ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
+  try {
+    $cat = @(Get-SebPointCatalogue -Connection $Connection -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database)
+    $plan = Get-SebRestorePlan -Catalogue $cat -StopAt $StopAt
+    if ($plan.Error) { throw ('cannot restore to that point in time: ' + $plan.Error) }
 
-  $fullStep = $plan.Steps | Where-Object { $_.Kind -eq 'full' } | Select-Object -First 1
-  $fullInfo = Get-SebRestoreInspect -Connection $Connection -Path $fullStep.File
-  if (-not $fullInfo.Readable -or @($fullInfo.Files).Count -eq 0) {
-    throw ('cannot read the file list for {0}: {1}' -f $fullStep.File, $fullInfo.ReadReason)
-  }
-
-  foreach ($target in @(Get-SebRestoreTargets -Files $fullInfo.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir)) {
-    if ((Test-Path -LiteralPath $target) -and -not $Replace) {
-      throw ('{0} already exists. Restoring would overwrite a file that may belong to another database. Choose a different name, or move that file first.' -f $target)
+    $fullStep = $plan.Steps | Where-Object { $_.Kind -eq 'full' } | Select-Object -First 1
+    $fullFile = Resolve-SebRestoreSource -File $fullStep.File -StagingDir $decompDir
+    $fullInfo = Get-SebRestoreInspect -Connection $Connection -Path $fullFile
+    if (-not $fullInfo.Readable -or @($fullInfo.Files).Count -eq 0) {
+      throw ('cannot read the file list for {0}: {1}' -f $fullStep.File, $fullInfo.ReadReason)
     }
-  }
 
-  if ($CloseConnections) {
-    try { Invoke-SebSqlNonQuery -Connection $Connection -Sql ('ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE' -f (Get-SebQuotedName $RestoreAs)) }
-    catch { }
-  }
+    foreach ($target in @(Get-SebRestoreTargets -Files $fullInfo.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir)) {
+      if ((Test-Path -LiteralPath $target) -and -not $Replace) {
+        throw ('{0} already exists. Restoring would overwrite a file that may belong to another database. Choose a different name, or move that file first.' -f $target)
+      }
+    }
 
-  $total = $plan.Steps.Count
-  $i = 0
-  foreach ($step in $plan.Steps) {
-    $i++
-    Write-SebStage -Database $RestoreAs -Stage ('restore ' + $step.Kind + ' ' + $i + '/' + $total)
-    $moves = @()
-    if ($step.Kind -eq 'full') { $moves = @(Get-SebRestoreMoveClauses -Files $fullInfo.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir) }
-    $sql = Get-SebRestoreStepSql -Step $step -RestoreAs $RestoreAs -Replace $Replace -MoveClauses $moves
-    Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
+    if ($CloseConnections) {
+      try { Invoke-SebSqlNonQuery -Connection $Connection -Sql ('ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE' -f (Get-SebQuotedName $RestoreAs)) }
+      catch { }
+    }
+
+    $total = $plan.Steps.Count
+    $i = 0
+    foreach ($step in $plan.Steps) {
+      $i++
+      Write-SebStage -Database $RestoreAs -Stage ('restore ' + $step.Kind + ' ' + $i + '/' + $total)
+      $moves = @()
+      if ($step.Kind -eq 'full') { $moves = @(Get-SebRestoreMoveClauses -Files $fullInfo.Files -TargetName $RestoreAs -DataDir $DataDir -LogDir $LogDir) }
+      $stepSource = $step.File
+      if ($step.Kind -eq 'full') { $stepSource = $fullFile } else { $stepSource = Resolve-SebRestoreSource -File $step.File -StagingDir $decompDir }
+      $sql = Get-SebRestoreStepSql -Step $step -RestoreAs $RestoreAs -Replace $Replace -MoveClauses $moves -SourceFile $stepSource
+      Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
+    }
+    Write-SebStage -Database $RestoreAs -Stage 'restore complete'
   }
-  Write-SebStage -Database $RestoreAs -Stage 'restore complete'
+  finally {
+    if (Test-Path -LiteralPath $decompDir) { Remove-Item -LiteralPath $decompDir -Recurse -Force -ErrorAction SilentlyContinue }
+  }
 }
 
 function Invoke-SebSelfTest {
@@ -3645,8 +3671,12 @@ try {
     if ([string]::IsNullOrWhiteSpace($RestoreAs)) { throw '-RestoreRun needs -RestoreAs <database name>' }
     $config = Read-SebRestoreContext
     $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
+    $decompRoot = [string]$config.StagingPath
+    if ([string]::IsNullOrWhiteSpace($decompRoot)) { $decompRoot = $env:TEMP }
+    $decompDir = Join-Path $decompRoot ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
     try {
-      $info = Get-SebRestoreInspect -Connection $connection -Path $RestoreFrom
+      $restoreSource = Resolve-SebRestoreSource -File $RestoreFrom -StagingDir $decompDir
+      $info = Get-SebRestoreInspect -Connection $connection -Path $restoreSource
       if (-not $info.Readable) {
         throw ('SQL Server cannot read {0}. This is a PERMISSION fault, not a corrupt backup: the file is read by the SQL service account, not by you. Grant that account read on the folder. The symptom is identical to a damaged file, which is why it is checked before anything is committed.' -f $RestoreFrom)
       }
@@ -3680,7 +3710,7 @@ try {
 
       Write-SebJob -Index 1 -Total 1 -Database $RestoreAs
       Write-SebStage -Database $RestoreAs -Stage 'backup'
-      $sql = Get-SebRestoreSql -Path $RestoreFrom -TargetName $RestoreAs -Files $info.Files -DataDir $dataDir -LogDir $logDir -RecoveryState $RestoreRecoveryState -Replace:([bool]$RestoreReplace) -RestrictedUser:([bool]$RestoreRestrictedUser)
+      $sql = Get-SebRestoreSql -Path $restoreSource -TargetName $RestoreAs -Files $info.Files -DataDir $dataDir -LogDir $logDir -RecoveryState $RestoreRecoveryState -Replace:([bool]$RestoreReplace) -RestrictedUser:([bool]$RestoreRestrictedUser)
       Write-SebLog ('restoring {0} from {1}' -f $RestoreAs, $RestoreFrom)
 
       # Percent comes from SQL itself, exactly as it does for BACKUP.
@@ -3708,7 +3738,10 @@ try {
       Write-Host (ConvertTo-Json @{ Ok = $ok; Database = $RestoreAs; Check = $checkMessage } -Compress)
       if (-not $ok) { $exitCode = 1 }
     }
-    finally { $connection.Close() }
+    finally {
+      $connection.Close()
+      if (Test-Path -LiteralPath $decompDir) { Remove-Item -LiteralPath $decompDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
   }
   elseif ($RestoreToPoint) {
     if ([string]::IsNullOrWhiteSpace($Database)) { throw '-RestoreToPoint needs -Database <name>' }
@@ -3740,7 +3773,7 @@ try {
 
       Write-SebJob -Index 1 -Total 1 -Database $RestoreAs
       Invoke-SebRestoreToPoint -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $chosen.InstanceName `
-        -Database $Database -RestoreAs $RestoreAs -StopAt $StopAt -DataDir $dataDir -LogDir $logDir `
+        -Database $Database -RestoreAs $RestoreAs -StopAt $StopAt -DataDir $dataDir -LogDir $logDir -WorkDir ([string]$config.StagingPath) `
         -Replace:([bool]$RestoreReplace) -CloseConnections:([bool]$RestoreCloseConnections)
 
       Write-SebLog ('point-in-time restore finished: {0} -> {1} @ {2}' -f $Database, $RestoreAs, $StopAt)

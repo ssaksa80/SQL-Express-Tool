@@ -1493,4 +1493,28 @@ try {
 }
 finally { Remove-Item -LiteralPath $tmpS -Recurse -Force -ErrorAction SilentlyContinue }
 
+# ---- COMP-7. a .zip restore source is expanded; a plain source passes through -------
+$tmpR = Join-Path $env:TEMP ('seb-rr-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpR -Force)
+try {
+  $srcPlain = Join-Path $tmpR 'APPDB_20260905-090000.bak'
+  [System.IO.File]::WriteAllBytes($srcPlain, [byte[]](1..2000 | ForEach-Object { $_ % 256 }))
+  $srcZip = Join-Path $tmpR 'APPDB_20260905-090000.bak.zip'
+  Compress-SebFile -Source $srcPlain -Destination $srcZip
+  $stg = Join-Path $tmpR 'stg'
+  $resolved = Resolve-SebRestoreSource -File $srcZip -StagingDir $stg
+  Assert ($resolved -like '*APPDB_20260905-090000.bak' -and $resolved -notlike '*.zip') 'a .zip source resolves to a plain .bak path'
+  Assert ((Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $srcPlain -Algorithm SHA256).Hash) 'the resolved plain file matches the original bytes'
+  $plainIn = Join-Path $tmpR 'other.bak'; Set-Content -LiteralPath $plainIn -Value 'x'
+  Assert ((Resolve-SebRestoreSource -File $plainIn -StagingDir $stg) -eq $plainIn) 'a plain source is returned unchanged (no decompress)'
+  # the SourceFile override drives the FROM DISK path while the step keeps its real .File
+  $step = [pscustomobject]@{ Kind = 'full'; File = 'C:\share\APPDB_20260905-090000.bak.zip' }
+  $sqlOverride = Get-SebRestoreStepSql -Step $step -RestoreAs 'APPDB_R' -Replace $true -MoveClauses @() -SourceFile 'C:\stg\APPDB_20260905-090000.bak'
+  Assert ($sqlOverride -like "*FROM DISK = 'C:\stg\APPDB_20260905-090000.bak'*") '-SourceFile overrides the FROM DISK path'
+  Assert ($sqlOverride -notlike '*.zip*') 'the override SQL never references the .zip'
+  $sqlPlain = Get-SebRestoreStepSql -Step ([pscustomobject]@{ Kind = 'log'; File = 'C:\share\APPDB.trn'; Recovery = $false }) -RestoreAs 'APPDB_R'
+  Assert ($sqlPlain -like "*FROM DISK = 'C:\share\APPDB.trn'*") 'positive control: with no -SourceFile the step file is used (unchanged)'
+}
+finally { Remove-Item -LiteralPath $tmpR -Recurse -Force -ErrorAction SilentlyContinue }
+
 Write-Host 'ALL PASS'
