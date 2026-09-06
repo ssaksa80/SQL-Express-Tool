@@ -682,6 +682,20 @@ function Get-SebServiceAccount {
   return [string]$service.StartName
 }
 
+# The instance's own service account, asked of the running instance - no service name or
+# registry access needed. Used to grant that account read on a restore temp folder holding a
+# decompressed backup, since RESTORE reads that file as this account. Empty on any failure
+# (the caller then skips the grant and the restore falls back to the clear read-permission error).
+function Get-SebSqlServiceAccount {
+  param($Connection)
+  try {
+    $rows = Invoke-SebSqlTable -Connection $Connection -Sql "SELECT TOP 1 service_account AS a FROM sys.dm_server_services WHERE servicename LIKE 'SQL Server (%'"
+    if (@($rows).Count -eq 0) { return '' }
+    return (Get-SebAclIdentity ([string](Get-SebValue $rows[0].a)))
+  }
+  catch { return '' }
+}
+
 # Win32_Service reports the built-in accounts under names an ACL rule will not
 # accept. Everything else - a virtual account, a domain account - is already in the
 # form NTAccount wants.
@@ -3193,6 +3207,22 @@ function Invoke-SebRestoreToPoint {
     $plan = Get-SebRestorePlan -Catalogue $cat -StopAt $StopAt
     if ($plan.Error) { throw ('cannot restore to that point in time: ' + $plan.Error) }
 
+    # A compressed source is expanded into $decompDir and RESTORE reads the plain file AS THE
+    # SQL SERVICE ACCOUNT, which cannot read an operator temp folder. Grant that account read
+    # here (discovered from the instance), exactly as staging is granted for backup - but only
+    # when the plan really has a .zip, so a plain restore creates and grants nothing. The
+    # operator owns this fresh dir, so can set its DACL without local admin; a grant that still
+    # fails leaves the existing "SQL cannot read" fault rather than a silent one.
+    $anyZip = @($plan.Steps | Where-Object { $_.File -like '*.zip' }).Count -gt 0
+    if ($anyZip) {
+      [void](New-Item -ItemType Directory -Path $decompDir -Force)
+      $svcAcct = Get-SebSqlServiceAccount -Connection $Connection
+      if (-not [string]::IsNullOrWhiteSpace($svcAcct)) {
+        try { Set-SebStagingAcl -Path $decompDir -SqlAccount $svcAcct -AlsoGrant @([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) }
+        catch { Write-SebLog ('could not grant the SQL service account read on the restore temp folder: {0}' -f $_.Exception.Message) 'WARN' }
+      }
+    }
+
     $fullStep = $plan.Steps | Where-Object { $_.Kind -eq 'full' } | Select-Object -First 1
     $fullFile = Resolve-SebRestoreSource -File $fullStep.File -StagingDir $decompDir
     $fullInfo = Get-SebRestoreInspect -Connection $Connection -Path $fullFile
@@ -3671,10 +3701,19 @@ try {
     if ([string]::IsNullOrWhiteSpace($RestoreAs)) { throw '-RestoreRun needs -RestoreAs <database name>' }
     $config = Read-SebRestoreContext
     $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
-    $decompRoot = [string]$config.StagingPath
-    if ([string]::IsNullOrWhiteSpace($decompRoot)) { $decompRoot = $env:TEMP }
-    $decompDir = Join-Path $decompRoot ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
+    # $env:TEMP is fine as the expansion root because the SQL service account is granted read
+    # on the per-restore subfolder below (Read-SebRestoreContext deliberately does not carry
+    # StagingPath, and a temp folder is not readable by that account by default).
+    $decompDir = Join-Path $env:TEMP ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
     try {
+      if ($RestoreFrom -like '*.zip') {
+        [void](New-Item -ItemType Directory -Path $decompDir -Force)
+        $svcAcct = Get-SebSqlServiceAccount -Connection $connection
+        if (-not [string]::IsNullOrWhiteSpace($svcAcct)) {
+          try { Set-SebStagingAcl -Path $decompDir -SqlAccount $svcAcct -AlsoGrant @([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) }
+          catch { Write-SebLog ('could not grant the SQL service account read on the restore temp folder: {0}' -f $_.Exception.Message) 'WARN' }
+        }
+      }
       $restoreSource = Resolve-SebRestoreSource -File $RestoreFrom -StagingDir $decompDir
       $info = Get-SebRestoreInspect -Connection $connection -Path $restoreSource
       if (-not $info.Readable) {
@@ -3773,7 +3812,7 @@ try {
 
       Write-SebJob -Index 1 -Total 1 -Database $RestoreAs
       Invoke-SebRestoreToPoint -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME -InstanceLabel $chosen.InstanceName `
-        -Database $Database -RestoreAs $RestoreAs -StopAt $StopAt -DataDir $dataDir -LogDir $logDir -WorkDir ([string]$config.StagingPath) `
+        -Database $Database -RestoreAs $RestoreAs -StopAt $StopAt -DataDir $dataDir -LogDir $logDir `
         -Replace:([bool]$RestoreReplace) -CloseConnections:([bool]$RestoreCloseConnections)
 
       Write-SebLog ('point-in-time restore finished: {0} -> {1} @ {2}' -f $Database, $RestoreAs, $StopAt)
