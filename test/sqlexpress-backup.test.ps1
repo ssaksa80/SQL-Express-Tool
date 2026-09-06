@@ -1517,4 +1517,21 @@ try {
 }
 finally { Remove-Item -LiteralPath $tmpR -Recurse -Force -ErrorAction SilentlyContinue }
 
+# ---- COMP-8. retention removes a compressed backup's sidecar with it ----------------
+$tmpP = Join-Path $env:TEMP ('seb-ret-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpP -Force)
+try {
+  $z = Join-Path $tmpP 'APPDB_20260905-000000.bak.zip'; Set-Content -LiteralPath $z -Value 'x'
+  Set-Content -LiteralPath (Get-SebSidecarName $z) -Value 'x'
+  Remove-SebNamed -Directory $tmpP -Names @('APPDB_20260905-000000.bak.zip')
+  Assert (-not (Test-Path -LiteralPath $z)) 'the pruned .zip is removed'
+  Assert (-not (Test-Path -LiteralPath (Get-SebSidecarName $z))) 'its .meta.json sidecar is removed too'
+  # positive control: a PLAIN backup with no sidecar prunes cleanly, no error, sidecar-removal a no-op
+  $p = Join-Path $tmpP 'APPDB_20260904-000000.bak'; Set-Content -LiteralPath $p -Value 'x'
+  Remove-SebNamed -Directory $tmpP -Names @('APPDB_20260904-000000.bak')
+  Assert (-not (Test-Path -LiteralPath $p)) 'a plain backup (no sidecar) is still pruned normally'
+  Assert (-not (Test-Path -LiteralPath (Get-SebSidecarName $p))) 'no phantom sidecar remains for a plain backup'
+}
+finally { Remove-Item -LiteralPath $tmpP -Recurse -Force -ErrorAction SilentlyContinue }
+
 Write-Host 'ALL PASS'

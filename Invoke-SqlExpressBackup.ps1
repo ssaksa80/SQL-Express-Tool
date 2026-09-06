@@ -1411,6 +1411,10 @@ function Remove-SebNamed {
     catch {
       Write-SebLog ('could not prune {0}: {1}' -f $path, $_.Exception.Message) 'WARN'
     }
+    # A compressed backup carries a .meta.json sidecar; prune it with its backup so the
+    # share does not accumulate orphaned sidecars. No-op for a plain backup (no sidecar).
+    $meta = Get-SebSidecarName $path
+    if (Test-Path -LiteralPath $meta) { Remove-Item -LiteralPath $meta -Force -ErrorAction SilentlyContinue }
   }
 }
 
@@ -1934,6 +1938,8 @@ GROUP BY database_id
                        ($entry.Kind -eq 'log'  -and $rplan.LogDelete  -contains $leaf)
               if ($prune) {
                 Remove-Item -LiteralPath $entry.File -Force -ErrorAction SilentlyContinue
+                $entryMeta = Get-SebSidecarName $entry.File
+                if (Test-Path -LiteralPath $entryMeta) { Remove-Item -LiteralPath $entryMeta -Force -ErrorAction SilentlyContinue }
                 Write-SebLog ('pruned {0}' -f $leaf) 'INFO'
               }
             }
