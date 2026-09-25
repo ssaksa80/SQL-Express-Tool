@@ -116,6 +116,22 @@ param(
   # Encryption. -SetupEncryption makes the key (passphrase + a one-time recovery key);
   # -ImportEncryptionKey brings a key back onto a rebuilt server from its escrow;
   # -EncryptBackups On|Off on -Reschedule switches it for new backups (keys are kept).
+  # Immutable offsite copy (S3-compatible with Object Lock). -ConfigureOffsite sets it up
+  # and proves a locked upload works; -SyncOffsite runs one sync (the task runs it every
+  # 30 minutes); -FetchOffsite downloads backups back for a restore (-SharePath <folder>).
+  [switch]$ConfigureOffsite,
+  [switch]$DisableOffsite,
+  [switch]$SyncOffsite,
+  [switch]$FetchOffsite,
+  [string]$OffsiteEndpoint,
+  [string]$OffsiteRegion,
+  [string]$OffsiteBucket,
+  [string]$OffsitePrefix,
+  [int]$OffsiteLockDays = 30,
+  [ValidateSet('Compliance', 'Governance')]
+  [string]$OffsiteLockMode = 'Compliance',
+  [string]$OffsiteSecretsFile,      # DPAPI CurrentUser JSON {AccessKeyId, SecretAccessKey} from the app
+  [string]$Destination,             # -FetchOffsite: where the downloaded backups go
   [switch]$SetupEncryption,
   [switch]$RotateKey,
   [switch]$ImportEncryptionKey,
@@ -182,6 +198,7 @@ $script:SebShowKeys = @(
   'AlertWebhookKind', 'AlertRemindHours', 'AlertStaleHours', 'AlertPendingMinutes',
   'AlertHasSmtpPassword', 'AlertHasWebhook', 'AlertHasHeartbeat', 'RestoreTesting', 'RestoreTestTime',
   'EncryptBackups', 'ActiveKeyId',
+  'OffsiteEnabled', 'OffsiteEndpoint', 'OffsiteRegion', 'OffsiteBucket', 'OffsitePrefix', 'OffsiteLockDays', 'OffsiteLockMode',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -1021,6 +1038,468 @@ function Get-SebActiveEncryptionKey {
   return , $ring[$id]
 }
 
+# =====================================================================
+# S3 Signature Version 4, pure. Hand-rolled because there is no SDK on a bare server and
+# must not be one: every byte of the canonical request is tested against AWS's own
+# published examples.
+# =====================================================================
+
+function Get-SebSha256Hex {
+  param([byte[]]$Bytes)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try { $h = $sha.ComputeHash($Bytes) } finally { $sha.Dispose() }
+  return (($h | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Get-SebHmacBytes {
+  param([byte[]]$Key, [string]$Text)
+  $mac = New-Object System.Security.Cryptography.HMACSHA256(, $Key)
+  try { return , $mac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Text)) } finally { $mac.Dispose() }
+}
+
+# RFC 3986 percent-encoding as SigV4 wants it: unreserved characters stay, every other
+# UTF-8 byte becomes %XX (uppercase). -KeepSlash for a path, where '/' separates segments.
+function ConvertTo-SebUriEncoded {
+  param([string]$Text, [switch]$KeepSlash)
+  $sb = New-Object System.Text.StringBuilder
+  foreach ($b in [System.Text.Encoding]::UTF8.GetBytes($Text)) {
+    $c = [char]$b
+    if (($b -ge 0x41 -and $b -le 0x5A) -or ($b -ge 0x61 -and $b -le 0x7A) -or ($b -ge 0x30 -and $b -le 0x39) -or $c -eq '-' -or $c -eq '_' -or $c -eq '.' -or $c -eq '~' -or ($KeepSlash -and $c -eq '/')) {
+      [void]$sb.Append($c)
+    }
+    else { [void]$sb.Append('%' + $b.ToString('X2')) }
+  }
+  return $sb.ToString()
+}
+
+# Signs one request. Headers: name -> value (any case; host and x-amz-date must be among
+# them). Query: name -> value, unencoded. Path: the object path, unencoded ('/bucket/key').
+# Returns the Authorization header value plus the intermediate strings, which the tests
+# compare against AWS's examples.
+function New-SebSigV4 {
+  param([string]$Method, [string]$Path, [hashtable]$Query = @{}, [hashtable]$Headers, [string]$PayloadHash,
+        [string]$AccessKey, [string]$SecretKey, [string]$Region, [string]$Service = 's3')
+  $canonUri = ConvertTo-SebUriEncoded -Text $Path -KeepSlash
+  if ($canonUri -eq '') { $canonUri = '/' }
+  $canonQuery = (@($Query.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive | ForEach-Object {
+        (ConvertTo-SebUriEncoded $_) + '=' + (ConvertTo-SebUriEncoded ([string]$Query[$_]))
+      }) -join '&')
+  $h = @{}
+  foreach ($k in @($Headers.Keys)) { $h[([string]$k).ToLowerInvariant()] = (([string]$Headers[$k]).Trim() -replace '\s+', ' ') }
+  $names = @($h.Keys | Sort-Object -CaseSensitive)
+  $canonHeaders = (($names | ForEach-Object { $_ + ':' + $h[$_] + "`n" }) -join '')
+  $signed = $names -join ';'
+  $canonRequest = $Method + "`n" + $canonUri + "`n" + $canonQuery + "`n" + $canonHeaders + "`n" + $signed + "`n" + $PayloadHash
+  $amzDate = $h['x-amz-date']
+  $date = $amzDate.Substring(0, 8)
+  $scope = '{0}/{1}/{2}/aws4_request' -f $date, $Region, $Service
+  $stringToSign = "AWS4-HMAC-SHA256`n" + $amzDate + "`n" + $scope + "`n" + (Get-SebSha256Hex ([System.Text.Encoding]::UTF8.GetBytes($canonRequest)))
+  $k = Get-SebHmacBytes -Key ([System.Text.Encoding]::UTF8.GetBytes('AWS4' + $SecretKey)) -Text $date
+  $k = Get-SebHmacBytes -Key $k -Text $Region
+  $k = Get-SebHmacBytes -Key $k -Text $Service
+  $k = Get-SebHmacBytes -Key $k -Text 'aws4_request'
+  $sig = ((Get-SebHmacBytes -Key $k -Text $stringToSign) | ForEach-Object { $_.ToString('x2') }) -join ''
+  return [pscustomobject]@{
+    Authorization = ('AWS4-HMAC-SHA256 Credential={0}/{1}, SignedHeaders={2}, Signature={3}' -f $AccessKey, $scope, $signed, $sig)
+    Signature = $sig; SignedHeaders = $signed; CanonicalRequest = $canonRequest; StringToSign = $stringToSign
+  }
+}
+
+# =====================================================================
+# S3 client: just the calls the offsite copy needs, over HttpWebRequest, streamed.
+# =====================================================================
+
+$script:SebS3PartBytes = 64MB
+
+# The offsite settings with defaults. Virtual-hosted addressing for AWS itself; path style
+# for everything else (MinIO, Wasabi, B2 and most S3-compatibles expect or accept it).
+function Get-SebOffsiteConfig {
+  param($Config)
+  $get = { param($n, $d) if ($null -ne $Config -and $Config.PSObject.Properties[$n] -and [string]$Config.$n -ne '') { return $Config.$n }; return $d }
+  $endpoint = ([string](& $get 'OffsiteEndpoint' '')).TrimEnd('/')
+  $uri = $null
+  if ($endpoint -ne '') { [void][System.Uri]::TryCreate($endpoint, [System.UriKind]::Absolute, [ref]$uri) }
+  $mode = ([string](& $get 'OffsiteLockMode' 'Compliance'))
+  return [pscustomobject]@{
+    Enabled   = [bool](& $get 'OffsiteEnabled' $false)
+    Endpoint  = $endpoint
+    Uri       = $uri
+    Region    = [string](& $get 'OffsiteRegion' 'us-east-1')
+    Bucket    = [string](& $get 'OffsiteBucket' '')
+    Prefix    = ([string](& $get 'OffsitePrefix' 'sqlexpress-backup')).Trim('/')
+    LockDays  = [int](& $get 'OffsiteLockDays' 30)
+    LockMode  = $(if ($mode -eq 'Governance') { 'GOVERNANCE' } else { 'COMPLIANCE' })
+    BacklogHours = [int](& $get 'OffsiteBacklogHours' 24)
+    VirtualHosted = ($null -ne $uri -and $uri.Host -like '*.amazonaws.com')
+  }
+}
+
+function Test-SebOffsiteEndpoint {
+  param([string]$Endpoint)
+  $u = $null
+  if (-not [System.Uri]::TryCreate($Endpoint, [System.UriKind]::Absolute, [ref]$u)) { return $false }
+  if ($u.Scheme -eq 'https') { return $true }
+  return ($u.Scheme -eq 'http' -and $u.IsLoopback)   # tests only; it never leaves the machine
+}
+
+# Where a key lives: the request URI, the Host header, and the unencoded path SigV4 signs.
+function Get-SebS3Target {
+  param($Offsite, [string]$Key)
+  $u = $Offsite.Uri
+  $hostHeader = $u.Host
+  if (-not $u.IsDefaultPort) { $hostHeader = '{0}:{1}' -f $u.Host, $u.Port }
+  $base = $u.AbsolutePath.TrimEnd('/')
+  if ($Offsite.VirtualHosted) {
+    $hostHeader = $Offsite.Bucket + '.' + $hostHeader
+    $path = $base + '/' + $Key
+  }
+  else { $path = $base + '/' + $Offsite.Bucket + $(if ($Key -ne '') { '/' + $Key } else { '/' }) }
+  return [pscustomobject]@{ Host = $hostHeader; Path = $path; Base = ('{0}://{1}' -f $u.Scheme, $hostHeader) }
+}
+
+# SHA-256 (hex, for SigV4) and MD5 (base64, for Content-MD5 - Object Lock requires it) of a
+# byte range of a file, in one streamed read.
+function Get-SebRangeHashes {
+  param([string]$Path, [long]$Offset, [long]$Length)
+  $sha = [System.Security.Cryptography.SHA256]::Create(); $md5 = [System.Security.Cryptography.MD5]::Create()
+  $fs = [System.IO.File]::OpenRead($Path)
+  try {
+    [void]$fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+    $buf = New-Object byte[] 1048576
+    $left = $Length
+    while ($left -gt 0) {
+      $n = $fs.Read($buf, 0, [int][math]::Min([long]$buf.Length, $left))
+      if ($n -le 0) { throw 'the file ended early' }
+      [void]$sha.TransformBlock($buf, 0, $n, $null, 0); [void]$md5.TransformBlock($buf, 0, $n, $null, 0)
+      $left -= $n
+    }
+    $empty = New-Object byte[] 0
+    [void]$sha.TransformFinalBlock($empty, 0, 0); [void]$md5.TransformFinalBlock($empty, 0, 0)
+    return [pscustomobject]@{ Sha256Hex = (($sha.Hash | ForEach-Object { $_.ToString('x2') }) -join ''); Md5Base64 = [Convert]::ToBase64String($md5.Hash); Md5Hex = (($md5.Hash | ForEach-Object { $_.ToString('x2') }) -join '') }
+  }
+  finally { $fs.Dispose(); $sha.Dispose(); $md5.Dispose() }
+}
+
+# One signed request. Body: $BodyBytes, or a file range ($BodyPath/$BodyOffset/$BodyLength)
+# streamed without buffering. Returns { Status; Headers; Body }. An S3 error becomes an
+# exception carrying S3's own code and message - never the credentials or a signature.
+function Invoke-SebS3Request {
+  param($Offsite, [hashtable]$Secrets, [string]$Method, [string]$Key = '', [hashtable]$Query = @{}, [hashtable]$Headers = @{},
+        [byte[]]$BodyBytes, [string]$BodyPath, [long]$BodyOffset = 0, [long]$BodyLength = -1, [string]$PayloadHash = '', [string]$OutFile)
+  Set-SebTls12
+  $target = Get-SebS3Target -Offsite $Offsite -Key $Key
+  $amzDate = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+  if ($PayloadHash -eq '') {
+    if ($null -ne $BodyBytes) { $PayloadHash = Get-SebSha256Hex $BodyBytes } else { $PayloadHash = Get-SebSha256Hex (New-Object byte[] 0) }
+  }
+  $sign = @{ host = $target.Host; 'x-amz-date' = $amzDate; 'x-amz-content-sha256' = $PayloadHash }
+  foreach ($k in @($Headers.Keys)) { $sign[([string]$k).ToLowerInvariant()] = [string]$Headers[$k] }
+  $sig = New-SebSigV4 -Method $Method -Path $target.Path -Query $Query -Headers $sign -PayloadHash $PayloadHash `
+    -AccessKey ([string]$Secrets['AccessKeyId']) -SecretKey ([string]$Secrets['SecretAccessKey']) -Region $Offsite.Region
+  $qs = (@($Query.Keys | Sort-Object -CaseSensitive | ForEach-Object { (ConvertTo-SebUriEncoded $_) + '=' + (ConvertTo-SebUriEncoded ([string]$Query[$_])) }) -join '&')
+  $url = $target.Base + (ConvertTo-SebUriEncoded -Text $target.Path -KeepSlash) + $(if ($qs -ne '') { '?' + $qs } else { '' })
+  $req = [System.Net.HttpWebRequest]::Create($url)
+  $req.Method = $Method
+  $req.Timeout = 600000; $req.ReadWriteTimeout = 600000
+  $req.AllowWriteStreamBuffering = $false
+  if ($target.Host -ne $req.Host) { $req.Host = $target.Host }
+  $req.Headers['x-amz-date'] = $amzDate
+  $req.Headers['x-amz-content-sha256'] = $PayloadHash
+  $req.Headers['Authorization'] = $sig.Authorization
+  foreach ($k in @($Headers.Keys)) {
+    if ([string]$k -ieq 'content-type') { $req.ContentType = [string]$Headers[$k] } else { $req.Headers[[string]$k] = [string]$Headers[$k] }
+  }
+  if ($null -ne $BodyBytes -or $BodyPath) {
+    $len = $(if ($null -ne $BodyBytes) { [long]$BodyBytes.Length } else { $BodyLength })
+    $req.ContentLength = $len
+    $rs = $req.GetRequestStream()
+    try {
+      if ($null -ne $BodyBytes) { $rs.Write($BodyBytes, 0, $BodyBytes.Length) }
+      else {
+        $fs = [System.IO.File]::OpenRead($BodyPath)
+        try {
+          [void]$fs.Seek($BodyOffset, [System.IO.SeekOrigin]::Begin)
+          $buf = New-Object byte[] 1048576
+          $left = $len
+          while ($left -gt 0) { $n = $fs.Read($buf, 0, [int][math]::Min([long]$buf.Length, $left)); if ($n -le 0) { throw 'the file ended early' }; $rs.Write($buf, 0, $n); $left -= $n }
+        }
+        finally { $fs.Dispose() }
+      }
+    }
+    finally { $rs.Dispose() }
+  }
+  elseif ($Method -eq 'PUT' -or $Method -eq 'POST') { $req.ContentLength = 0 }
+  $resp = $null
+  try { $resp = $req.GetResponse() }
+  catch [System.Net.WebException] {
+    $er = $_.Exception.Response
+    if ($null -eq $er) { throw ('offsite storage unreachable: {0}' -f $_.Exception.Message) }
+    $text = ''
+    try { $sr = New-Object System.IO.StreamReader($er.GetResponseStream()); $text = $sr.ReadToEnd(); $sr.Dispose() } catch { }
+    $code = [int]$er.StatusCode
+    $er.Dispose()
+    $s3Code = ''; $s3Msg = ''
+    if ($text -match '<Code>([^<]*)</Code>') { $s3Code = $Matches[1] }
+    if ($text -match '<Message>([^<]*)</Message>') { $s3Msg = $Matches[1] }
+    if ($Method -eq 'HEAD' -and $code -eq 404) { return [pscustomobject]@{ Status = 404; Headers = @{}; Body = '' } }
+    throw ('offsite storage refused {0} {1}: HTTP {2} {3} {4}' -f $Method, $Key, $code, $s3Code, $s3Msg).Trim()
+  }
+  try {
+    $hdrs = @{}
+    foreach ($n in $resp.Headers.AllKeys) { $hdrs[$n.ToLowerInvariant()] = $resp.Headers[$n] }
+    $body = ''
+    $stream = $resp.GetResponseStream()
+    try {
+      if ($OutFile) { $out = [System.IO.File]::Create($OutFile); try { $stream.CopyTo($out, 1048576) } finally { $out.Dispose() } }
+      else { $sr = New-Object System.IO.StreamReader($stream); $body = $sr.ReadToEnd(); $sr.Dispose() }
+    }
+    finally { $stream.Dispose() }
+    return [pscustomobject]@{ Status = [int]$resp.StatusCode; Headers = $hdrs; Body = $body }
+  }
+  finally { $resp.Dispose() }
+}
+
+function Get-SebLockHeaders {
+  param([string]$Mode, [datetime]$RetainUntilUtc)
+  return @{ 'x-amz-object-lock-mode' = $Mode; 'x-amz-object-lock-retain-until-date' = $RetainUntilUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+}
+
+# Pure. The object came back locked as asked: same mode, retained at least until the date
+# requested (to the second, allowing the store to round up).
+function Test-SebOffsiteLock {
+  param([hashtable]$Headers, [string]$Mode, [datetime]$RetainUntilUtc)
+  $got = [string]$Headers['x-amz-object-lock-mode']
+  if ($got -ine $Mode) { return $false }
+  $until = ConvertFrom-SebUtc ([string]$Headers['x-amz-object-lock-retain-until-date'])
+  if ($null -eq $until) { return $false }
+  return ($until -ge $RetainUntilUtc.AddSeconds(-1))
+}
+
+# Pure. How a file of Size bytes goes up: one PUT, or multipart parts of PartBytes.
+function Get-SebUploadPlan {
+  param([long]$Size, [long]$PartBytes = $script:SebS3PartBytes)
+  if ($Size -le $PartBytes) { return [pscustomobject]@{ Multipart = $false; Parts = @() } }
+  $parts = New-Object System.Collections.ArrayList
+  $offset = [long]0; $n = 1
+  while ($offset -lt $Size) {
+    $len = [long][math]::Min($PartBytes, $Size - $offset)
+    [void]$parts.Add([pscustomobject]@{ Number = $n; Offset = $offset; Length = $len })
+    $offset += $len; $n++
+  }
+  return [pscustomobject]@{ Multipart = $true; Parts = @($parts.ToArray()) }
+}
+
+# Upload one file under Key, locked until RetainUntilUtc, then read the lock back. A bucket
+# without Object Lock refuses the locked PUT, so misconfiguration is loud, never an
+# unlocked copy that merely looks fine.
+function Send-SebOffsiteObject {
+  param($Offsite, [hashtable]$Secrets, [string]$Key, [string]$Path, [datetime]$RetainUntilUtc)
+  $size = (Get-Item -LiteralPath $Path).Length
+  $lock = Get-SebLockHeaders -Mode $Offsite.LockMode -RetainUntilUtc $RetainUntilUtc
+  $plan = Get-SebUploadPlan -Size $size
+  $etag = ''
+  if (-not $plan.Multipart) {
+    $h = Get-SebRangeHashes -Path $Path -Offset 0 -Length $size
+    $headers = @{ 'Content-MD5' = $h.Md5Base64 } + $lock
+    $r = Invoke-SebS3Request -Offsite $Offsite -Secrets $Secrets -Method 'PUT' -Key $Key -Headers $headers -BodyPath $Path -BodyLength $size -PayloadHash $h.Sha256Hex
+    $etag = ([string]$r.Headers['etag']).Trim('"')
+    if ($etag -ne '' -and $etag -ine $h.Md5Hex) { throw ('the store''s checksum for {0} does not match the file sent' -f $Key) }
+  }
+  else {
+    $init = Invoke-SebS3Request -Offsite $Offsite -Secrets $Secrets -Method 'POST' -Key $Key -Query @{ uploads = '' } -Headers $lock
+    if ($init.Body -notmatch '<UploadId>([^<]+)</UploadId>') { throw 'the store did not start a multipart upload' }
+    $uploadId = $Matches[1]
+    try {
+      $done = New-Object System.Text.StringBuilder
+      [void]$done.Append('<CompleteMultipartUpload>')
+      foreach ($part in $plan.Parts) {
+        $h = Get-SebRangeHashes -Path $Path -Offset $part.Offset -Length $part.Length
+        $r = Invoke-SebS3Request -Offsite $Offsite -Secrets $Secrets -Method 'PUT' -Key $Key -Query @{ partNumber = [string]$part.Number; uploadId = $uploadId } `
+          -Headers @{ 'Content-MD5' = $h.Md5Base64 } -BodyPath $Path -BodyOffset $part.Offset -BodyLength $part.Length -PayloadHash $h.Sha256Hex
+        [void]$done.Append(('<Part><PartNumber>{0}</PartNumber><ETag>{1}</ETag></Part>' -f $part.Number, [System.Security.SecurityElement]::Escape([string]$r.Headers['etag'])))
+      }
+      [void]$done.Append('</CompleteMultipartUpload>')
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($done.ToString())
+      $md5 = [System.Security.Cryptography.MD5]::Create()
+      try { $cm = [Convert]::ToBase64String($md5.ComputeHash($bytes)) } finally { $md5.Dispose() }
+      $c = Invoke-SebS3Request -Offsite $Offsite -Secrets $Secrets -Method 'POST' -Key $Key -Query @{ uploadId = $uploadId } -Headers @{ 'Content-MD5' = $cm; 'Content-Type' = 'application/xml' } -BodyBytes $bytes
+      if ($c.Body -match '<Error>') { throw ('the store refused to complete the upload of {0}' -f $Key) }
+      if ($c.Body -match '<ETag>([^<]+)</ETag>') { $etag = $Matches[1].Replace('&quot;', '').Trim('"') }
+    }
+    catch {
+      try { [void](Invoke-SebS3Request -Offsite $Offsite -Secrets $Secrets -Method 'DELETE' -Key $Key -Query @{ uploadId = $uploadId }) } catch { }
+      throw
+    }
+  }
+  $head = Invoke-SebS3Request -Offsite $Offsite -Secrets $Secrets -Method 'HEAD' -Key $Key
+  if ($head.Status -ne 200) { throw ('{0} is not in the bucket after uploading it' -f $Key) }
+  if (-not (Test-SebOffsiteLock -Headers $head.Headers -Mode $Offsite.LockMode -RetainUntilUtc $RetainUntilUtc)) {
+    throw ('SEB_OFFSITE_UNLOCKED {0} was stored without the requested {1} lock - is Object Lock enabled on the bucket?' -f $Key, $Offsite.LockMode)
+  }
+  return [pscustomobject]@{ Key = $Key; Size = $size; ETag = $etag; RetainUntilUtc = $RetainUntilUtc.ToString('o') }
+}
+
+# Every object under a prefix: { Key; Size }. ListObjectsV2, following continuation.
+function Get-SebOffsiteList {
+  param($Offsite, [hashtable]$Secrets, [string]$Prefix)
+  $out = New-Object System.Collections.ArrayList
+  $token = ''
+  do {
+    $q = @{ 'list-type' = '2'; prefix = $Prefix }
+    if ($token -ne '') { $q['continuation-token'] = $token }
+    $r = Invoke-SebS3Request -Offsite $Offsite -Secrets $Secrets -Method 'GET' -Key '' -Query $q
+    $xml = [xml]$r.Body
+    foreach ($c in @($xml.ListBucketResult.Contents)) { if ($null -ne $c) { [void]$out.Add([pscustomobject]@{ Key = [string]$c.Key; Size = [long]$c.Size }) } }
+    $token = ''
+    if ([string]$xml.ListBucketResult.IsTruncated -eq 'true') { $token = [string]$xml.ListBucketResult.NextContinuationToken }
+  } while ($token -ne '')
+  return @($out.ToArray())
+}
+
+function Get-SebOffsiteSecretsPath { return (Join-Path $script:SebConfigDir 'offsite.dat') }
+
+function Read-SebOffsiteSecrets {
+  $path = Get-SebOffsiteSecretsPath
+  $out = @{}
+  if (-not (Test-Path -LiteralPath $path)) { return $out }
+  $master = Get-SebMasterKey
+  try {
+    $obj = (Unprotect-SebString -Blob ((Get-Content -LiteralPath $path -Raw).Trim()) -Master $master) | ConvertFrom-Json
+    foreach ($p in @($obj.PSObject.Properties)) { $out[$p.Name] = [string]$p.Value }
+  }
+  finally { [System.Array]::Clear($master, 0, $master.Length) }
+  return $out
+}
+
+function Write-SebOffsiteSecrets {
+  param([hashtable]$Secrets)
+  $master = Get-SebMasterKey -Create
+  try { $blob = Protect-SebString -Plain ($Secrets | ConvertTo-Json -Compress) -Master $master }
+  finally { [System.Array]::Clear($master, 0, $master.Length) }
+  $path = Get-SebOffsiteSecretsPath
+  Set-Content -LiteralPath $path -Value $blob -Encoding ASCII
+  Set-SebSecretAcl $path
+}
+
+# =====================================================================
+# The offsite sync: what is on the share goes offsite, locked.
+# =====================================================================
+
+function Get-SebOffsiteStatePath { return (Join-Path $script:SebConfigDir 'offsite-state.json') }
+
+function Read-SebOffsiteState {
+  $path = Get-SebOffsiteStatePath
+  $st = [pscustomobject]@{ LastRunUtc = ''; LastResult = 'never'; LastError = ''; Backlog = 0; OldestPendingUtc = ''; Objects = [pscustomobject]@{} }
+  if (-not (Test-Path -LiteralPath $path)) { return $st }
+  try { $read = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { return $st }
+  foreach ($p in @($read.PSObject.Properties)) { Add-Member -InputObject $st -MemberType NoteProperty -Name $p.Name -Value $p.Value -Force }
+  if ($null -eq $st.Objects) { $st.Objects = [pscustomobject]@{} }
+  return $st
+}
+
+function Write-SebOffsiteState {
+  param($State)
+  $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Get-SebOffsiteStatePath) -Encoding ASCII
+}
+
+# Pure-ish (file listing only). The share files for this host/instance that belong offsite -
+# backups, their sidecars, the key escrows - as { Path; Key; Size; Written }, oldest first so
+# a chain arrives in order. Key = <prefix>/<HOST>/<INSTANCE>/<relative path with '/'>.
+function Get-SebOffsiteCandidates {
+  param([string]$ShareHostDir, [string]$Prefix, [string]$HostLabel, [string]$InstanceLabel)
+  if (-not (Test-Path -LiteralPath $ShareHostDir)) { return @() }
+  $rootLen = $ShareHostDir.TrimEnd('\').Length + 1
+  $files = @(Get-ChildItem -LiteralPath $ShareHostDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+      $_.Name -match '\.(bak|dif|trn)(\.zip)?(\.enc)?(\.meta\.json)?$' -or $_.Name -match '^encryption-key-[0-9a-f]{16}\.json$'
+    })
+  $out = foreach ($f in $files) {
+    $rel = $f.FullName.Substring($rootLen).Replace('\', '/')
+    $key = (@($Prefix, (Get-SebSafeName $HostLabel), (Get-SebSafeName $InstanceLabel), $rel) | Where-Object { $_ -ne '' }) -join '/'
+    [pscustomobject]@{ Path = $f.FullName; Key = $key; Size = $f.Length; Written = $f.LastWriteTimeUtc }
+  }
+  return @($out | Sort-Object Written, Key)
+}
+
+# Pure. What still has to go up: a candidate with no record, or one recorded at another size.
+function Get-SebOffsitePending {
+  param([object[]]$Candidates = @(), $Objects)
+  return @($Candidates | Where-Object {
+      $rec = $null
+      if ($null -ne $Objects -and $Objects.PSObject.Properties[$_.Key]) { $rec = $Objects.($_.Key) }
+      $null -eq $rec -or [long]$rec.Size -ne [long]$_.Size
+    })
+}
+
+function Get-SebOffsiteConditions {
+  param($Result, [int]$BacklogHours, [datetime]$NowUtc)
+  $out = New-Object System.Collections.ArrayList
+  if ($Result.Unlocked -gt 0) {
+    [void]$out.Add((New-SebAlertCondition -Key 'offsite-lock-missing' -Severity 'critical' -Owner 'offsite' -Message (
+          '{0} backup(s) were stored offsite WITHOUT the requested lock - the offsite copy is not immutable. Check that Object Lock is enabled on the bucket.' -f $Result.Unlocked)))
+  }
+  if ($Result.Error -ne '' -or $Result.Failed -gt 0) {
+    $why = $Result.Error
+    if ($why -eq '') { $why = ('{0} upload(s) failed' -f $Result.Failed) }
+    [void]$out.Add((New-SebAlertCondition -Key 'offsite-failed' -Severity 'warning' -Owner 'offsite' -Message ('The offsite copy did not complete: {0}' -f $why)))
+  }
+  $oldest = ConvertFrom-SebUtc $Result.OldestPendingUtc
+  if ($null -ne $oldest -and ($NowUtc - $oldest).TotalHours -ge $BacklogHours) {
+    [void]$out.Add((New-SebAlertCondition -Key 'offsite-backlog' -Severity 'critical' -Owner 'offsite' -Message (
+          '{0} backup file(s) are not offsite; the oldest has waited {1} hours. If the share is lost now, they are gone.' -f $Result.Backlog, [int][math]::Floor(($NowUtc - $oldest).TotalHours))))
+  }
+  return @($out.ToArray())
+}
+
+# One sync run. Own mutex (never the backup one, which log backups need); state saved after
+# every upload, so a killed run loses nothing it had finished.
+function Invoke-SebOffsiteSync {
+  param($Config)
+  $os = Get-SebOffsiteConfig $Config
+  $now = (Get-Date).ToUniversalTime()
+  $result = [pscustomobject]@{ Uploaded = 0; Failed = 0; Unlocked = 0; Backlog = 0; OldestPendingUtc = ''; Error = '' }
+  $state = Read-SebOffsiteState
+  try {
+    if (-not (Test-SebOffsiteEndpoint $os.Endpoint) -or $os.Bucket -eq '') { throw 'the offsite endpoint or bucket is not configured' }
+    $secrets = Read-SebOffsiteSecrets
+    if (-not $secrets.ContainsKey('AccessKeyId') -or -not $secrets.ContainsKey('SecretAccessKey')) { throw 'the offsite credentials are not stored - run -ConfigureOffsite' }
+    $shareDir = Join-Path (Join-Path ([string]$Config.SharePath) (Get-SebSafeName $env:COMPUTERNAME)) (Get-SebSafeName ([string]$Config.InstanceName))
+    $cands = @(Get-SebOffsiteCandidates -ShareHostDir $shareDir -Prefix $os.Prefix -HostLabel $env:COMPUTERNAME -InstanceLabel ([string]$Config.InstanceName))
+    foreach ($c in @(Get-SebOffsitePending -Candidates $cands -Objects $state.Objects)) {
+      if (-not (Test-Path -LiteralPath $c.Path)) { continue }   # pruned by retention since the listing
+      $until = (Get-Date).ToUniversalTime().AddDays($os.LockDays)
+      try {
+        $rec = Send-SebOffsiteObject -Offsite $os -Secrets $secrets -Key $c.Key -Path $c.Path -RetainUntilUtc $until
+        Add-Member -InputObject $state.Objects -MemberType NoteProperty -Name $c.Key -Value ([pscustomobject]@{ Size = $rec.Size; UploadedUtc = (Get-Date).ToUniversalTime().ToString('o'); RetainUntilUtc = $rec.RetainUntilUtc; ETag = $rec.ETag }) -Force
+        $result.Uploaded++
+        Write-SebOffsiteState $state
+        Write-SebLog ('offsite: {0} stored, locked until {1:yyyy-MM-dd}' -f $c.Key, $until)
+      }
+      catch {
+        $m = Protect-SebAlertText ([string]$_.Exception.Message)
+        if ($m -like 'SEB_OFFSITE_UNLOCKED*') { $result.Unlocked++; $m = $m.Substring(21) }
+        $result.Failed++
+        $result.Error = $m
+        Write-SebLog ('offsite: {0} failed - {1}' -f $c.Key, $m) 'WARN'
+        # A store that cannot be reached will not be reached by the next file either.
+        if ($m -like 'offsite storage unreachable*' -or $m -like '*InvalidAccessKeyId*' -or $m -like '*SignatureDoesNotMatch*' -or $m -like '*NoSuchBucket*' -or $m -like '*AccessDenied*') { break }
+      }
+    }
+    # What is still not offsite, and how long the oldest of it has waited.
+    $left = @(Get-SebOffsitePending -Candidates $cands -Objects $state.Objects | Where-Object { Test-Path -LiteralPath $_.Path })
+    $result.Backlog = $left.Count
+    if ($left.Count -gt 0) { $result.OldestPendingUtc = ($left[0].Written).ToUniversalTime().ToString('o') }
+  }
+  catch { $result.Error = Protect-SebAlertText ([string]$_.Exception.Message); Write-SebLog ('offsite sync failed: {0}' -f $result.Error) 'WARN' }
+  $state.LastRunUtc = $now.ToString('o')
+  $state.LastResult = $(if ($result.Error -eq '' -and $result.Failed -eq 0) { 'ok' } else { 'failed' })
+  $state.LastError = $result.Error
+  $state.Backlog = $result.Backlog
+  $state.OldestPendingUtc = $result.OldestPendingUtc
+  Write-SebOffsiteState $state
+  Invoke-SebAlertEvaluation -Config $Config -Owners @('offsite') -Conditions @(Get-SebOffsiteConditions -Result $result -BacklogHours $os.BacklogHours -NowUtc $now)
+  return $result
+}
+
 # SYSTEM and Administrators, inheritance off. These files are the whole point of
 # the exercise; leaving them to inherit whatever ProgramData hands out is not a
 # decision anyone made on purpose.
@@ -1408,6 +1887,17 @@ function Write-SebPublicSummary {
       Add-Member -InputObject $public -MemberType NoteProperty -Name 'RestoreTests' -Value @($tests) -Force
     }
   }
+  # The offsite sync's summary, for the dashboard (no keys, no credentials - just progress).
+  try {
+    if (Test-Path -LiteralPath (Get-SebOffsiteStatePath)) {
+      $ost = Read-SebOffsiteState
+      Add-Member -InputObject $public -MemberType NoteProperty -Name 'Offsite' -Value ([pscustomobject]@{
+          LastRunUtc = [string]$ost.LastRunUtc; LastResult = [string]$ost.LastResult; LastError = [string]$ost.LastError
+          Backlog = [int]$ost.Backlog; OldestPendingUtc = [string]$ost.OldestPendingUtc; Objects = @($ost.Objects.PSObject.Properties).Count
+        }) -Force
+    }
+  }
+  catch { }
   Add-Member -InputObject $public -MemberType NoteProperty -Name 'HostName' -Value $env:COMPUTERNAME -Force
   Add-Member -InputObject $public -MemberType NoteProperty -Name 'WrittenUtc' -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force
   try {
@@ -1771,6 +2261,11 @@ function Get-SebWatchdogConditions {
       [void]$out.Add((New-SebAlertCondition -Key 'task-missing' -Severity 'critical' -Owner 'watchdog' -Message (
             'The backup task is {0} - no backups will run until it is restored (re-run -Reschedule, or Change schedule in the app).' -f ([string]$Schedule.MainTaskState).ToLowerInvariant())))
     }
+    $offsiteOn = ($null -ne $Config -and $Config.PSObject.Properties['OffsiteEnabled'] -and [bool]$Config.OffsiteEnabled)
+    if ($offsiteOn -and $Schedule.PSObject.Properties['OffsiteTaskState'] -and $dead -contains [string]$Schedule.OffsiteTaskState) {
+      [void]$out.Add((New-SebAlertCondition -Key 'offsite-task-missing' -Severity 'warning' -Owner 'watchdog' -Message (
+            'The offsite copy is on but its task is {0} - new backups are not reaching the immutable store (re-run -Reschedule).' -f ([string]$Schedule.OffsiteTaskState).ToLowerInvariant())))
+    }
     $testing = ($null -ne $Config -and $Config.PSObject.Properties['RestoreTesting'] -and [bool]$Config.RestoreTesting)
     if ($testing -and $Schedule.PSObject.Properties['RestoreTestTaskState'] -and $dead -contains [string]$Schedule.RestoreTestTaskState) {
       [void]$out.Add((New-SebAlertCondition -Key 'restore-test-task-missing' -Severity 'warning' -Owner 'watchdog' -Message (
@@ -2031,6 +2526,20 @@ function Read-SebAlertSecretsFile {
     if ($null -ne $bytes) { [System.Array]::Clear($bytes, 0, $bytes.Length) }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
   }
+}
+
+function Show-SebOffsiteStatus {
+  $config = Read-SebConfig
+  $os = Get-SebOffsiteConfig $config
+  Write-Host ''
+  Write-Host '== Offsite (immutable) ================================================'
+  if (-not $os.Enabled) { Write-Host '   off - set up with -ConfigureOffsite (S3-compatible storage with Object Lock)'; return }
+  Write-Host ('   {0}  bucket {1}  prefix {2}' -f $os.Endpoint, $os.Bucket, $os.Prefix)
+  Write-Host ('   each copy locked {0} for {1} day(s); the tool never deletes offsite' -f $os.LockMode, $os.LockDays)
+  $st = Read-SebOffsiteState
+  $count = @($st.Objects.PSObject.Properties).Count
+  Write-Host ('   last sync {0}: {1}{2}' -f $(if ($st.LastRunUtc) { $st.LastRunUtc } else { 'never' }), $st.LastResult, $(if ($st.LastError) { ' - ' + $st.LastError } else { '' }))
+  Write-Host ('   {0} object(s) offsite; {1} file(s) waiting{2}' -f $count, $st.Backlog, $(if ($st.OldestPendingUtc) { ' (oldest from ' + $st.OldestPendingUtc + ')' } else { '' }))
 }
 
 function Show-SebEncryptionStatus {
@@ -2736,12 +3245,12 @@ function Get-SebMutex {
   # operator does not. Fall back rather than refuse to run by hand.
   # -WaitSeconds: the data pass waits out a short log pass instead of losing its whole
   # interval (at boot the two tasks fire together); the 15-minute log pass keeps 0.
-  param([int]$WaitSeconds = 0)
+  param([int]$WaitSeconds = 0, [string]$Name = 'SqlExpressBackup')
   foreach ($prefix in @('Global\', 'Local\')) {
     $mutex = $null
     try {
       $created = $false
-      $mutex = New-Object System.Threading.Mutex($true, ($prefix + 'SqlExpressBackup'), [ref]$created)
+      $mutex = New-Object System.Threading.Mutex($true, ($prefix + $Name), [ref]$created)
       if (-not $created) {
         $held = $mutex.WaitOne([TimeSpan]::FromSeconds($WaitSeconds))
         if (-not $held) { $mutex.Dispose(); return $null }
@@ -3461,6 +3970,37 @@ function Sync-SebRestoreTestTask {
   return $true
 }
 
+function Get-SebOffsiteTaskName {
+  param([string]$Base)
+  return ($Base + '-Offsite')
+}
+
+# The offsite sync's task: every 30 minutes and 15 minutes after boot, as SYSTEM, present
+# only while offsite is enabled. Six hours allowed - a first sync of a large share takes time.
+function Sync-SebOffsiteTask {
+  param([string]$ScriptPath, [string]$ConfigDirectory)
+  $name = Get-SebOffsiteTaskName -Base $script:SebTaskName
+  $os = Get-SebOffsiteConfig (Read-SebConfig)
+  if (-not $os.Enabled) {
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+      Write-SebLog ('scheduled task "{0}" removed - the offsite copy is off' -f $name)
+    }
+    return $false
+  }
+  $arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -SyncOffsite -ConfigDir "{1}"' -f $ScriptPath, $ConfigDirectory)
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+  $every = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(11) -RepetitionInterval (New-TimeSpan -Minutes 30)
+  $boot = New-ScheduledTaskTrigger -AtStartup
+  $boot.Delay = 'PT15M'
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+  [void](Register-ScheduledTask -TaskName $name -Action $action -Trigger @($every, $boot) -Principal $principal -Settings $settings -Force)
+  Write-SebLog ('scheduled task "{0}" registered - offsite copy every 30 minutes' -f $name)
+  return $true
+}
+
 # What the watchdog needs to know about the schedule, as plain values for the pure check.
 function Get-SebWatchdogSchedule {
   $taskState = {
@@ -3474,6 +4014,7 @@ function Get-SebWatchdogSchedule {
     MainTaskState  = (& $taskState $script:SebTaskName)
     LogTaskState   = (& $taskState (Get-SebLogTaskName -Base $script:SebTaskName))
     RestoreTestTaskState = (& $taskState (Get-SebRestoreTestTaskName -Base $script:SebTaskName))
+    OffsiteTaskState = (& $taskState (Get-SebOffsiteTaskName -Base $script:SebTaskName))
   }
 }
 
@@ -3534,6 +4075,7 @@ function Install-SebTask {
   # The dead-man check follows the alert config: present only while something can receive it.
   [void](Sync-SebWatchdogTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
   [void](Sync-SebRestoreTestTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
+  [void](Sync-SebOffsiteTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
 }
 
 function Resolve-SebNssm {
@@ -3604,6 +4146,7 @@ function Install-SebService {
   # The dead-man check follows the alert config: present only while something can receive it.
   [void](Sync-SebWatchdogTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
   [void](Sync-SebRestoreTestTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
+  [void](Sync-SebOffsiteTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
 }
 
 function Uninstall-SebSchedule {
@@ -3622,7 +4165,7 @@ function Uninstall-SebSchedule {
   }
   # Removed with the backups they watch and test, or the watchdog would alert "backup task
   # missing" forever and the restore test would test a share nobody writes to any more.
-  foreach ($extraTask in @((Get-SebWatchdogTaskName -Base $script:SebTaskName), (Get-SebRestoreTestTaskName -Base $script:SebTaskName))) {
+  foreach ($extraTask in @((Get-SebWatchdogTaskName -Base $script:SebTaskName), (Get-SebRestoreTestTaskName -Base $script:SebTaskName), (Get-SebOffsiteTaskName -Base $script:SebTaskName))) {
     if (Get-ScheduledTask -TaskName $extraTask -ErrorAction SilentlyContinue) {
       Unregister-ScheduledTask -TaskName $extraTask -Confirm:$false -ErrorAction SilentlyContinue
       Write-SebLog ('scheduled task "{0}" removed' -f $extraTask)
@@ -4198,9 +4741,10 @@ function Write-SebCheck {
 # Administrators because it holds sealed credentials; public.json carries the same
 # instance and share paths for exactly this kind of reader.
 function Read-SebRestoreContext {
+  $ctx = $null
   try {
     $cfg = Read-SebConfig
-    return [pscustomobject]@{ DataSource = [string]$cfg.DataSource; SharePath = [string]$cfg.SharePath }
+    $ctx = [pscustomobject]@{ DataSource = [string]$cfg.DataSource; SharePath = [string]$cfg.SharePath }
   }
   catch {
     $p = Get-SebPublicPath
@@ -4208,8 +4752,12 @@ function Read-SebRestoreContext {
       throw 'no configuration found. Run -Setup first, or start the console as an administrator if the settings exist but cannot be read.'
     }
     $j = Get-Content -LiteralPath $p -Raw | ConvertFrom-Json
-    return [pscustomobject]@{ DataSource = [string]$j.DataSource; SharePath = [string]$j.SharePath }
+    $ctx = [pscustomobject]@{ DataSource = [string]$j.DataSource; SharePath = [string]$j.SharePath }
   }
+  # -SharePath on a restore mode reads backups from another folder with the share's layout -
+  # the one -FetchOffsite fills from the immutable copy when the real share is gone.
+  if (-not [string]::IsNullOrWhiteSpace($script:SebRestoreShareOverride)) { $ctx.SharePath = $script:SebRestoreShareOverride }
+  return $ctx
 }
 
 # A UNC pointing at THIS host, resolved to the folder behind it.
@@ -5195,6 +5743,14 @@ if ($DotSourceOnly) { return }
 # every restore/inspect aimed at it missed. An interactive console is left as it is.
 try { if ([Console]::IsOutputRedirected) { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } } catch { }
 
+# -SharePath means "the share" to -Setup, and "read the backups from here instead" to the
+# restore modes - e.g. a folder -FetchOffsite filled from the immutable copy.
+$script:SebRestoreShareOverride = ''
+if (-not [string]::IsNullOrWhiteSpace($SharePath) -and ($RestoreList -or $RestoreRun -or $RestoreToPoint -or
+    -not [string]::IsNullOrWhiteSpace($RestoreInspect) -or -not [string]::IsNullOrWhiteSpace($RestoreVerify))) {
+  $script:SebRestoreShareOverride = $SharePath
+}
+
 $exitCode = 0
 $mutex = $null
 try {
@@ -5539,8 +6095,102 @@ try {
     Assert-SebElevated -Mode 'Status'
     Show-SebStatus
     Show-SebEncryptionStatus
+    Show-SebOffsiteStatus
     Show-SebRestoreTestStatus
     Show-SebAlertStatus
+  }
+  elseif ($ConfigureOffsite) {
+    Assert-SebElevated -Mode 'ConfigureOffsite'
+    $config = Read-SebConfig
+    foreach ($name in @('OffsiteEndpoint', 'OffsiteRegion', 'OffsiteBucket', 'OffsitePrefix', 'OffsiteLockDays', 'OffsiteLockMode')) {
+      if ($PSBoundParameters.ContainsKey($name)) { Add-Member -InputObject $config -MemberType NoteProperty -Name $name -Value (Get-Variable -Name $name -ValueOnly) -Force }
+    }
+    $os = Get-SebOffsiteConfig $config
+    if (-not (Test-SebOffsiteEndpoint $os.Endpoint)) { throw 'give -OffsiteEndpoint as an https:// URL (e.g. https://s3.eu-west-1.amazonaws.com, https://s3.wasabisys.com)' }
+    if ($os.Bucket -eq '') { throw 'give -OffsiteBucket - a bucket created WITH Object Lock enabled' }
+    if ($os.LockDays -lt 1 -or $os.LockDays -gt 3650) { throw '-OffsiteLockDays must be between 1 and 3650' }
+    $secrets = @{}
+    try { $secrets = Read-SebOffsiteSecrets } catch { }
+    if (-not [string]::IsNullOrWhiteSpace($OffsiteSecretsFile)) {
+      $given = Read-SebAlertSecretsFile -Path $OffsiteSecretsFile
+      foreach ($k in @('AccessKeyId', 'SecretAccessKey')) { if ($given.ContainsKey($k) -and [string]$given[$k] -ne '') { $secrets[$k] = [string]$given[$k] } }
+    }
+    elseif (-not $secrets.ContainsKey('SecretAccessKey')) {
+      $secrets['AccessKeyId'] = Read-Host 'Access key id (a key that can put objects and set retention - no delete)'
+      $s = Read-Host -AsSecureString 'Secret access key'
+      $secrets['SecretAccessKey'] = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+    }
+    if ([string]$secrets['AccessKeyId'] -eq '' -or [string]$secrets['SecretAccessKey'] -eq '') { throw 'the access key id and secret access key are both needed' }
+    # Prove it before switching it on: a small object, locked for a day, read back locked. A
+    # bucket without Object Lock, a wrong key or a key without retention rights fails HERE,
+    # with the store's own reason, not silently on the first real backup.
+    $probeFile = Join-Path $env:TEMP ('seb-offsite-probe-' + [Guid]::NewGuid().ToString('N') + '.txt')
+    Set-Content -LiteralPath $probeFile -Value ('SQL Express Backup offsite probe from {0} at {1:o}' -f $env:COMPUTERNAME, (Get-Date).ToUniversalTime()) -Encoding ASCII
+    $probeKey = (@($os.Prefix, (Get-SebSafeName $env:COMPUTERNAME), (Get-SebSafeName ([string]$config.InstanceName)), '.seb-probe', ([Guid]::NewGuid().ToString('N') + '.txt')) | Where-Object { $_ -ne '' }) -join '/'
+    try { [void](Send-SebOffsiteObject -Offsite $os -Secrets $secrets -Key $probeKey -Path $probeFile -RetainUntilUtc ((Get-Date).ToUniversalTime().AddDays(1))) }
+    catch { throw ('the offsite store failed the locked test upload, so nothing was switched on: ' + (Protect-SebAlertText ([string]$_.Exception.Message) -replace '^SEB_OFFSITE_UNLOCKED ', '')) }
+    finally { Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue }
+    Write-SebOffsiteSecrets -Secrets $secrets
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'OffsiteEnabled' -Value $true -Force
+    Write-SebConfig -Config $config
+    $taskOn = $false
+    $schedule = Get-SebScheduleState
+    if ($schedule.TaskPresent -or $schedule.ServicePresent) { $taskOn = Sync-SebOffsiteTask -ScriptPath (Copy-SebEngineForService -ScriptPath (Get-SebScriptPath)) -ConfigDirectory $script:SebConfigDir }
+    Write-SebLog ('offsite copy on: {0} bucket {1}, {2} lock for {3} days' -f $os.Endpoint, $os.Bucket, $os.LockMode, $os.LockDays)
+    Write-Host (ConvertTo-Json @{ Ok = $true; Endpoint = $os.Endpoint; Bucket = $os.Bucket; LockMode = $os.LockMode; LockDays = $os.LockDays; ProbeKey = $probeKey; Task = $taskOn } -Compress)
+  }
+  elseif ($DisableOffsite) {
+    Assert-SebElevated -Mode 'DisableOffsite'
+    $config = Read-SebConfig
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'OffsiteEnabled' -Value $false -Force
+    Write-SebConfig -Config $config
+    $name = Get-SebOffsiteTaskName -Base $script:SebTaskName
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue }
+    Write-SebLog 'offsite copy off - nothing more is uploaded; what is already offsite stays locked until its date'
+    Write-Host (ConvertTo-Json @{ Ok = $true } -Compress)
+  }
+  elseif ($SyncOffsite) {
+    Assert-SebElevated -Mode 'SyncOffsite'
+    $config = Read-SebConfig
+    if (-not (Get-SebOffsiteConfig $config).Enabled) {
+      Write-SebLog 'offsite copy is off - nothing to sync'
+      Write-Host (ConvertTo-Json @{ Ok = $true; Result = 'off' } -Compress)
+    }
+    else {
+      # Its own lock: two syncs never overlap, and the backup lock stays free for log backups.
+      $mutex = Get-SebMutex -Name 'SqlExpressBackup-Offsite'
+      if ($null -eq $mutex) { Write-SebLog 'offsite: another sync is still running'; exit 0 }
+      $r = Invoke-SebOffsiteSync -Config $config
+      Write-Host (ConvertTo-Json @{ Ok = ($r.Error -eq '' -and $r.Failed -eq 0); Uploaded = $r.Uploaded; Failed = $r.Failed; Backlog = $r.Backlog; Error = $r.Error } -Compress)
+      if ($r.Error -ne '' -or $r.Failed -gt 0) { $exitCode = 1 }
+    }
+  }
+  elseif ($FetchOffsite) {
+    Assert-SebElevated -Mode 'FetchOffsite'
+    if ([string]::IsNullOrWhiteSpace($Destination)) { throw '-FetchOffsite needs -Destination <folder>' }
+    $config = Read-SebConfig
+    $os = Get-SebOffsiteConfig $config
+    $secrets = Read-SebOffsiteSecrets
+    $base = (@($os.Prefix, (Get-SebSafeName $env:COMPUTERNAME), (Get-SebSafeName ([string]$config.InstanceName))) | Where-Object { $_ -ne '' }) -join '/'
+    $listPrefix = $base + '/'
+    if (-not [string]::IsNullOrWhiteSpace($Database)) { $listPrefix += (Get-SebSafeName $Database) + '/' }
+    $objects = @(Get-SebOffsiteList -Offsite $os -Secrets $secrets -Prefix $listPrefix | Where-Object { $_.Key -notlike '*/.seb-probe/*' })
+    # Laid out exactly like the share: <Destination>\<HOST>\<INSTANCE>\<db>\<kind>\<file>, so
+    # every restore mode reads it with -SharePath <Destination>.
+    $hostDir = Join-Path (Join-Path $Destination (Get-SebSafeName $env:COMPUTERNAME)) (Get-SebSafeName ([string]$config.InstanceName))
+    $n = 0
+    foreach ($o in $objects) {
+      $rel = $o.Key.Substring($base.Length + 1)
+      $local = Join-Path $hostDir ($rel.Replace('/', '\'))
+      $dir = Split-Path -Parent $local
+      if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+      [void](Invoke-SebS3Request -Offsite $os -Secrets $secrets -Method 'GET' -Key $o.Key -OutFile $local)
+      if ((Get-Item -LiteralPath $local).Length -ne $o.Size) { throw ('{0} arrived at the wrong size' -f $o.Key) }
+      $n++
+    }
+    Write-SebLog ('offsite: fetched {0} object(s) into {1}' -f $n, $Destination)
+    Write-Host ('Restore from it with -SharePath "{0}" on any restore mode (e.g. -RestoreToPoint, -RestoreList).' -f $Destination)
+    Write-Host (ConvertTo-Json @{ Ok = $true; Fetched = $n; Destination = $Destination } -Compress)
   }
   elseif ($SetupEncryption) {
     Assert-SebElevated -Mode 'SetupEncryption'
@@ -5898,7 +6548,8 @@ catch {
   $failedMode = 'Run'
   foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest', 'BackupLog', 'Reschedule',
       'RestoreList', 'RestoreInspect', 'RestoreVerify', 'RestoreRun', 'RestoreToPoint',
-      'ConfigureAlerts', 'ClearAlerts', 'TestAlert', 'Watchdog', 'TestRestore', 'SetupEncryption', 'ImportEncryptionKey')) {
+      'ConfigureAlerts', 'ClearAlerts', 'TestAlert', 'Watchdog', 'TestRestore', 'SetupEncryption', 'ImportEncryptionKey',
+      'ConfigureOffsite', 'DisableOffsite', 'SyncOffsite', 'FetchOffsite')) {
     $v = Get-Variable -Name $m -ValueOnly -ErrorAction SilentlyContinue
     if ($v) { $failedMode = $m; break }
   }

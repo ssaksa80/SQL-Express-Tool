@@ -1919,6 +1919,182 @@ finally {
 }
 
 # ======================================================================================
+# OFFSITE (immutable, S3-compatible)
+# ======================================================================================
+# ---- OFF-1. SigV4 against AWS's own published examples -------------------------------
+$empty = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+$exSk = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+$sigCases = @(
+  @('SigV4 test suite: get-vanilla', '5fa00fa31553b73ebf1942676e86291e8372ff2a2260956d9b8aae1d763fbf31', (New-SebSigV4 -Method GET -Path '/' -Headers @{ Host = 'example.amazonaws.com'; 'X-Amz-Date' = '20150830T123600Z' } -PayloadHash $empty -AccessKey 'AKIDEXAMPLE' -SecretKey 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY' -Region 'us-east-1' -Service 'service')),
+  @('SigV4 test suite: query parameter order', 'b97d918cfa904a5beff61c982a1b6f458b799221646efd99d3219ec94cdf2500', (New-SebSigV4 -Method GET -Path '/' -Query @{ Param2 = 'value2'; Param1 = 'value1' } -Headers @{ Host = 'example.amazonaws.com'; 'X-Amz-Date' = '20150830T123600Z' } -PayloadHash $empty -AccessKey 'AKIDEXAMPLE' -SecretKey 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY' -Region 'us-east-1' -Service 'service')),
+  @('S3 docs: GET object with Range', 'f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41', (New-SebSigV4 -Method GET -Path '/test.txt' -Headers @{ Host = 'examplebucket.s3.amazonaws.com'; Range = 'bytes=0-9'; 'x-amz-content-sha256' = $empty; 'x-amz-date' = '20130524T000000Z' } -PayloadHash $empty -AccessKey 'AKIAIOSFODNN7EXAMPLE' -SecretKey $exSk -Region 'us-east-1')),
+  @('S3 docs: PUT object, $ in the key', '98ad721746da40c64f1a55b78f14c238d841ea1380cd77a1b5971af0ece108bd', (New-SebSigV4 -Method PUT -Path '/test$file.text' -Headers @{ Date = 'Fri, 24 May 2013 00:00:00 GMT'; Host = 'examplebucket.s3.amazonaws.com'; 'x-amz-content-sha256' = '44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072'; 'x-amz-date' = '20130524T000000Z'; 'x-amz-storage-class' = 'REDUCED_REDUNDANCY' } -PayloadHash '44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072' -AccessKey 'AKIAIOSFODNN7EXAMPLE' -SecretKey $exSk -Region 'us-east-1')),
+  @('S3 docs: GET ?lifecycle (empty query value)', 'fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543', (New-SebSigV4 -Method GET -Path '/' -Query @{ lifecycle = '' } -Headers @{ Host = 'examplebucket.s3.amazonaws.com'; 'x-amz-content-sha256' = $empty; 'x-amz-date' = '20130524T000000Z' } -PayloadHash $empty -AccessKey 'AKIAIOSFODNN7EXAMPLE' -SecretKey $exSk -Region 'us-east-1')),
+  @('S3 docs: list objects', '34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7', (New-SebSigV4 -Method GET -Path '/' -Query @{ 'max-keys' = '2'; prefix = 'J' } -Headers @{ Host = 'examplebucket.s3.amazonaws.com'; 'x-amz-content-sha256' = $empty; 'x-amz-date' = '20130524T000000Z' } -PayloadHash $empty -AccessKey 'AKIAIOSFODNN7EXAMPLE' -SecretKey $exSk -Region 'us-east-1')))
+foreach ($sc in $sigCases) { Assert ($sc[2].Signature -eq $sc[1]) ("the signature matches AWS's example - " + $sc[0]) }
+Assert ((ConvertTo-SebUriEncoded -Text '/a b/c+d/e$f~g.h_i-j' -KeepSlash) -eq '/a%20b/c%2Bd/e%24f~g.h_i-j') 'paths are RFC 3986-encoded, slashes kept'
+Assert ((ConvertTo-SebUriEncoded ('caf' + [char]0xE9)) -eq 'caf%C3%A9') 'non-ASCII is percent-encoded as UTF-8'
+
+# ---- OFF-2. pure pieces: plan, lock, addressing, candidates, backlog ----------------
+$p = Get-SebUploadPlan -Size 64MB
+Assert (-not $p.Multipart) 'up to 64 MB goes in one PUT'
+$p = Get-SebUploadPlan -Size (150MB)
+Assert ($p.Multipart -and @($p.Parts).Count -eq 3 -and $p.Parts[2].Offset -eq 128MB -and $p.Parts[2].Length -eq 22MB) 'above that: 64 MB parts, the last one the remainder'
+$until = [datetime]::SpecifyKind([datetime]'2026-10-25 10:00:00', 'Utc')
+Assert (Test-SebOffsiteLock -Headers @{ 'x-amz-object-lock-mode' = 'COMPLIANCE'; 'x-amz-object-lock-retain-until-date' = '2026-10-25T10:00:00.000Z' } -Mode 'COMPLIANCE' -RetainUntilUtc $until) 'a lock read back as asked is accepted'
+Assert (-not (Test-SebOffsiteLock -Headers @{ 'x-amz-object-lock-retain-until-date' = '2026-10-25T10:00:00Z' } -Mode 'COMPLIANCE' -RetainUntilUtc $until)) 'no lock mode on the object: refused'
+Assert (-not (Test-SebOffsiteLock -Headers @{ 'x-amz-object-lock-mode' = 'GOVERNANCE'; 'x-amz-object-lock-retain-until-date' = '2026-10-25T10:00:00Z' } -Mode 'COMPLIANCE' -RetainUntilUtc $until)) 'a weaker mode than asked: refused'
+Assert (-not (Test-SebOffsiteLock -Headers @{ 'x-amz-object-lock-mode' = 'COMPLIANCE'; 'x-amz-object-lock-retain-until-date' = '2026-10-24T10:00:00Z' } -Mode 'COMPLIANCE' -RetainUntilUtc $until)) 'a shorter lock than asked: refused'
+Assert (Test-SebOffsiteEndpoint 'https://s3.eu-west-1.amazonaws.com') 'an https endpoint is accepted'
+Assert (-not (Test-SebOffsiteEndpoint 'http://s3.example.com')) 'plain http to a remote store is refused'
+$aws = Get-SebOffsiteConfig ([pscustomobject]@{ OffsiteEndpoint = 'https://s3.eu-west-1.amazonaws.com'; OffsiteBucket = 'bk' })
+$t = Get-SebS3Target -Offsite $aws -Key 'p/H/I/db/hourly/x.bak'
+Assert ($t.Host -eq 'bk.s3.eu-west-1.amazonaws.com' -and $t.Path -eq '/p/H/I/db/hourly/x.bak') 'AWS: virtual-hosted addressing'
+$minio = Get-SebOffsiteConfig ([pscustomobject]@{ OffsiteEndpoint = 'https://minio.local:9000'; OffsiteBucket = 'bk' })
+$t = Get-SebS3Target -Offsite $minio -Key 'k/x.bak'
+Assert ($t.Host -eq 'minio.local:9000' -and $t.Path -eq '/bk/k/x.bak') 'others: path-style, port in the Host header'
+Assert ($aws.LockMode -eq 'COMPLIANCE' -and $aws.LockDays -eq 30 -and $aws.Prefix -eq 'sqlexpress-backup') 'defaults: COMPLIANCE, 30 days, a fixed prefix'
+$cd = Join-Path $env:TEMP ('seb-off-' + [Guid]::NewGuid().ToString('N'))
+try {
+  $hostDir = Join-Path $cd 'HOST\INST'
+  foreach ($rel in @('db\hourly\db_20260925-010000.bak.enc', 'db\hourly\db_20260925-010000.bak.enc.meta.json', 'db\log\db_20260925-011500.trn', 'encryption-key-0123456789abcdef.json', 'db\hourly\notes.txt')) {
+    $f = Join-Path $hostDir $rel; [void](New-Item -ItemType Directory -Path (Split-Path -Parent $f) -Force); Set-Content -LiteralPath $f -Value 'x'
+  }
+  (Get-Item (Join-Path $hostDir 'db\log\db_20260925-011500.trn')).LastWriteTimeUtc = [datetime]'2026-09-25 01:15'
+  (Get-Item (Join-Path $hostDir 'db\hourly\db_20260925-010000.bak.enc')).LastWriteTimeUtc = [datetime]'2026-09-25 01:00'
+  $cands = @(Get-SebOffsiteCandidates -ShareHostDir $hostDir -Prefix 'pre' -HostLabel 'HOST' -InstanceLabel 'INST')
+  $ckeys = @($cands | ForEach-Object { $_.Key })
+  Assert ($ckeys -contains 'pre/HOST/INST/db/hourly/db_20260925-010000.bak.enc' -and $ckeys -contains 'pre/HOST/INST/db/hourly/db_20260925-010000.bak.enc.meta.json' -and $ckeys -contains 'pre/HOST/INST/encryption-key-0123456789abcdef.json') 'backups, their sidecars and the key escrow all go offsite, keyed like the share'
+  Assert (-not ($ckeys -like '*notes.txt')) 'anything else in the folder does not'
+  Assert ($cands[0].Key -like '*db_20260925-010000.bak.enc' -and ([array]::IndexOf($ckeys, 'pre/HOST/INST/db/log/db_20260925-011500.trn') -gt 0)) 'oldest first, so a chain arrives in order'
+  $objs = [pscustomobject]@{ 'pre/HOST/INST/db/log/db_20260925-011500.trn' = [pscustomobject]@{ Size = $cands[([array]::IndexOf($ckeys, 'pre/HOST/INST/db/log/db_20260925-011500.trn'))].Size } }
+  Assert (@(Get-SebOffsitePending -Candidates $cands -Objects $objs).Count -eq ($cands.Count - 1)) 'what is recorded at the same size is not sent again'
+}
+finally { Remove-Item -LiteralPath $cd -Recurse -Force -ErrorAction SilentlyContinue }
+$now = [datetime]::SpecifyKind([datetime]'2026-09-26 12:00', 'Utc')
+$c = @(Get-SebOffsiteConditions -Result ([pscustomobject]@{ Uploaded = 0; Failed = 0; Unlocked = 0; Backlog = 3; OldestPendingUtc = $now.AddHours(-24).ToString('o'); Error = '' }) -BacklogHours 24 -NowUtc $now)
+Assert ($c.Count -eq 1 -and $c[0].Key -eq 'offsite-backlog' -and $c[0].Severity -eq 'critical') 'a day-old backlog is critical'
+$c = @(Get-SebOffsiteConditions -Result ([pscustomobject]@{ Uploaded = 5; Failed = 0; Unlocked = 0; Backlog = 1; OldestPendingUtc = $now.AddHours(-2).ToString('o'); Error = '' }) -BacklogHours 24 -NowUtc $now)
+Assert ($c.Count -eq 0) 'a short backlog after a good run: nothing'
+$c = @(Get-SebOffsiteConditions -Result ([pscustomobject]@{ Uploaded = 0; Failed = 1; Unlocked = 1; Backlog = 1; OldestPendingUtc = ''; Error = 'x' }) -BacklogHours 24 -NowUtc $now)
+Assert ((@($c | ForEach-Object { $_.Key }) -contains 'offsite-lock-missing') -and (@($c | ForEach-Object { $_.Key }) -contains 'offsite-failed')) 'an unlocked copy is its own critical alert, besides the failure'
+
+# ---- OFF-3. transport, against a loopback fake S3 ------------------------------------
+# Checks what matters on the wire: a signature is present, Content-MD5 matches the body,
+# every upload asks for a lock, multipart assembles in order. -NoLock makes it behave like a
+# bucket without Object Lock (it stores, but HEAD shows no lock).
+function Start-FakeS3 {
+  param([switch]$NoLock)
+  $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback, 0)
+  $listener.Start()
+  $store = [hashtable]::Synchronized(@{})
+  $log = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+  $ps = [powershell]::Create()
+  [void]$ps.AddScript({
+      param($listener, $store, $log, $noLock)
+      function ReadLine($s) { $b = New-Object System.Collections.Generic.List[byte]; while ($true) { $x = $s.ReadByte(); if ($x -lt 0) { break }; if ($x -eq 10) { break }; if ($x -ne 13) { $b.Add([byte]$x) } }; return [System.Text.Encoding]::ASCII.GetString($b.ToArray()) }
+      function Respond($s, $code, $hdrs, [byte[]]$body) {
+        if ($null -eq $body) { $body = New-Object byte[] 0 }
+        $t = "HTTP/1.1 $code X`r`nConnection: close`r`nContent-Length: $($body.Length)`r`n"
+        foreach ($k in $hdrs.Keys) { $t += "${k}: $($hdrs[$k])`r`n" }
+        $h = [System.Text.Encoding]::ASCII.GetBytes($t + "`r`n"); $s.Write($h, 0, $h.Length); $s.Write($body, 0, $body.Length); $s.Flush()
+      }
+      $md5 = [System.Security.Cryptography.MD5]::Create()
+      while ($true) {
+        try { $client = $listener.AcceptTcpClient() } catch { break }
+        try {
+          $s = $client.GetStream()
+          $first = ReadLine $s; $hd = @{}
+          while (($l = ReadLine $s) -ne '') { $i = $l.IndexOf(':'); $hd[$l.Substring(0, $i).Trim().ToLowerInvariant()] = $l.Substring($i + 1).Trim() }
+          if ($hd['expect'] -eq '100-continue') { $c = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 100 Continue`r`n`r`n"); $s.Write($c, 0, $c.Length) }
+          $len = 0; if ($hd.ContainsKey('content-length')) { $len = [int]$hd['content-length'] }
+          $body = New-Object byte[] $len; $got = 0; while ($got -lt $len) { $n = $s.Read($body, $got, $len - $got); if ($n -le 0) { break }; $got += $n }
+          $parts = $first.Split(' '); $method = $parts[0]; $url = $parts[1]
+          $path = [System.Uri]::UnescapeDataString(($url -split '\?', 2)[0]); $q = @{}
+          if ($url.Contains('?')) { foreach ($kv in ($url -split '\?', 2)[1].Split('&')) { $kv2 = $kv.Split('=', 2); $q[$kv2[0]] = $(if ($kv2.Count -gt 1) { [System.Uri]::UnescapeDataString($kv2[1]) } else { '' }) } }
+          [void]$log.Add([pscustomobject]@{ Method = $method; Path = $path; Query = $q; Headers = $hd; Size = $len })
+          if (-not $hd.ContainsKey('authorization') -or $hd['authorization'] -notlike 'AWS4-HMAC-SHA256 Credential=*') { Respond $s 403 @{} ([System.Text.Encoding]::ASCII.GetBytes('<Error><Code>AccessDenied</Code><Message>unsigned</Message></Error>')); continue }
+          if ($hd.ContainsKey('content-md5') -and $hd['content-md5'] -ne [Convert]::ToBase64String($md5.ComputeHash($body))) { Respond $s 400 @{} ([System.Text.Encoding]::ASCII.GetBytes('<Error><Code>BadDigest</Code><Message>md5</Message></Error>')); continue }
+          $hex = (($md5.ComputeHash($body) | ForEach-Object { $_.ToString('x2') }) -join '')
+          if ($method -eq 'PUT' -and $q.ContainsKey('partNumber')) { $store['part:' + $q['uploadId'] + ':' + $q['partNumber']] = $body; Respond $s 200 @{ ETag = '"' + $hex + '"' } $null }
+          elseif ($method -eq 'PUT') {
+            if (-not $hd.ContainsKey('x-amz-object-lock-mode') -or -not $hd.ContainsKey('content-md5')) { Respond $s 400 @{} ([System.Text.Encoding]::ASCII.GetBytes('<Error><Code>InvalidRequest</Code><Message>lock and Content-MD5 required</Message></Error>')); continue }
+            $store[$path] = @{ Body = $body; Mode = $hd['x-amz-object-lock-mode']; Until = $hd['x-amz-object-lock-retain-until-date'] }; Respond $s 200 @{ ETag = '"' + $hex + '"' } $null
+          }
+          elseif ($method -eq 'POST' -and $q.ContainsKey('uploads')) { $id = [Guid]::NewGuid().ToString('N'); $store['mp:' + $id] = @{ Path = $path; Mode = $hd['x-amz-object-lock-mode']; Until = $hd['x-amz-object-lock-retain-until-date'] }; Respond $s 200 @{} ([System.Text.Encoding]::ASCII.GetBytes("<InitiateMultipartUploadResult><UploadId>$id</UploadId></InitiateMultipartUploadResult>")) }
+          elseif ($method -eq 'POST' -and $q.ContainsKey('uploadId')) {
+            $mp = $store['mp:' + $q['uploadId']]; $ms = New-Object System.IO.MemoryStream
+            foreach ($m in [regex]::Matches([System.Text.Encoding]::UTF8.GetString($body), '<PartNumber>(\d+)</PartNumber>')) { $pb = $store['part:' + $q['uploadId'] + ':' + $m.Groups[1].Value]; $ms.Write($pb, 0, $pb.Length) }
+            $store[$mp.Path] = @{ Body = $ms.ToArray(); Mode = $mp.Mode; Until = $mp.Until }; Respond $s 200 @{} ([System.Text.Encoding]::ASCII.GetBytes('<CompleteMultipartUploadResult><ETag>"x-2"</ETag></CompleteMultipartUploadResult>'))
+          }
+          elseif ($method -eq 'HEAD') {
+            $o = $store[$path]
+            if ($null -eq $o) { Respond $s 404 @{} $null; continue }
+            $h = @{ ETag = '"x"' }; if (-not $noLock) { $h['x-amz-object-lock-mode'] = $o.Mode; $h['x-amz-object-lock-retain-until-date'] = $o.Until }
+            $h2 = [System.Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`nConnection: close`r`nContent-Length: $($o.Body.Length)`r`n" + (($h.Keys | ForEach-Object { "${_}: $($h[$_])`r`n" }) -join '') + "`r`n"); $s.Write($h2, 0, $h2.Length); $s.Flush()
+          }
+          elseif ($method -eq 'GET' -and $q['list-type'] -eq '2') {
+            $pre = $path.TrimEnd('/') + '/' + $q['prefix']
+            $xml = '<ListBucketResult><IsTruncated>false</IsTruncated>'
+            foreach ($k in @($store.Keys | Where-Object { $_ -like ($pre + '*') -and $_ -notlike 'part:*' -and $_ -notlike 'mp:*' } | Sort-Object)) { $xml += '<Contents><Key>' + $k.Substring($path.TrimEnd('/').Length + 1) + '</Key><Size>' + $store[$k].Body.Length + '</Size></Contents>' }
+            Respond $s 200 @{} ([System.Text.Encoding]::UTF8.GetBytes($xml + '</ListBucketResult>'))
+          }
+          elseif ($method -eq 'GET') { $o = $store[$path]; if ($null -eq $o) { Respond $s 404 @{} $null } else { Respond $s 200 @{} $o.Body } }
+          elseif ($method -eq 'DELETE') { Respond $s 204 @{} $null }
+          else { Respond $s 400 @{} $null }
+        }
+        catch { }
+        finally { $client.Close() }
+      }
+    }).AddArgument($listener).AddArgument($store).AddArgument($log).AddArgument([bool]$NoLock)
+  [void]$ps.BeginInvoke()
+  return [pscustomobject]@{ Endpoint = ('http://127.0.0.1:{0}' -f ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port); Listener = $listener; Store = $store; Log = $log; Ps = $ps }
+}
+function Stop-FakeS3($f) { try { $f.Listener.Stop() } catch { }; try { $f.Ps.Stop(); $f.Ps.Dispose() } catch { } }
+
+$offRoot = Join-Path $env:TEMP ('seb-offt-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $offRoot -Force)
+$fake = Start-FakeS3
+$savedPart = $script:SebS3PartBytes
+try {
+  $os = Get-SebOffsiteConfig ([pscustomobject]@{ OffsiteEndpoint = $fake.Endpoint; OffsiteBucket = 'bk'; OffsiteLockDays = 30 })
+  $cred = @{ AccessKeyId = 'AKIDTEST'; SecretAccessKey = 'secret' }
+  $small = Join-Path $offRoot 'small.bak'; $bytes = New-Object byte[] 300000; (New-Object Random 3).NextBytes($bytes); [IO.File]::WriteAllBytes($small, $bytes)
+  $until = (Get-Date).ToUniversalTime().AddDays(30)
+  $rec = Send-SebOffsiteObject -Offsite $os -Secrets $cred -Key 'pre/H/I/db/hourly/small.bak' -Path $small -RetainUntilUtc $until
+  $put = @($fake.Log | Where-Object { $_.Method -eq 'PUT' })[0]
+  Assert ($put.Headers['x-amz-object-lock-mode'] -eq 'COMPLIANCE' -and $put.Headers.ContainsKey('x-amz-object-lock-retain-until-date')) 'a single PUT asks for the COMPLIANCE lock and its date'
+  Assert ($put.Headers.ContainsKey('content-md5') -and $put.Headers['x-amz-content-sha256'] -match '^[0-9a-f]{64}$') 'with Content-MD5 and the payload hash (the fake checked the MD5 against the body)'
+  Assert ($put.Path -eq '/bk/pre/H/I/db/hourly/small.bak') 'path-style to a non-AWS endpoint'
+  Assert ([Convert]::ToBase64String($fake.Store['/bk/pre/H/I/db/hourly/small.bak'].Body) -eq [Convert]::ToBase64String($bytes)) 'the stored object is the file, byte for byte'
+  Assert (@($fake.Log | Where-Object { $_.Method -eq 'HEAD' }).Count -eq 1) 'and the lock was read back with a HEAD'
+  $script:SebS3PartBytes = 100000
+  $rec2 = Send-SebOffsiteObject -Offsite $os -Secrets $cred -Key 'pre/H/I/db/hourly/big.bak' -Path $small -RetainUntilUtc $until
+  $partPuts = @($fake.Log | Where-Object { $_.Method -eq 'PUT' -and $_.Query.ContainsKey('partNumber') })
+  Assert ($partPuts.Count -eq 3) "a larger file goes up in parts ($($partPuts.Count) of 100 KB)"
+  $initPost = @($fake.Log | Where-Object { $_.Method -eq 'POST' -and $_.Query.ContainsKey('uploads') })[0]
+  Assert ($initPost.Headers['x-amz-object-lock-mode'] -eq 'COMPLIANCE') 'the multipart upload asks for the lock when it starts'
+  Assert ([Convert]::ToBase64String($fake.Store['/bk/pre/H/I/db/hourly/big.bak'].Body) -eq [Convert]::ToBase64String($bytes)) 'and reassembles to the identical file'
+  $script:SebS3PartBytes = $savedPart
+  $listed = @(Get-SebOffsiteList -Offsite $os -Secrets $cred -Prefix 'pre/H/I/')
+  Assert ($listed.Count -eq 2 -and @($listed | Where-Object { $_.Size -eq 300000 }).Count -eq 2) 'listing finds both, with their sizes'
+  $back = Join-Path $offRoot 'back.bak'
+  [void](Invoke-SebS3Request -Offsite $os -Secrets $cred -Method 'GET' -Key 'pre/H/I/db/hourly/big.bak' -OutFile $back)
+  Assert ((Get-FileHash $back).Hash -eq (Get-FileHash $small).Hash) 'and a GET brings one back intact'
+  $msg = ''; try { [void](Invoke-SebS3Request -Offsite $os -Secrets @{ AccessKeyId = ''; SecretAccessKey = '' } -Method 'PUT' -Key 'x' -BodyBytes ([byte[]](1, 2))) } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like '*HTTP 400*' -or $msg -like '*HTTP 403*') "a refused request surfaces the store's status and code ($msg)"
+}
+finally { $script:SebS3PartBytes = $savedPart; Stop-FakeS3 $fake }
+# A bucket without Object Lock: the upload "works", but the lock is not there - refused.
+$nolock = Start-FakeS3 -NoLock
+try {
+  $os = Get-SebOffsiteConfig ([pscustomobject]@{ OffsiteEndpoint = $nolock.Endpoint; OffsiteBucket = 'bk' })
+  $msg = ''; try { [void](Send-SebOffsiteObject -Offsite $os -Secrets @{ AccessKeyId = 'A'; SecretAccessKey = 'S' } -Key 'k/x.bak' -Path (Join-Path $offRoot 'small.bak') -RetainUntilUtc ((Get-Date).ToUniversalTime().AddDays(30))) } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like 'SEB_OFFSITE_UNLOCKED*Object Lock*') 'a copy stored without its lock is an error, never a quiet success'
+}
+finally { Stop-FakeS3 $nolock; Remove-Item -LiteralPath $offRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ======================================================================================
 # ENCRYPTION
 # ======================================================================================
 $encRoot = Join-Path $env:TEMP ('seb-enc-' + [Guid]::NewGuid().ToString('N'))

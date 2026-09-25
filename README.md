@@ -200,6 +200,47 @@ encrypted backup needs an elevated console, because the keys are readable only b
 administrators. The design is in
 [docs/superpowers/specs/2026-09-25-backup-encryption-design.md](docs/superpowers/specs/2026-09-25-backup-encryption-design.md).
 
+## Immutable offsite copy
+
+A Windows share cannot be write-once. Whatever writes the backups owns them, and ransomware
+that gets SYSTEM on the server can delete them. So the tool can also copy every backup to
+**S3-compatible object storage with Object Lock** (AWS S3, Wasabi, Backblaze B2, MinIO, …).
+The storage itself then refuses to delete or overwrite a copy until its lock date, even for
+someone holding the server's credentials.
+
+- **What goes offsite:** exactly what is on the share, including any compression and
+  encryption, the sidecars and the key escrow. A rebuilt server can fetch the backups and
+  its key from offsite.
+- **When:** a separate task every 30 minutes uploads what is not offsite yet. It never
+  holds up the backups: log backups keep running during a long upload.
+- **Locking:** each copy is locked COMPLIANCE for 30 days by default, longer than the
+  share keeps anything. Each lock is read back after upload. A bucket without Object Lock
+  fails at setup, never silently.
+- **The tool never deletes anything offsite.** Use a lifecycle rule on the bucket to
+  expire old versions.
+
+```powershell
+.\Invoke-SqlExpressBackup.ps1 -ConfigureOffsite -OffsiteEndpoint https://s3.eu-west-1.amazonaws.com `
+    -OffsiteRegion eu-west-1 -OffsiteBucket my-locked-bucket     # elevated; prompts for the key, proves a locked upload
+.\Invoke-SqlExpressBackup.ps1 -SyncOffsite                        # one sync now (the task runs it every 30 min)
+.\Invoke-SqlExpressBackup.ps1 -FetchOffsite -Destination D:\FromOffsite [-Database AppDb]
+.\Invoke-SqlExpressBackup.ps1 -RestoreToPoint -Database AppDb -StopAt ... -SharePath D:\FromOffsite
+```
+
+Create the bucket **with Object Lock enabled**, and give the tool a key that can add but
+never remove:
+
+```json
+{ "Version": "2012-10-17", "Statement": [ { "Effect": "Allow",
+  "Action": ["s3:PutObject", "s3:PutObjectRetention", "s3:GetObject", "s3:GetObjectRetention",
+             "s3:ListBucket", "s3:AbortMultipartUpload"],
+  "Resource": ["arn:aws:s3:::my-locked-bucket", "arn:aws:s3:::my-locked-bucket/*"] } ] }
+```
+
+The policy grants no delete and no `s3:BypassGovernanceRetention`. With it, a fully
+compromised server can add objects but cannot remove or shorten a lock. The design is in
+[docs/superpowers/specs/2026-09-25-immutable-offsite-design.md](docs/superpowers/specs/2026-09-25-immutable-offsite-design.md).
+
 ## Restore testing
 
 A backup nobody has restored is only a hope. With restore testing on, a daily task (03:30
@@ -313,7 +354,12 @@ hours. That shipped once. The test now asserts the path the app actually used.
 
 - **A share on the same host is not an offsite copy.** If that disk dies, the backups
   die with it. `Full install` says so before it will proceed. Point setup at a real
-  file server when you have one — the schedule, retention and credential all stay.
+  file server when you have one (the schedule, retention and credential all stay), and
+  turn on the immutable offsite copy.
+- **The offsite copy has been tested against a stand-in S3, not a live store.** Request
+  signing matches AWS's published examples. Locking, multipart upload and a bucket
+  refusing the lock were exercised against a local test server. `-ConfigureOffsite`
+  proves a real locked upload against your bucket before it switches on.
 - **DPAPI is machine-bound.** Sealed credentials do not move between servers; re-run
   setup on the new host.
 - **Point-in-time recovery is opt-in.** By default databases stay in SIMPLE recovery
