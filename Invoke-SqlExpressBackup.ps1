@@ -113,6 +113,16 @@ param(
   # or -AlertPromptSecrets, never from the command line where they would sit in history.
   # Restore testing: -TestRestore runs one test now (the task runs it daily); -RestoreTesting
   # On|Off and -RestoreTestTime set it up on -Setup/-Reschedule (unbound = unchanged).
+  # Encryption. -SetupEncryption makes the key (passphrase + a one-time recovery key);
+  # -ImportEncryptionKey brings a key back onto a rebuilt server from its escrow;
+  # -EncryptBackups On|Off on -Reschedule switches it for new backups (keys are kept).
+  [switch]$SetupEncryption,
+  [switch]$RotateKey,
+  [switch]$ImportEncryptionKey,
+  [string]$EncryptionKeyFile,       # an escrow file to import from, instead of the share
+  [string]$EncryptionSecretsFile,   # DPAPI CurrentUser JSON {Passphrase|RecoveryKey} from the app, deleted after reading
+  [ValidateSet('On', 'Off')]
+  [string]$EncryptBackups = 'Off',
   [switch]$TestRestore,
   [ValidateSet('On', 'Off')]
   [string]$RestoreTesting = 'Off',
@@ -171,6 +181,7 @@ $script:SebShowKeys = @(
   'AlertEmailTo', 'AlertEmailFrom', 'AlertSmtpHost', 'AlertSmtpPort', 'AlertSmtpTls', 'AlertSmtpUser',
   'AlertWebhookKind', 'AlertRemindHours', 'AlertStaleHours', 'AlertPendingMinutes',
   'AlertHasSmtpPassword', 'AlertHasWebhook', 'AlertHasHeartbeat', 'RestoreTesting', 'RestoreTestTime',
+  'EncryptBackups', 'ActiveKeyId',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -353,7 +364,7 @@ function Get-SebSidecarName { param([string]$Name) return ($Name + '.meta.json')
 # file. The stamp is baked into the name at BACKUP time and never changes after.
 function Get-SebStampFromName {
   param([string]$Name, [datetime]$Fallback)
-  $match = [regex]::Match($Name, '_(\d{8})-(\d{6})\.(bak|dif|trn)(\.zip)?$')
+  $match = [regex]::Match($Name, '_(\d{8})-(\d{6})\.(bak|dif|trn)(\.zip)?(\.enc)?$')
   if (-not $match.Success) { return $Fallback }
   $parsed = [datetime]::MinValue
   $ok = [datetime]::TryParseExact(
@@ -702,6 +713,312 @@ function Unprotect-SebSecureString {
     if ($null -ne $chars) { [System.Array]::Clear($chars, 0, $chars.Length) }
     [System.Array]::Clear($bytes, 0, $bytes.Length)
   }
+}
+
+# =====================================================================
+# Backup encryption. SQL Express cannot encrypt a backup itself, so the file is
+# encrypted after SQL writes it: compress -> encrypt -> copy.
+#
+# File layout: "SEBENC01" (8) | key id (16 ASCII hex) | IV (16) | AES-256-CBC
+# ciphertext | HMAC-SHA256 (32) over everything before it. Encrypt-then-MAC with
+# separate keys derived from the data key, the same construction as the credential
+# seal. Streamed, pure .NET - no Add-Type, which application control can block.
+# =====================================================================
+
+$script:SebEncMagic = 'SEBENC01'
+$script:SebEncHeaderLength = 40   # magic 8 + key id 16 + IV 16
+
+# The first 8 bytes of SHA-256 of the key, in hex: names a key in every file header, so
+# the right one is found in the keyring instead of guessed.
+function Get-SebKeyId {
+  param([byte[]]$Key)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try { $h = $sha.ComputeHash($Key) } finally { $sha.Dispose() }
+  return (($h[0..7] | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function New-SebRandomBytes {
+  param([int]$Count)
+  $b = New-Object byte[] $Count
+  $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+  try { $rng.GetBytes($b) } finally { $rng.Dispose() }
+  return , $b
+}
+
+# HMAC over a byte range of an open stream, in chunks - a 10 GB backup is never in memory.
+function Get-SebStreamMac {
+  param([System.IO.Stream]$Stream, [long]$Length, [byte[]]$MacKey)
+  $mac = New-Object System.Security.Cryptography.HMACSHA256(, $MacKey)
+  try {
+    $buf = New-Object byte[] 1048576
+    [void]$Stream.Seek(0, [System.IO.SeekOrigin]::Begin)
+    $left = $Length
+    while ($left -gt 0) {
+      $want = [int][math]::Min([long]$buf.Length, $left)
+      $n = $Stream.Read($buf, 0, $want)
+      if ($n -le 0) { throw 'the file ended early' }
+      [void]$mac.TransformBlock($buf, 0, $n, $null, 0)
+      $left -= $n
+    }
+    [void]$mac.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+    return , $mac.Hash
+  }
+  finally { $mac.Dispose() }
+}
+
+function Protect-SebFile {
+  param([string]$Source, [string]$Destination, [byte[]]$Key)
+  $encKey = Get-SebSubKey -Master $Key -Label 'seb-file-enc-v1'
+  $macKey = Get-SebSubKey -Master $Key -Label 'seb-file-mac-v1'
+  $aes = [System.Security.Cryptography.Aes]::Create()
+  $in = $null; $out = $null
+  try {
+    $aes.KeySize = 256
+    $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = $encKey
+    $aes.GenerateIV()
+    $in = [System.IO.File]::OpenRead($Source)
+    $out = New-Object System.IO.FileStream($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    $header = [byte[]]([System.Text.Encoding]::ASCII.GetBytes($script:SebEncMagic + (Get-SebKeyId $Key)) + $aes.IV)
+    $out.Write($header, 0, $header.Length)
+    $cs = New-Object System.Security.Cryptography.CryptoStream($out, $aes.CreateEncryptor(), [System.Security.Cryptography.CryptoStreamMode]::Write, $true)
+    try { $in.CopyTo($cs, 1048576); $cs.FlushFinalBlock() } finally { $cs.Dispose() }
+    $tag = Get-SebStreamMac -Stream $out -Length $out.Length -MacKey $macKey
+    [void]$out.Seek(0, [System.IO.SeekOrigin]::End)
+    $out.Write($tag, 0, $tag.Length)
+  }
+  catch {
+    if ($null -ne $out) { $out.Dispose(); $out = $null }
+    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue   # never leave a half-written .enc
+    throw
+  }
+  finally {
+    if ($null -ne $in) { $in.Dispose() }
+    if ($null -ne $out) { $out.Dispose() }
+    [System.Array]::Clear($encKey, 0, $encKey.Length); [System.Array]::Clear($macKey, 0, $macKey.Length)
+    $aes.Dispose()
+  }
+}
+
+# The key id an encrypted file was written with, or '' for a file that is not one.
+function Get-SebEncryptedKeyId {
+  param([string]$Path)
+  $fs = [System.IO.File]::OpenRead($Path)
+  try {
+    if ($fs.Length -lt ($script:SebEncHeaderLength + 32)) { return '' }
+    $h = New-Object byte[] 24
+    [void]$fs.Read($h, 0, 24)
+    $text = [System.Text.Encoding]::ASCII.GetString($h)
+    if (-not $text.StartsWith($script:SebEncMagic, [System.StringComparison]::Ordinal)) { return '' }
+    return $text.Substring(8)
+  }
+  finally { $fs.Dispose() }
+}
+
+# Verify the whole file, THEN decrypt: a tampered or truncated backup is refused before a
+# byte of it reaches RESTORE. Keyring is { keyId = [byte[]] }.
+function Unprotect-SebFile {
+  param([string]$Source, [string]$Destination, [hashtable]$Keyring)
+  $keyId = Get-SebEncryptedKeyId -Path $Source
+  if ($keyId -eq '') { throw ('{0} is not an encrypted backup (or is damaged beyond reading its header)' -f (Split-Path -Leaf $Source)) }
+  if ($null -eq $Keyring -or -not $Keyring.ContainsKey($keyId)) {
+    throw ('{0} was encrypted with key {1}, which this server does not have. On a rebuilt server, run -ImportEncryptionKey with the passphrase or the recovery key.' -f (Split-Path -Leaf $Source), $keyId)
+  }
+  $key = $Keyring[$keyId]
+  $encKey = Get-SebSubKey -Master $key -Label 'seb-file-enc-v1'
+  $macKey = Get-SebSubKey -Master $key -Label 'seb-file-mac-v1'
+  $aes = [System.Security.Cryptography.Aes]::Create()
+  $in = $null; $out = $null
+  try {
+    $in = [System.IO.File]::OpenRead($Source)
+    $bodyLength = $in.Length - 32
+    $expected = Get-SebStreamMac -Stream $in -Length $bodyLength -MacKey $macKey
+    $tag = New-Object byte[] 32
+    [void]$in.Seek($bodyLength, [System.IO.SeekOrigin]::Begin)
+    [void]$in.Read($tag, 0, 32)
+    if (-not (Test-SebFixedTimeEqual -Left $expected -Right $tag)) {
+      throw ('{0} failed its integrity check - it has been altered or damaged, and was not restored' -f (Split-Path -Leaf $Source))
+    }
+    $iv = New-Object byte[] 16
+    [void]$in.Seek(24, [System.IO.SeekOrigin]::Begin)
+    [void]$in.Read($iv, 0, 16)
+    $aes.KeySize = 256
+    $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $aes.Key = $encKey
+    $aes.IV = $iv
+    $out = New-Object System.IO.FileStream($Destination, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $cs = New-Object System.Security.Cryptography.CryptoStream($out, $aes.CreateDecryptor(), [System.Security.Cryptography.CryptoStreamMode]::Write, $true)
+    try {
+      $buf = New-Object byte[] 1048576
+      $left = $bodyLength - $script:SebEncHeaderLength
+      while ($left -gt 0) {
+        $n = $in.Read($buf, 0, [int][math]::Min([long]$buf.Length, $left))
+        if ($n -le 0) { throw 'the file ended early' }
+        $cs.Write($buf, 0, $n)
+        $left -= $n
+      }
+      $cs.FlushFinalBlock()
+    }
+    finally { $cs.Dispose() }
+  }
+  catch {
+    if ($null -ne $out) { $out.Dispose(); $out = $null }
+    Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+    throw
+  }
+  finally {
+    if ($null -ne $in) { $in.Dispose() }
+    if ($null -ne $out) { $out.Dispose() }
+    [System.Array]::Clear($encKey, 0, $encKey.Length); [System.Array]::Clear($macKey, 0, $macKey.Length)
+    $aes.Dispose()
+  }
+}
+
+# ---- keys: recovery key, escrow, keyring --------------------------------------------
+
+# 32 random bytes as 64 hex characters in groups of 8 - long, but it is typed once in a
+# disaster, and hex survives being read aloud, printed, and retyped.
+function Format-SebRecoveryKey {
+  param([byte[]]$Bytes)
+  $hex = (($Bytes | ForEach-Object { $_.ToString('X2') }) -join '')
+  return ((0..7 | ForEach-Object { $hex.Substring($_ * 8, 8) }) -join '-')
+}
+
+function ConvertFrom-SebRecoveryKey {
+  param([string]$Text)
+  $hex = ($Text -replace '[\s-]', '').ToUpperInvariant()
+  if ($hex -notmatch '^[0-9A-F]{64}$') { throw 'a recovery key is 64 hexadecimal characters (dashes and spaces are ignored)' }
+  $b = New-Object byte[] 32
+  for ($i = 0; $i -lt 32; $i++) { $b[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
+  return , $b
+}
+
+function Get-SebPassphraseKek {
+  param([string]$Passphrase, [byte[]]$Salt, [int]$Iterations)
+  $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($Passphrase, $Salt, $Iterations, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+  try { return , $kdf.GetBytes(32) } finally { $kdf.Dispose() }
+}
+
+# The recovery key is 256 random bits already - no stretching needed, only separation
+# from every other use of those bits.
+function Get-SebRecoveryKek {
+  param([byte[]]$RecoveryKey)
+  return , (Get-SebSubKey -Master $RecoveryKey -Label 'seb-recovery-kek-v1')
+}
+
+function Test-SebPassphrase {
+  param([string]$Passphrase)
+  if ([string]::IsNullOrEmpty($Passphrase) -or $Passphrase.Length -lt 12) { throw 'the passphrase must be at least 12 characters - it is all that protects the key copy on the share' }
+}
+
+# The escrow: the data key wrapped twice, by the passphrase and by the recovery key. It
+# holds nothing usable without one of them.
+function New-SebEscrow {
+  param([byte[]]$DataKey, [string]$Passphrase, [byte[]]$RecoveryKey, [int]$Iterations = 600000, [string]$HostName = $env:COMPUTERNAME, [string]$InstanceLabel = '')
+  Test-SebPassphrase $Passphrase
+  $salt = New-SebRandomBytes 16
+  $pk = Get-SebPassphraseKek -Passphrase $Passphrase -Salt $salt -Iterations $Iterations
+  $rk = Get-SebRecoveryKek -RecoveryKey $RecoveryKey
+  try {
+    return [pscustomobject]@{
+      Version = 1; KeyId = (Get-SebKeyId $DataKey); Kdf = 'PBKDF2-SHA256'; Iterations = $Iterations
+      Salt = [Convert]::ToBase64String($salt)
+      PassphraseWrapped = (Protect-SebBytes -Plain $DataKey -Master $pk)
+      RecoveryWrapped = (Protect-SebBytes -Plain $DataKey -Master $rk)
+      CreatedUtc = (Get-Date).ToUniversalTime().ToString('o'); Host = $HostName; Instance = $InstanceLabel
+    }
+  }
+  finally { [System.Array]::Clear($pk, 0, $pk.Length); [System.Array]::Clear($rk, 0, $rk.Length) }
+}
+
+# Unwrap with the passphrase OR the recovery key. A wrong one fails the HMAC, never
+# yields a wrong key.
+function Open-SebEscrow {
+  param($Escrow, [string]$Passphrase = '', [string]$RecoveryKey = '')
+  if ([string]$Escrow.Kdf -ne 'PBKDF2-SHA256') { throw ('unknown key-derivation {0} in the escrow' -f $Escrow.Kdf) }
+  $kek = $null
+  $blob = ''
+  if ($RecoveryKey -ne '') { $kek = Get-SebRecoveryKek -RecoveryKey (ConvertFrom-SebRecoveryKey $RecoveryKey); $blob = [string]$Escrow.RecoveryWrapped }
+  elseif ($Passphrase -ne '') { $kek = Get-SebPassphraseKek -Passphrase $Passphrase -Salt ([Convert]::FromBase64String([string]$Escrow.Salt)) -Iterations ([int]$Escrow.Iterations); $blob = [string]$Escrow.PassphraseWrapped }
+  else { throw 'give the passphrase or the recovery key' }
+  try {
+    try { $key = [byte[]](Unprotect-SebBytes -Blob $blob -Master $kek) }
+    catch { throw 'that passphrase or recovery key does not open this key' }
+    if ((Get-SebKeyId $key) -ne [string]$Escrow.KeyId) { throw 'the unwrapped key does not match the escrow''s key id' }
+    return , $key
+  }
+  finally { [System.Array]::Clear($kek, 0, $kek.Length) }
+}
+
+function Get-SebKeyringPath { return (Join-Path $script:SebConfigDir 'keyring.dat') }
+# One escrow per key, so a rotated-away key stays recoverable for the backups it wrote.
+function Get-SebEscrowName { param([string]$KeyId) return ('encryption-key-{0}.json' -f $KeyId) }
+function Get-SebEscrowShareDir {
+  param($Config)
+  return (Join-Path (Join-Path ([string]$Config.SharePath) (Get-SebSafeName $env:COMPUTERNAME)) (Get-SebSafeName ([string]$Config.InstanceName)))
+}
+
+# Put every local escrow on the share, beside the backups it unlocks, if it is missing or
+# different there. Run by the data pass (SYSTEM, which can already write the share) - the
+# operator who ran -SetupEncryption may not be able to. Returns whether all are there.
+function Sync-SebEscrowToShare {
+  param($Config)
+  $local = @(Get-ChildItem -LiteralPath $script:SebConfigDir -Filter 'encryption-key-*.json' -File -ErrorAction SilentlyContinue)
+  if ($local.Count -eq 0) { return $false }
+  $dir = Get-SebEscrowShareDir -Config $Config
+  $allThere = $true
+  foreach ($f in $local) {
+    $dest = Join-Path $dir $f.Name
+    try {
+      $same = (Test-Path -LiteralPath $dest) -and ((Get-Content -LiteralPath $dest -Raw) -eq (Get-Content -LiteralPath $f.FullName -Raw))
+      if (-not $same) {
+        if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
+        Copy-Item -LiteralPath $f.FullName -Destination $dest -Force
+        Write-SebLog ('encryption key escrow {0} copied to the share' -f $f.Name)
+      }
+    }
+    catch { $allThere = $false; Write-SebLog ('could not put the encryption key escrow {0} on the share: {1}' -f $f.Name, $_.Exception.Message) 'WARN' }
+  }
+  return $allThere
+}
+
+# { keyId = [byte[]] } for every key this server can decrypt with, sealed to the machine.
+function Read-SebKeyring {
+  $path = Get-SebKeyringPath
+  $ring = @{}
+  if (-not (Test-Path -LiteralPath $path)) { return $ring }
+  $master = Get-SebMasterKey
+  try {
+    $obj = (Unprotect-SebString -Blob ((Get-Content -LiteralPath $path -Raw).Trim()) -Master $master) | ConvertFrom-Json
+    foreach ($p in @($obj.PSObject.Properties)) { $ring[$p.Name] = [Convert]::FromBase64String([string]$p.Value) }
+  }
+  finally { [System.Array]::Clear($master, 0, $master.Length) }
+  return $ring
+}
+
+function Write-SebKeyring {
+  param([hashtable]$Keyring)
+  $map = [ordered]@{}
+  foreach ($k in @($Keyring.Keys | Sort-Object)) { $map[$k] = [Convert]::ToBase64String($Keyring[$k]) }
+  $master = Get-SebMasterKey -Create
+  try { $blob = Protect-SebString -Plain ($map | ConvertTo-Json -Compress) -Master $master }
+  finally { [System.Array]::Clear($master, 0, $master.Length) }
+  $path = Get-SebKeyringPath
+  Set-Content -LiteralPath $path -Value $blob -Encoding ASCII
+  Set-SebSecretAcl $path
+}
+
+# The key new backups are encrypted with, from config and the keyring - or a clear refusal.
+function Get-SebActiveEncryptionKey {
+  param($Config)
+  $id = ''
+  if ($Config.PSObject.Properties['ActiveKeyId']) { $id = [string]$Config.ActiveKeyId }
+  if ($id -eq '') { throw 'encryption is on but no key has been set up - run -SetupEncryption' }
+  $ring = Read-SebKeyring
+  if (-not $ring.ContainsKey($id)) { throw ('encryption is on but key {0} is not in this server''s keyring - run -ImportEncryptionKey' -f $id) }
+  return , $ring[$id]
 }
 
 # SYSTEM and Administrators, inheritance off. These files are the whole point of
@@ -1123,6 +1440,18 @@ function Get-SebSetupCarryOver {
     }
   }
   return $out
+}
+
+# Setup's fresh config, plus every key of the previous one that setup does not set itself
+# (alerting, the active encryption key, OnlyDatabase ...), and the original CreatedUtc.
+function Merge-SebPreservedConfig {
+  param($New, $Previous)
+  if ($null -eq $Previous) { return $New }
+  foreach ($p in @($Previous.PSObject.Properties)) {
+    if ($p.Name -eq 'CreatedUtc') { Add-Member -InputObject $New -MemberType NoteProperty -Name 'CreatedUtc' -Value $p.Value -Force; continue }
+    if (-not $New.PSObject.Properties[$p.Name]) { Add-Member -InputObject $New -MemberType NoteProperty -Name $p.Name -Value $p.Value }
+  }
+  return $New
 }
 
 function Write-SebConfig {
@@ -1704,6 +2033,29 @@ function Read-SebAlertSecretsFile {
   }
 }
 
+function Show-SebEncryptionStatus {
+  $config = Read-SebConfig
+  Write-Host ''
+  Write-Host '== Encryption ========================================================='
+  $on = ($config.PSObject.Properties['EncryptBackups'] -and [bool]$config.EncryptBackups)
+  $active = ''
+  if ($config.PSObject.Properties['ActiveKeyId']) { $active = [string]$config.ActiveKeyId }
+  if (-not $on) {
+    if ($active -eq '') { Write-Host '   off - set up with -SetupEncryption (a passphrase and a one-time recovery key)' }
+    else { Write-Host ('   off for new backups (key {0} kept) - -Reschedule -EncryptBackups On to resume' -f $active) }
+  }
+  else { Write-Host ('   on - new backups are encrypted with key {0}' -f $active) }
+  $ids = @()
+  try { $ids = @((Read-SebKeyring).Keys) } catch { Write-Host '   (the keyring could not be read)' }
+  if ($ids.Count -gt 0) { Write-Host ('   keys this server holds: {0}' -f ($ids -join ', ')) }
+  if ($active -ne '') {
+    $escrow = Join-Path (Get-SebEscrowShareDir -Config $config) (Get-SebEscrowName $active)
+    $there = $false
+    try { $there = Test-Path -LiteralPath $escrow } catch { }
+    Write-Host ('   key escrow on the share: {0}' -f $(if ($there) { 'yes' } else { 'NO - the next backup pass copies it; until then only the recovery key can restore on another server' }))
+  }
+}
+
 function Show-SebRestoreTestStatus {
   $config = Read-SebConfig
   Write-Host ''
@@ -2100,12 +2452,27 @@ function Expand-SebFile {
 # The expanded file lands in StagingDir so it is readable by the SQL service account (the same
 # account RESTORE runs as) and is cleaned up by the caller after the restore.
 function Resolve-SebRestoreSource {
-  param([string]$File, [string]$StagingDir)
-  if ($File -notlike '*.zip') { return $File }
+  param([string]$File, [string]$StagingDir, [hashtable]$Keyring)
+  if ($File -notlike '*.zip' -and $File -notlike '*.enc') { return $File }
   if (-not (Test-Path -LiteralPath $StagingDir)) { [void](New-Item -ItemType Directory -Path $StagingDir -Force) }
-  $plain = Join-Path $StagingDir ([System.IO.Path]::GetFileNameWithoutExtension($File))  # strips the trailing .zip
-  Expand-SebFile -Source $File -Destination $plain
-  return $plain
+  $current = $File
+  if ($current -like '*.enc') {
+    # Decrypt (verify first) into the SQL-readable folder, then carry on with what was inside.
+    if ($null -eq $Keyring) {
+      try { $Keyring = Read-SebKeyring }
+      catch { throw ('{0} is encrypted, and the keys are readable only by administrators - run this from an elevated console' -f (Split-Path -Leaf $File)) }
+    }
+    $decrypted = Join-Path $StagingDir ([System.IO.Path]::GetFileNameWithoutExtension($current))   # strips .enc
+    Unprotect-SebFile -Source $current -Destination $decrypted -Keyring $Keyring
+    $current = $decrypted
+  }
+  if ($current -like '*.zip') {
+    $plain = Join-Path $StagingDir ([System.IO.Path]::GetFileNameWithoutExtension($current))  # strips the trailing .zip
+    Expand-SebFile -Source $current -Destination $plain
+    if ($current -ne $File) { Remove-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue }   # the decrypted zip was a step on the way
+    $current = $plain
+  }
+  return $current
 }
 
 # A restore-side source SQL can read: a .zip is expanded into a fresh temp folder the SQL
@@ -2117,7 +2484,7 @@ function Resolve-SebRestoreSource {
 function Get-SebRestoreSource {
   param($Connection, [string]$File)
   $dir = Join-Path $env:TEMP ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
-  if ($File -like '*.zip') {
+  if ($File -like '*.zip' -or $File -like '*.enc') {
     [void](New-Item -ItemType Directory -Path $dir -Force)
     $svcAcct = Get-SebSqlServiceAccount -Connection $Connection
     if (-not [string]::IsNullOrWhiteSpace($svcAcct)) {
@@ -2144,7 +2511,7 @@ function Get-SebFolderFacts {
   param([string]$Directory)
   if (-not (Test-Path -LiteralPath $Directory)) { return @() }
   $items = Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -cmatch '\.(bak|dif|trn)(\.zip)?$' }
+    Where-Object { $_.Name -cmatch '\.(bak|dif|trn)(\.zip)?(\.enc)?$' }
   $facts = foreach ($item in $items) {
     [pscustomobject]@{
       Name      = $item.Name
@@ -2275,20 +2642,37 @@ function Save-SebCopyOrPend {
 # in copy order; the plain staged file is left for the caller's own staged cleanup. HeaderReader
 # is injectable for testing; it defaults to a real RESTORE HEADERONLY of the plain file.
 function Get-SebPublishSet {
-  param($Connection, [string]$StagedPlain, [string]$PlainName, [string]$Kind, [bool]$Compress, [scriptblock]$HeaderReader)
-  if (-not $Compress) {
+  param($Connection, [string]$StagedPlain, [string]$PlainName, [string]$Kind, [bool]$Compress, [scriptblock]$HeaderReader,
+        [bool]$Encrypt = $false, [byte[]]$EncryptKey)
+  if (-not $Compress -and -not $Encrypt) {
     return @([pscustomobject]@{ Src = $StagedPlain; Name = $PlainName })
   }
   if (-not $HeaderReader) { $HeaderReader = { param($c, $f, $k) Get-SebRestoreHeaderFacts -Connection $c -File $f -Kind $k } }
+  # Facts from the PLAIN file: neither a .zip nor ciphertext can be read by RESTORE
+  # HEADERONLY, so the sidecar is the catalogue's only view of what is inside.
   $facts = & $HeaderReader $Connection $StagedPlain $Kind
-  $stagedZip = $StagedPlain + '.zip'
-  Compress-SebFile -Source $StagedPlain -Destination $stagedZip
-  $stagedMeta = Get-SebSidecarName $stagedZip
+  $src = $StagedPlain
+  $name = $PlainName
+  if ($Compress) {
+    $stagedZip = $StagedPlain + '.zip'
+    Compress-SebFile -Source $StagedPlain -Destination $stagedZip
+    $src = $stagedZip
+    $name = Get-SebCompressedName $PlainName
+  }
+  if ($Encrypt) {
+    # Compress first, then encrypt: ciphertext does not compress. The zip was only ever a
+    # step on the way - it is not published, so it goes as soon as its .enc exists.
+    $stagedEnc = $src + '.enc'
+    Protect-SebFile -Source $src -Destination $stagedEnc -Key $EncryptKey
+    if ($Compress) { Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue }
+    $src = $stagedEnc
+    $name = $name + '.enc'
+  }
+  $stagedMeta = Get-SebSidecarName $src
   Set-Content -LiteralPath $stagedMeta -Value (Get-SebSidecarJson -Facts $facts) -Encoding ASCII
-  $zipName = Get-SebCompressedName $PlainName
   return @(
-    [pscustomobject]@{ Src = $stagedZip;  Name = $zipName }
-    [pscustomobject]@{ Src = $stagedMeta; Name = (Get-SebSidecarName $zipName) }
+    [pscustomobject]@{ Src = $src;        Name = $name }
+    [pscustomobject]@{ Src = $stagedMeta; Name = (Get-SebSidecarName $name) }
   )
 }
 
@@ -2307,16 +2691,21 @@ function Get-SebOrphanLogEntries {
   $files = @(Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction SilentlyContinue)
   $plainNames = @($files | Where-Object { $_.Name -match '\.trn$' } | ForEach-Object { $_.Name })
   foreach ($f in $files) {
-    if ($f.Name -notmatch '^(.+)_\d{8}-\d{6}\.trn(\.zip)?$') { continue }
+    # A processed copy is .trn.zip, .trn.enc or .trn.zip.enc; a plain .trn has no suffix.
+    if ($f.Name -notmatch '^(.+)_\d{8}-\d{6}\.trn((?:\.zip)?(?:\.enc)?)$') { continue }
     $safeDb = $Matches[1]
-    $isZip = [bool]$Matches[2]
+    $suffix = $Matches[2]
+    $isProcessed = ($suffix -ne '')
     if (@($KeepPaths) -contains $f.FullName) { continue }
-    # its zip is already pending: shipping the plain file too would put the backup on the share twice
-    if (-not $isZip -and @($KeepPaths) -contains ($f.FullName + '.zip')) { continue }
-    if ($isZip -and ($plainNames -contains $f.Name.Substring(0, $f.Name.Length - 4))) { continue }
+    # a processed copy of it is already pending: shipping the plain file too would put the backup on the share twice
+    if (-not $isProcessed -and @(@('.zip', '.enc', '.zip.enc') | Where-Object { @($KeepPaths) -contains ($f.FullName + $_) }).Count -gt 0) { continue }
+    # the plain file wins over any processed copy of it - that copy may be half-written
+    if ($isProcessed -and ($plainNames -contains $f.Name.Substring(0, $f.Name.Length - $suffix.Length))) { continue }
+    # an intermediate .zip whose .zip.enc exists was only a step on the way
+    if ($suffix -eq '.zip' -and (Test-Path -LiteralPath ($f.FullName + '.enc'))) { continue }
     $logDir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $safeDb -Kind 'log'
     [void]$out.Add([pscustomobject]@{ Staged = $f.FullName; Dest = (Join-Path $logDir $f.Name); Database = $safeDb; Kind = 'log' })
-    if ($isZip) {
+    if ($isProcessed) {
       $meta = Get-SebSidecarName $f.FullName
       if ((Test-Path -LiteralPath $meta) -and @($KeepPaths) -notcontains $meta) {
         [void]$out.Add([pscustomobject]@{ Staged = $meta; Dest = (Join-Path $logDir (Get-SebSidecarName $f.Name)); Database = $safeDb; Kind = 'log' })
@@ -2334,7 +2723,7 @@ function Get-SebOrphanLogEntries {
 function Clear-SebStagedExcept {
   param([string]$StagingPath, [string[]]$KeepPaths = @())
   Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction SilentlyContinue |
-    Where-Object { ($_.Name -match '\.(bak|dif|trn)(\.zip)?$' -or $_.Name -match '\.meta\.json$') -and $KeepPaths -notcontains $_.FullName } |
+    Where-Object { ($_.Name -match '\.(bak|dif|trn)(\.zip)?(\.enc)?$' -or $_.Name -match '\.meta\.json$') -and $KeepPaths -notcontains $_.FullName } |
     ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 }
 
@@ -2379,7 +2768,7 @@ function Get-SebMutex {
 # .trn sitting in the same folder facts is not a base, zipped or not.
 function Get-SebHoursSinceNewestFull {
   param([object[]]$Facts = @(), [datetime]$Now)
-  $fulls = @($Facts | Where-Object { $_.Name -match '\.bak(\.zip)?$' })
+  $fulls = @($Facts | Where-Object { $_.Name -match '\.bak(\.zip)?(\.enc)?$' })
   if ($fulls.Count -eq 0) { return [double]::PositiveInfinity }
   $newest = @($fulls | Sort-Object Timestamp)[-1]
   return ($Now - $newest.Timestamp).TotalHours
@@ -2471,7 +2860,9 @@ function Invoke-SebBackupLogPass {
     [string]$StagingPath,
     [string]$OnlyDatabase = '',
     [switch]$NoHash,
-    [bool]$Compress = $false
+    [bool]$Compress = $false,
+    [bool]$Encrypt = $false,
+    [byte[]]$EncryptKey
   )
   # Drain first, exactly as Invoke-SebPass does: a share that came back catches up before
   # this pass stages anything new, so a long outage cannot let staging grow unbounded. The
@@ -2538,20 +2929,20 @@ FROM sys.databases AS d
         # The anchor is the log chain's base. If the share refuses it, record and keep it
         # (do not orphan it) and still take the log: the base is safe locally, and the anchor
         # and the log then drain to the share together on the next run.
-        foreach ($art in @(Get-SebPublishSet -Connection $Connection -StagedPlain $anchorStaged -PlainName $anchorName -Kind 'full' -Compress $Compress)) {
+        foreach ($art in @(Get-SebPublishSet -Connection $Connection -StagedPlain $anchorStaged -PlainName $anchorName -Kind 'full' -Compress $Compress -Encrypt $Encrypt -EncryptKey $EncryptKey)) {
           Save-SebCopyOrPend -Staged $art.Src -Dest (Join-Path $anchorDir $art.Name) -Database $db -Kind 'hourly' -PendingList $pendingList -NoHash:$NoHash
         }
-        if ($Compress) { Remove-Item -LiteralPath $anchorStaged -Force -ErrorAction SilentlyContinue }
+        if ($Compress -or $Encrypt) { Remove-Item -LiteralPath $anchorStaged -Force -ErrorAction SilentlyContinue }
         Invoke-SebBackupLog -Connection $Connection -Database $db -TargetFile $logStaged
       }
       $logDir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $db -Kind 'log'
       # BACKUP LOG has already truncated the chain, so a refused copy must not throw the .trn
       # away: record it and keep it staged for the next run's drain instead of losing the
       # interval. A pending copy is not a per-database failure - the log itself was taken.
-      foreach ($art in @(Get-SebPublishSet -Connection $Connection -StagedPlain $logStaged -PlainName $logName -Kind 'log' -Compress $Compress)) {
+      foreach ($art in @(Get-SebPublishSet -Connection $Connection -StagedPlain $logStaged -PlainName $logName -Kind 'log' -Compress $Compress -Encrypt $Encrypt -EncryptKey $EncryptKey)) {
         Save-SebCopyOrPend -Staged $art.Src -Dest (Join-Path $logDir $art.Name) -Database $db -Kind 'log' -PendingList $pendingList -NoHash:$NoHash
       }
-      if ($Compress) { Remove-Item -LiteralPath $logStaged -Force -ErrorAction SilentlyContinue }
+      if ($Compress -or $Encrypt) { Remove-Item -LiteralPath $logStaged -Force -ErrorAction SilentlyContinue }
       Write-SebLog ('log backup of {0} taken' -f $db) 'INFO'
       $succeeded++
     }
@@ -2605,6 +2996,16 @@ function Invoke-SebPass {
   $noHash = [bool]$Config.NoHashVerify
   $compress = $false
   if ($Config.PSObject.Properties['CompressBackups']) { $compress = [bool]$Config.CompressBackups }
+  # Encryption on means every new backup is encrypted or the pass fails - never a quiet
+  # fallback to plaintext on the share because the key went missing.
+  $encrypt = ($Config.PSObject.Properties['EncryptBackups'] -and [bool]$Config.EncryptBackups)
+  $encryptKey = $null
+  $escrowOnShare = $true
+  if ($encrypt) {
+    $encryptKey = Get-SebActiveEncryptionKey -Config $Config
+    # The escrow is how a rebuilt server gets these backups back; keep it beside them.
+    $escrowOnShare = Sync-SebEscrowToShare -Config $Config
+  }
 
   # Drain first. A share that came back should catch up before this pass adds to
   # the pile, otherwise a long outage means staging grows until the disk fills.
@@ -2774,7 +3175,7 @@ GROUP BY database_id
           $destDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind $destKind
           Write-SebStage -Database $database -Stage ('copy-' + $kind)
           $copyOk = $true
-          foreach ($art in @(Get-SebPublishSet -Connection $connection -StagedPlain $staged -PlainName $fileName -Kind $kind -Compress $compress)) {
+          foreach ($art in @(Get-SebPublishSet -Connection $connection -StagedPlain $staged -PlainName $fileName -Kind $kind -Compress $compress -Encrypt $encrypt -EncryptKey $encryptKey)) {
             $dest = Join-Path $destDir $art.Name
             try {
               Copy-SebVerified -Source $art.Src -Destination $dest -NoHash:$noHash
@@ -2794,7 +3195,7 @@ GROUP BY database_id
           }
           # When compressing, the plain staged file is now redundant (the .zip carries its
           # bytes and was published/pended in its place); nothing pending references the plain.
-          if ($compress) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+          if ($compress -or $encrypt) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
 
           # Chain-safe pruning: never delete a full/diff/log a retained recovery point still
           # needs (Get-SebChainRetentionPlan guarantees this). Runs only in Full mode; Simple
@@ -2851,7 +3252,7 @@ GROUP BY database_id
             -HourlyKeep ([int]$Config.HourlyKeep) -DailyKeepDays ([int]$Config.DailyKeepDays)
 
           Write-SebStage -Database $database -Stage 'copy'
-          $publishSet = @(Get-SebPublishSet -Connection $connection -StagedPlain $staged -PlainName $fileName -Kind $kind -Compress $compress)
+          $publishSet = @(Get-SebPublishSet -Connection $connection -StagedPlain $staged -PlainName $fileName -Kind $kind -Compress $compress -Encrypt $encrypt -EncryptKey $encryptKey)
           $targets = @(@{ Dir = $hourlyDir; Kind = 'hourly' })
           if ($plan.PromoteToDaily) { $targets += @{ Dir = $dailyDir; Kind = 'daily' } }
 
@@ -2884,7 +3285,7 @@ GROUP BY database_id
                 Remove-Item -LiteralPath $art.Src -Force -ErrorAction SilentlyContinue
               }
             }
-            if ($compress) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+            if ($compress -or $encrypt) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
           }
         }
         $succeeded++
@@ -2915,6 +3316,10 @@ GROUP BY database_id
     Write-SebState $newState
 
     Write-SebLog ('pass finished: {0} succeeded, {1} failed, {2} copy(s) pending' -f $succeeded, $failed, $pendingList.Count)
+    if (-not $escrowOnShare) {
+      [void]$healthConditions.Add((New-SebAlertCondition -Key 'encryption-escrow-missing' -Severity 'warning' -Owner 'data-health' -Message (
+            'Backups are encrypted but the key escrow could not be put on the share. If this server is lost, they can only be restored with the recovery key.')))
+    }
     $ac = Get-SebAlertConfig $Config
     $conditions = @(Get-SebDataPassConditions -Succeeded $succeeded -Failed $failed -FailedDatabases @($failedNames.ToArray())) +
       @($healthConditions.ToArray()) +
@@ -3384,7 +3789,7 @@ function Invoke-SebSetup {
     Write-Host '  credential sealed (DPAPI LocalMachine key, AES-256-CBC + HMAC-SHA256 payload)'
   }
 
-  Write-SebConfig ([pscustomobject]@{
+  $newConfig = [pscustomobject]@{
       Version       = 1
       DataSource    = $chosen.DataSource
       InstanceName  = $chosen.InstanceName
@@ -3405,7 +3810,14 @@ function Invoke-SebSetup {
       UseWindowsAuth = [bool]$WindowsAuth
       NoHashVerify  = [bool]$SkipHash
       CreatedUtc    = (Get-Date).ToUniversalTime().ToString('o')
-    })
+    }
+  # A reconfigure keeps every setting setup does not itself own - alerting, the active
+  # encryption key, OnlyDatabase. Writing only the object above used to drop them all, so
+  # re-running setup from the app silently turned alerting off and left an encrypting
+  # host without its key id (every pass then failed). Setup's own values still win.
+  $previousConfig = $null
+  if (Test-Path -LiteralPath (Get-SebConfigPath)) { try { $previousConfig = Read-SebConfig } catch { } }
+  Write-SebConfig (Merge-SebPreservedConfig -New $newConfig -Previous $previousConfig)
 
   Write-Host ''
   Write-Host ('Setup complete. Config in {0}' -f $script:SebConfigDir)
@@ -3842,7 +4254,7 @@ function Get-SebRestoreCatalogue {
   try { if (-not (Test-Path -LiteralPath $Root)) { return $sets } }
   catch { return $sets }
   # <root>\<host>\<instance>\<database>\<kind>\<db>_<stamp>.bak (or .bak.zip, compressed)
-  foreach ($f in @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.bak(\.zip)?$' })) {
+  foreach ($f in @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.bak(\.zip)?(\.enc)?$' })) {
     $kind = Split-Path -Leaf (Split-Path -Parent $f.FullName)
     $db = Split-Path -Leaf (Split-Path -Parent (Split-Path -Parent $f.FullName))
     $stamp = Get-SebStampFromName -Name $f.Name -Fallback $f.LastWriteTime
@@ -4230,7 +4642,7 @@ function Invoke-SebRestoreSteps {
     # when the plan really has a .zip, so a plain restore creates and grants nothing. The
     # operator owns this fresh dir, so can set its DACL without local admin; a grant that still
     # fails leaves the existing "SQL cannot read" fault rather than a silent one.
-    $anyZip = @($plan.Steps | Where-Object { $_.File -like '*.zip' }).Count -gt 0
+    $anyZip = @($plan.Steps | Where-Object { $_.File -like '*.zip' -or $_.File -like '*.enc' }).Count -gt 0
     if ($anyZip) {
       [void](New-Item -ItemType Directory -Path $decompDir -Force)
       $svcAcct = Get-SebSqlServiceAccount -Connection $Connection
@@ -4842,6 +5254,13 @@ try {
     # $CompressBackups is a [switch]; persist its .IsPresent (a real bool), not the switch
     # object itself - ConvertTo-Json would not serialize a SwitchParameter as a plain true/false.
     if ($PSBoundParameters.ContainsKey('CompressBackups')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'CompressBackups' -Value $CompressBackups.IsPresent -Force }
+    if ($PSBoundParameters.ContainsKey('EncryptBackups')) {
+      if ($EncryptBackups -eq 'On') {
+        # Refuse up front rather than let every later pass fail on a missing key.
+        [void](Get-SebActiveEncryptionKey -Config $config)
+      }
+      Add-Member -InputObject $config -MemberType NoteProperty -Name 'EncryptBackups' -Value ($EncryptBackups -eq 'On') -Force
+    }
     if ($PSBoundParameters.ContainsKey('RestoreTesting')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'RestoreTesting' -Value ($RestoreTesting -eq 'On') -Force }
     if ($PSBoundParameters.ContainsKey('RestoreTestTime')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'RestoreTestTime' -Value $RestoreTestTime -Force }
     Write-SebConfig -Config $config
@@ -5119,8 +5538,109 @@ try {
   elseif ($Status) {
     Assert-SebElevated -Mode 'Status'
     Show-SebStatus
+    Show-SebEncryptionStatus
     Show-SebRestoreTestStatus
     Show-SebAlertStatus
+  }
+  elseif ($SetupEncryption) {
+    Assert-SebElevated -Mode 'SetupEncryption'
+    $config = Read-SebConfig
+    $existingId = ''
+    if ($config.PSObject.Properties['ActiveKeyId']) { $existingId = [string]$config.ActiveKeyId }
+    if ($existingId -ne '' -and -not $RotateKey) {
+      throw ('encryption is already set up (key {0}). Pass -RotateKey to make a new key for new backups; the old one is kept for the backups it wrote.' -f $existingId)
+    }
+    $passphrase = ''
+    if (-not [string]::IsNullOrWhiteSpace($EncryptionSecretsFile)) {
+      $given = Read-SebAlertSecretsFile -Path $EncryptionSecretsFile
+      if ($given.ContainsKey('Passphrase')) { $passphrase = [string]$given['Passphrase'] }
+    }
+    else {
+      Write-Host 'Choose a passphrase (12+ characters). With it - or the recovery key shown next - a rebuilt'
+      Write-Host 'server can read these backups. Without either, nobody can. It is not stored anywhere.'
+      $p1 = Read-Host -AsSecureString 'Passphrase'
+      $p2 = Read-Host -AsSecureString 'Passphrase again'
+      $passphrase = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1))
+      $again = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2))
+      if ($passphrase -cne $again) { throw 'the two passphrases differ - nothing was changed' }
+    }
+    Test-SebPassphrase $passphrase
+    $dataKey = New-SebRandomBytes 32
+    $recovery = New-SebRandomBytes 32
+    $escrow = New-SebEscrow -DataKey $dataKey -Passphrase $passphrase -RecoveryKey $recovery -InstanceLabel ([string]$config.InstanceName)
+    $keyId = [string]$escrow.KeyId
+    $ring = @{}
+    try { $ring = Read-SebKeyring } catch { throw ('the existing keyring cannot be read, so a new key would orphan the old ones: {0}' -f $_.Exception.Message) }
+    $ring[$keyId] = $dataKey
+    Write-SebKeyring -Keyring $ring
+    Set-Content -LiteralPath (Join-Path $script:SebConfigDir (Get-SebEscrowName $keyId)) -Value ($escrow | ConvertTo-Json) -Encoding ASCII
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'ActiveKeyId' -Value $keyId -Force
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'EncryptBackups' -Value $true -Force
+    Write-SebConfig -Config $config
+    $onShare = Sync-SebEscrowToShare -Config $config
+    $recoveryText = Format-SebRecoveryKey $recovery
+    Write-SebLog ('encryption set up: key {0}; new backups are encrypted{1}' -f $keyId, $(if ($existingId -ne '') { ' (rotated from ' + $existingId + ', kept for older backups)' } else { '' }))
+    Write-Host ''
+    Write-Host '== RECOVERY KEY - write it down or store it in a password manager NOW ===='
+    Write-Host ''
+    Write-Host ('   ' + $recoveryText)
+    Write-Host ''
+    Write-Host '   It is shown once and stored nowhere. With it, or the passphrase, a rebuilt server'
+    Write-Host '   can restore these backups (-ImportEncryptionKey). Without either, nobody can.'
+    Write-Host '========================================================================='
+    if (-not $onShare) { Write-Host '   (the key escrow will be copied to the share by the next backup pass)' }
+    Write-Host (ConvertTo-Json @{ Ok = $true; KeyId = $keyId; RecoveryKey = $recoveryText; EscrowOnShare = $onShare } -Compress)
+    [System.Array]::Clear($dataKey, 0, $dataKey.Length); [System.Array]::Clear($recovery, 0, $recovery.Length)
+  }
+  elseif ($ImportEncryptionKey) {
+    Assert-SebElevated -Mode 'ImportEncryptionKey'
+    $files = @()
+    if (-not [string]::IsNullOrWhiteSpace($EncryptionKeyFile)) { $files = @(Get-Item -LiteralPath $EncryptionKeyFile) }
+    else {
+      $config = Read-SebConfig
+      $dir = Get-SebEscrowShareDir -Config $config
+      $files = @(Get-ChildItem -LiteralPath $dir -Filter 'encryption-key-*.json' -File -ErrorAction SilentlyContinue)
+      if ($files.Count -eq 0) { throw ('no key escrow (encryption-key-*.json) in {0} - pass -EncryptionKeyFile to point at one' -f $dir) }
+    }
+    $passphrase = ''; $recoveryText = ''
+    if (-not [string]::IsNullOrWhiteSpace($EncryptionSecretsFile)) {
+      $given = Read-SebAlertSecretsFile -Path $EncryptionSecretsFile
+      if ($given.ContainsKey('RecoveryKey')) { $recoveryText = [string]$given['RecoveryKey'] }
+      if ($given.ContainsKey('Passphrase')) { $passphrase = [string]$given['Passphrase'] }
+    }
+    else {
+      $s = Read-Host -AsSecureString 'Passphrase or recovery key'
+      $typed = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
+      # A recovery key has a shape a passphrase almost never has; anything else is a passphrase.
+      if (($typed -replace '[\s-]', '') -match '^[0-9A-Fa-f]{64}$') { $recoveryText = $typed } else { $passphrase = $typed }
+    }
+    $ring = @{}
+    try { $ring = Read-SebKeyring } catch { }
+    $imported = @(); $failed = @()
+    foreach ($f in $files) {
+      $escrow = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
+      try {
+        $key = Open-SebEscrow -Escrow $escrow -Passphrase $passphrase -RecoveryKey $recoveryText
+        $ring[[string]$escrow.KeyId] = $key
+        $imported += [string]$escrow.KeyId
+        # Keep the escrow locally too, so this server re-publishes it like one it made.
+        Copy-Item -LiteralPath $f.FullName -Destination (Join-Path $script:SebConfigDir (Get-SebEscrowName ([string]$escrow.KeyId))) -Force
+      }
+      catch { $failed += ('{0}: {1}' -f $f.Name, $_.Exception.Message) }
+    }
+    if ($imported.Count -eq 0) { throw ('no key could be opened - ' + ($failed -join '; ')) }
+    Write-SebKeyring -Keyring $ring
+    $cfgNow = $null
+    try { $cfgNow = Read-SebConfig } catch { }
+    if ($null -ne $cfgNow -and (-not $cfgNow.PSObject.Properties['ActiveKeyId'] -or [string]$cfgNow.ActiveKeyId -eq '')) {
+      # A rebuilt server: carry on with the newest imported key for new backups.
+      $newest = @($files | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json } | Where-Object { $imported -contains [string]$_.KeyId } | Sort-Object CreatedUtc)[-1]
+      Add-Member -InputObject $cfgNow -MemberType NoteProperty -Name 'ActiveKeyId' -Value ([string]$newest.KeyId) -Force
+      Write-SebConfig -Config $cfgNow
+    }
+    Write-SebLog ('imported encryption key(s): {0}' -f ($imported -join ', '))
+    foreach ($x in $failed) { Write-SebLog ('not imported - {0}' -f $x) 'WARN' }
+    Write-Host (ConvertTo-Json @{ Ok = $true; Imported = @($imported); NotImported = @($failed) } -Compress)
   }
   elseif ($TestRestore) {
     Assert-SebElevated -Mode 'TestRestore'
@@ -5286,6 +5806,9 @@ try {
     $noHash = [bool]$config.NoHashVerify
     $compress = $false
     if ($config.PSObject.Properties['CompressBackups']) { $compress = [bool]$config.CompressBackups }
+    $encrypt = ($config.PSObject.Properties['EncryptBackups'] -and [bool]$config.EncryptBackups)
+    $encryptKey = $null
+    if ($encrypt) { $encryptKey = Get-SebActiveEncryptionKey -Config $config }
 
     $password = $null
     $connection = $null
@@ -5305,7 +5828,8 @@ try {
       Write-SebLog ('connected to {0}' -f $config.DataSource)
 
       $result = Invoke-SebBackupLogPass -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME `
-        -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath -OnlyDatabase $only -NoHash:$noHash -Compress $compress
+        -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath -OnlyDatabase $only -NoHash:$noHash -Compress $compress `
+        -Encrypt $encrypt -EncryptKey $encryptKey
       Write-SebLog ('log pass finished: {0} succeeded, {1} failed, {2} copy(s) pending' -f $result.Succeeded, $result.Failed, $result.Pending)
       $logState = Read-SebState
       $conditions = @(Get-SebLogPassConditions -Failed $result.Failed -FailedDatabases $result.FailedDatabases) +
@@ -5374,7 +5898,7 @@ catch {
   $failedMode = 'Run'
   foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest', 'BackupLog', 'Reschedule',
       'RestoreList', 'RestoreInspect', 'RestoreVerify', 'RestoreRun', 'RestoreToPoint',
-      'ConfigureAlerts', 'ClearAlerts', 'TestAlert', 'Watchdog', 'TestRestore')) {
+      'ConfigureAlerts', 'ClearAlerts', 'TestAlert', 'Watchdog', 'TestRestore', 'SetupEncryption', 'ImportEncryptionKey')) {
     $v = Get-Variable -Name $m -ValueOnly -ErrorAction SilentlyContinue
     if ($v) { $failedMode = $m; break }
   }

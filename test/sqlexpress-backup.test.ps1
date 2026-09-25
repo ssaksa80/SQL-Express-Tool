@@ -1919,6 +1919,111 @@ finally {
 }
 
 # ======================================================================================
+# ENCRYPTION
+# ======================================================================================
+$encRoot = Join-Path $env:TEMP ('seb-enc-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $encRoot -Force)
+try {
+  # ---- ENC-1. the file format: round trip, and nothing tampered gets through -----------
+  $dek = New-SebRandomBytes 32
+  $ring = @{ (Get-SebKeyId $dek) = $dek }
+  Assert ((Get-SebKeyId $dek) -match '^[0-9a-f]{16}$') 'a key id is 16 hex characters'
+  $plainF = Join-Path $encRoot 'db_20260925-010000.bak'
+  $data = New-Object byte[] (2621440 + 7)   # 2.5 MB + a few: several chunks and a ragged end
+  (New-Object Random 11).NextBytes($data)
+  [IO.File]::WriteAllBytes($plainF, $data)
+  Protect-SebFile -Source $plainF -Destination "$plainF.enc" -Key $dek
+  Assert ((Get-Item "$plainF.enc").Length -eq ($data.Length + 40 + 32 + (16 - $data.Length % 16))) 'the encrypted file is header + padded ciphertext + tag, nothing more'
+  Assert ((Get-SebEncryptedKeyId "$plainF.enc") -eq (Get-SebKeyId $dek)) 'the header names the key it was written with'
+  $raw = [IO.File]::ReadAllBytes("$plainF.enc")
+  Assert (-not ([System.Text.Encoding]::ASCII.GetString($raw, 72, 64) -eq [System.Text.Encoding]::ASCII.GetString($data, 32, 64))) 'the body is not the plaintext'
+  Unprotect-SebFile -Source "$plainF.enc" -Destination "$plainF.back" -Keyring $ring
+  Assert ((Get-FileHash $plainF).Hash -eq (Get-FileHash "$plainF.back").Hash) 'decrypting gives back the identical file (multi-chunk)'
+  [IO.File]::WriteAllBytes("$encRoot\empty.bak", (New-Object byte[] 0))
+  Protect-SebFile -Source "$encRoot\empty.bak" -Destination "$encRoot\empty.bak.enc" -Key $dek
+  Unprotect-SebFile -Source "$encRoot\empty.bak.enc" -Destination "$encRoot\empty.back" -Keyring $ring
+  Assert ((Get-Item "$encRoot\empty.back").Length -eq 0) 'an empty file round-trips too'
+  foreach ($case in @(@('body', 5000), @('header', 12), @('tag', -3))) {
+    $t = [IO.File]::ReadAllBytes("$plainF.enc")
+    $at = $case[1]; if ($at -lt 0) { $at = $t.Length + $at }
+    $t[$at] = $t[$at] -bxor 0x40
+    [IO.File]::WriteAllBytes("$encRoot\t.enc", $t)
+    $refused = $false
+    try { Unprotect-SebFile -Source "$encRoot\t.enc" -Destination "$encRoot\t.out" -Keyring $ring } catch { $refused = $true }
+    Assert ($refused -and -not (Test-Path "$encRoot\t.out")) "a flipped bit in the $($case[0]) is refused, and nothing is written"
+  }
+  $t = [IO.File]::ReadAllBytes("$plainF.enc"); [IO.File]::WriteAllBytes("$encRoot\tr.enc", $t[0..($t.Length - 17)])
+  $refused = $false; try { Unprotect-SebFile -Source "$encRoot\tr.enc" -Destination "$encRoot\tr.out" -Keyring $ring } catch { $refused = $true }
+  Assert $refused 'a truncated file is refused'
+  $msg = ''; try { Unprotect-SebFile -Source "$plainF.enc" -Destination "$encRoot\nk.out" -Keyring @{} } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like '*key*ImportEncryptionKey*') 'a missing key says which one, and how to get it back'
+  $msg = ''; try { Unprotect-SebFile -Source $plainF -Destination "$encRoot\np.out" -Keyring $ring } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like '*not an encrypted backup*') 'a plain file handed to decryption is named as such'
+
+  # ---- ENC-2. escrow and recovery key -------------------------------------------------
+  $rk = New-SebRandomBytes 32
+  $rkText = Format-SebRecoveryKey $rk
+  Assert ($rkText -match '^([0-9A-F]{8}-){7}[0-9A-F]{8}$') "the recovery key prints as 8 groups of 8 hex ($rkText)"
+  Assert ([Convert]::ToBase64String((ConvertFrom-SebRecoveryKey ($rkText.ToLower() -replace '-', ' '))) -eq [Convert]::ToBase64String($rk)) 'and reads back with any case, dashes or spaces'
+  $threw = $false; try { [void](ConvertFrom-SebRecoveryKey 'ABCD') } catch { $threw = $true }
+  Assert $threw 'a malformed recovery key is refused'
+  $esc = New-SebEscrow -DataKey $dek -Passphrase 'a long enough passphrase' -RecoveryKey $rk -Iterations 2000 -InstanceLabel 'SQLEXPRESS'
+  $escJson = ($esc | ConvertTo-Json) | ConvertFrom-Json   # as it really travels, via the share
+  Assert ($escJson.KeyId -eq (Get-SebKeyId $dek) -and $escJson.Kdf -eq 'PBKDF2-SHA256' -and $escJson.Iterations -eq 2000) 'the escrow records the key id and how its key is derived'
+  Assert (((ConvertTo-Json $esc) -notlike ('*' + [Convert]::ToBase64String($dek) + '*'))) 'the escrow never contains the data key itself'
+  Assert ((Get-SebKeyId (Open-SebEscrow -Escrow $escJson -Passphrase 'a long enough passphrase')) -eq (Get-SebKeyId $dek)) 'the passphrase opens it'
+  Assert ((Get-SebKeyId (Open-SebEscrow -Escrow $escJson -RecoveryKey $rkText)) -eq (Get-SebKeyId $dek)) 'so does the recovery key'
+  $msg = ''; try { [void](Open-SebEscrow -Escrow $escJson -Passphrase 'a long enough passphrasE') } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like '*does not open*') 'a wrong passphrase is refused (never a wrong key)'
+  $msg = ''; try { [void](Open-SebEscrow -Escrow $escJson -RecoveryKey (Format-SebRecoveryKey (New-SebRandomBytes 32))) } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like '*does not open*') 'a wrong recovery key is refused'
+  $threw = $false; try { [void](New-SebEscrow -DataKey $dek -Passphrase 'short' -RecoveryKey $rk) } catch { $threw = $true }
+  Assert $threw 'a passphrase under 12 characters is refused'
+  $big = New-SebEscrow -DataKey $dek -Passphrase 'a long enough passphrase' -RecoveryKey $rk
+  Assert ($big.Iterations -eq 600000) 'the default is 600,000 PBKDF2 rounds'
+
+  # ---- ENC-3. the pipeline: publish names, and back through restore ------------------
+  $facts = [pscustomobject]@{ Kind = 'full'; FirstLSN = [decimal]1; LastLSN = [decimal]2; DatabaseBackupLSN = [decimal]0; CheckpointLSN = [decimal]1; Finish = [datetime]'2026-09-25 01:00' }
+  $reader = { param($c, $f, $k) $facts }
+  foreach ($combo in @(@($false, $false, 'db_20260925-010000.bak'), @($true, $false, 'db_20260925-010000.bak.zip'), @($false, $true, 'db_20260925-010000.bak.enc'), @($true, $true, 'db_20260925-010000.bak.zip.enc'))) {
+    $stage = Join-Path $encRoot ('stage-' + [Guid]::NewGuid().ToString('N')); [void](New-Item -ItemType Directory -Path $stage)
+    $sp = Join-Path $stage 'db_20260925-010000.bak'; Copy-Item $plainF $sp
+    $set = @(Get-SebPublishSet -Connection $null -StagedPlain $sp -PlainName 'db_20260925-010000.bak' -Kind 'full' -Compress $combo[0] -Encrypt $combo[1] -EncryptKey $dek -HeaderReader $reader)
+    Assert ($set[0].Name -eq $combo[2]) "compress=$($combo[0]) encrypt=$($combo[1]): publishes $($set[0].Name)"
+    if ($combo[0] -or $combo[1]) {
+      Assert ($set.Count -eq 2 -and $set[1].Name -eq ($combo[2] + '.meta.json')) '  with a sidecar named after it'
+      Assert ((Get-SebHeaderFactsFromSidecar -Json (Get-Content -LiteralPath $set[1].Src -Raw) -File $set[0].Src -Kind 'full').LastLSN -eq [decimal]2) '  whose facts the catalogue can read without the key'
+    }
+    if ($combo[0] -and $combo[1]) { Assert (-not (Test-Path -LiteralPath ($sp + '.zip'))) '  and the intermediate zip is gone' }
+    $back = Resolve-SebRestoreSource -File $set[0].Src -StagingDir (Join-Path $stage 'restore') -Keyring $ring
+    Assert ((Get-FileHash -LiteralPath $back).Hash -eq (Get-FileHash $plainF).Hash) '  and restore resolves it back to the identical .bak'
+    Remove-Item -LiteralPath $stage -Recurse -Force
+  }
+
+  # ---- ENC-4. names with .enc are backups everywhere ----------------------------------
+  Assert ((Get-SebStampFromName -Name 'db_20260925-013000.trn.zip.enc' -Fallback ([datetime]'2000-01-01')) -eq [datetime]'2026-09-25 01:30:00') 'the stamp is read through .zip.enc'
+  $fd = Join-Path $encRoot 'facts'; [void](New-Item -ItemType Directory -Path $fd)
+  foreach ($n in @('a_20260925-010000.bak.enc', 'a_20260925-020000.bak.zip.enc', 'a_20260925-010000.bak.enc.meta.json', 'a_20260925-030000.trn.enc')) { Set-Content -LiteralPath (Join-Path $fd $n) -Value 'x' }
+  $ff = @(Get-SebFolderFacts -Directory $fd)
+  Assert ($ff.Count -eq 3) "folder facts count the three encrypted backups and not the sidecar (got $($ff.Count))"
+  Assert (-not [double]::IsInfinity((Get-SebHoursSinceNewestFull -Facts $ff -Now ([datetime]'2026-09-25 04:00')))) 'an encrypted .bak counts as a full for the full-every cadence'
+  $os = Join-Path $encRoot 'orph'; [void](New-Item -ItemType Directory -Path $os)
+  foreach ($n in @('L_20260925-010000.trn.enc', 'L_20260925-010000.trn.enc.meta.json', 'M_20260925-010000.trn', 'M_20260925-010000.trn.zip.enc', 'N_20260925-010000.trn.zip', 'N_20260925-010000.trn.zip.enc')) { Set-Content -LiteralPath (Join-Path $os $n) -Value 'x' }
+  $adopted = @(Get-SebOrphanLogEntries -StagingPath $os -Root '\\fs\s' -HostName 'H' -InstanceLabel 'I' | ForEach-Object { Split-Path -Leaf $_.Staged })
+  Assert (($adopted -contains 'L_20260925-010000.trn.enc') -and ($adopted -contains 'L_20260925-010000.trn.enc.meta.json')) 'a lone encrypted log is adopted with its sidecar'
+  Assert (($adopted -contains 'M_20260925-010000.trn') -and -not ($adopted -contains 'M_20260925-010000.trn.zip.enc')) 'the plain log wins over a possibly half-written encrypted copy'
+  Assert (($adopted -contains 'N_20260925-010000.trn.zip.enc') -and -not ($adopted -contains 'N_20260925-010000.trn.zip')) 'an intermediate zip beside its .zip.enc is not shipped'
+
+  # ---- ENC-5. a reconfigure keeps what setup does not own ------------------------------
+  $prev = [pscustomobject]@{ SharePath = '\\old'; AlertEmailTo = 'ops@x.test'; ActiveKeyId = 'abc'; EncryptBackups = $true; CreatedUtc = 'first' }
+  $merged = Merge-SebPreservedConfig -New ([pscustomobject]@{ SharePath = '\\new'; CreatedUtc = 'now' }) -Previous $prev
+  Assert ($merged.SharePath -eq '\\new') 'setup''s own values win'
+  Assert ($merged.AlertEmailTo -eq 'ops@x.test' -and $merged.ActiveKeyId -eq 'abc' -and $merged.EncryptBackups -eq $true) 'alerting and the encryption key survive a reconfigure'
+  Assert ($merged.CreatedUtc -eq 'first') 'and the host keeps its original creation time (the watchdog''s baseline)'
+}
+finally { Remove-Item -LiteralPath $encRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ======================================================================================
 # RESTORE TESTING
 # ======================================================================================
 function New-CatEntry($kind, $file, $first, $last, $dbLsn, $ckpt, $finish) {

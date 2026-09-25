@@ -172,6 +172,34 @@ secrets. They are prompted for, never passed on the command line, and sealed in
 `alert.dat` the same way as the SQL credential. The design is in
 [docs/superpowers/specs/2026-09-25-alerting-design.md](docs/superpowers/specs/2026-09-25-alerting-design.md).
 
+## Encryption
+
+SQL Server Express cannot encrypt a backup, so the tool does it after SQL writes the file:
+compress, then encrypt (AES-256 with HMAC-SHA256 integrity), then copy. Anyone who can
+read the share sees ciphertext. A backup that has been tampered with or damaged is refused
+before it reaches `RESTORE`.
+
+**Losing the key would mean losing the backups**, so there are two ways to get it back:
+
+- **A passphrase you choose.** It wraps a copy of the key that the backup pass keeps on the
+  share, beside the backups.
+- **A recovery key**, shown once, for you to keep somewhere safe offline.
+
+Day to day, backups use a copy of the key sealed to the server, so nothing is typed. On a
+rebuilt server, `-ImportEncryptionKey` with either secret brings the backups back.
+
+```powershell
+.\Invoke-SqlExpressBackup.ps1 -SetupEncryption              # elevated: passphrase twice, recovery key shown ONCE
+.\Invoke-SqlExpressBackup.ps1 -ImportEncryptionKey          # on a rebuilt server: passphrase or recovery key
+.\Invoke-SqlExpressBackup.ps1 -Reschedule -EncryptBackups Off   # new backups plain again; keys are kept
+.\Invoke-SqlExpressBackup.ps1 -SetupEncryption -RotateKey   # a new key for new backups; old ones still restore
+```
+
+Backups already on the share stay as they are and age out through retention. Restoring an
+encrypted backup needs an elevated console, because the keys are readable only by
+administrators. The design is in
+[docs/superpowers/specs/2026-09-25-backup-encryption-design.md](docs/superpowers/specs/2026-09-25-backup-encryption-design.md).
+
 ## Restore testing
 
 A backup nobody has restored is only a hope. With restore testing on, a daily task (03:30
@@ -219,6 +247,11 @@ This ships a tool that runs as SYSTEM and holds a database credential, so:
   extracts its engine copy under the user profile — correct for something run as that
   user — and the elevated install places the copy the *task* uses somewhere only
   SYSTEM and Administrators can write.
+- **Encrypted backups protect the share, not the running host.** An administrator or
+  SYSTEM on the server can read the keyring, as with the SQL credential. The key copy on
+  the share is only as strong as the passphrase, which is why it must be at least 12
+  characters and is stretched with 600,000 PBKDF2 rounds. Sidecar files reveal backup
+  times and log positions, never data.
 - **The pass validates what it reads.** Pending copies recorded in state are checked
   against the configured staging and share folders before anything is copied, so a
   tampered state file is not a "put this anywhere, as SYSTEM" primitive.
@@ -260,7 +293,8 @@ scratch databases:
 - compressed round trips;
 - share-outage recovery;
 - alerting (raise once, stay quiet, resolve once);
-- restore testing (a full chain restores and checks clean, and a broken chain fails the test).
+- restore testing (a full chain restores and checks clean, and a broken chain fails the test);
+- encryption (no plaintext on the share, and restores still work after a key import).
 
 `dist/` is gitignored: the source and the build script are the reviewable artifacts.
 
