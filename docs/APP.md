@@ -200,6 +200,14 @@ credential, so it runs elevated; when the app is not already elevated it runs th
 an elevated job and streams the same glowing progress bar and activity log a scheduled run
 would.
 
+### Restore testing
+
+The setup wizard's **Protection** section has **Test restores daily** at a time you choose. It is ticked for a first setup and matches the current setting on a reconfigure.
+
+The overview's **restore test** tile shows the most recent test: passed, skipped or FAILED, with the database and when. **Test a restore** runs one now as an elevated job, with the same live progress and log as a backup.
+
+Each test restores the newest backup chain of the database tested longest ago to a scratch copy. It then checks the copy with `DBCC CHECKDB` and drops it. A failure raises an alert.
+
 ### Alerts
 
 **Alerts** (in the sidebar) sets who hears about a problem:
@@ -246,6 +254,7 @@ Useful for scripted deployment and for testing:
 | `--apply-setup <file>` | Configure and schedule from a JSON file, Windows auth (elevates). Behind the setup wizard. |
 | `--configure-alerts <file>` | Apply the alert settings in a JSON file; secrets come from the DPAPI file it names (elevates). Behind **Alerts → Save**. |
 | `--test-alert` | Send a test through every configured channel (elevates). Behind **Send test alert**. |
+| `--test-restore` | Run one restore test now (elevates). Behind **Test a restore**. |
 | `--clear-alerts` | Remove all alert settings, secrets and the watchdog task (elevates). Behind **Turn alerts off**. |
 | `--live <file>` | With any elevated job above: stream the engine's output to `<file>`, ending in `[EXIT] N`, so the launching app can tail it live across the UAC boundary. |
 | `--check <file>` | Construct every view headless and write findings to `<file>`; used by the test suite. No window is shown. |

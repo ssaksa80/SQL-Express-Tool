@@ -36,6 +36,20 @@ class BackupStatus
     public int AlertSmtpPort = 587, AlertRemindHours = 24, AlertStaleHours = 0, AlertPendingMinutes = 60;
     public bool AlertSmtpTls = true, AlertHasSmtpPassword = false, AlertHasWebhook = false, AlertHasHeartbeat = false;
     public List<OpenAlert> OpenAlerts = new List<OpenAlert>();
+    // Restore testing: whether the daily test is on, when, and each database's last result.
+    public bool RestoreTesting = false;
+    public string RestoreTestTime = "03:30";
+    public List<RestoreTestResult> RestoreTests = new List<RestoreTestResult>();
+}
+
+class RestoreTestResult
+{
+    public string Database = "";
+    public string Result = "";
+    public string Message = "";
+    public string LastUtc = "";
+    public string RecoveredToUtc = "";
+    public int DurationSeconds = 0;
 }
 
 class OpenAlert
@@ -132,6 +146,17 @@ static class Engine
             s.AlertHasSmtpPassword = Bool(d, "AlertHasSmtpPassword");
             s.AlertHasWebhook = Bool(d, "AlertHasWebhook");
             s.AlertHasHeartbeat = Bool(d, "AlertHasHeartbeat");
+            s.RestoreTesting = Bool(d, "RestoreTesting");
+            string rtt = Str(d, "RestoreTestTime");
+            if (rtt.Length == 5) { s.RestoreTestTime = rtt; }
+            foreach (IDictionary<string, object> t in Rows(d, "RestoreTests"))
+            {
+                RestoreTestResult r = new RestoreTestResult();
+                r.Database = DStr(t, "Database"); r.Result = DStr(t, "Result"); r.Message = DStr(t, "Message");
+                r.LastUtc = DStr(t, "LastUtc"); r.RecoveredToUtc = DStr(t, "RecoveredToUtc");
+                try { if (t.ContainsKey("DurationSeconds") && t["DurationSeconds"] != null) { r.DurationSeconds = Convert.ToInt32(t["DurationSeconds"]); } } catch { }
+                s.RestoreTests.Add(r);
+            }
             // PowerShell can write a one-element array as the bare object; take either shape.
             object rawAlerts = d.ContainsKey("Alerts") ? d["Alerts"] : null;
             if (rawAlerts is IDictionary<string, object>) { rawAlerts = new object[] { rawAlerts }; }
@@ -454,6 +479,24 @@ static class Engine
         if (d == null || !d.ContainsKey(k) || d[k] == null) { return ""; }
         return Convert.ToString(d[k], System.Globalization.CultureInfo.InvariantCulture);
     }
+    // The rows of a JSON array of objects - or of a lone object, which is how PowerShell
+    // can write a one-element array.
+    static List<IDictionary<string, object>> Rows(Dictionary<string, object> d, string k)
+    {
+        List<IDictionary<string, object>> rows = new List<IDictionary<string, object>>();
+        object raw = (d != null && d.ContainsKey(k)) ? d[k] : null;
+        IDictionary<string, object> single = raw as IDictionary<string, object>;
+        if (single != null) { rows.Add(single); return rows; }
+        System.Collections.IEnumerable seq = raw as System.Collections.IEnumerable;
+        if (seq == null || raw is string) { return rows; }
+        foreach (object o in seq)
+        {
+            IDictionary<string, object> r = o as IDictionary<string, object>;
+            if (r != null) { rows.Add(r); }
+        }
+        return rows;
+    }
+
     static bool Bool(Dictionary<string, object> d, string k)
     {
         try { if (d != null && d.ContainsKey(k) && d[k] != null) { return Convert.ToBoolean(d[k]); } } catch { }

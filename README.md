@@ -172,6 +172,31 @@ secrets. They are prompted for, never passed on the command line, and sealed in
 `alert.dat` the same way as the SQL credential. The design is in
 [docs/superpowers/specs/2026-09-25-alerting-design.md](docs/superpowers/specs/2026-09-25-alerting-design.md).
 
+## Restore testing
+
+A backup nobody has restored is only a hope. With restore testing on, a daily task (03:30
+by default) takes the database tested longest ago and does four things:
+
+1. Restores its newest chain to a scratch database. In point-in-time mode that is the full
+   backup, its differential and every log after it, up to the newest log.
+2. Runs `DBCC CHECKDB` on the copy.
+3. Records the result.
+4. Drops the scratch copy.
+
+Every database is covered in turn. A broken log chain, a file SQL cannot read, or a
+consistency error fails the test and raises a critical alert. Not enough disk to try
+raises a warning. The scratch copy is always dropped, even after a failure.
+
+```powershell
+.\Invoke-SqlExpressBackup.ps1 -Reschedule -RestoreTesting On -RestoreTestTime 02:30   # elevated
+.\Invoke-SqlExpressBackup.ps1 -TestRestore [-Database AppDb]                          # one test, now
+```
+
+The scratch database is named `SebRestoreTest_<database>` and its files go in the staging
+folder. The test does not take the backup lock, so log backups keep running while it runs.
+The design is in
+[docs/superpowers/specs/2026-09-25-restore-testing-design.md](docs/superpowers/specs/2026-09-25-restore-testing-design.md).
+
 ## Security
 
 This ships a tool that runs as SYSTEM and holds a database credential, so:
@@ -230,8 +255,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\test\backup-app.test.ps1
 ```
 
 Where SQL Express is installed, the `test\live-*.ps1` scripts prove the real thing against
-scratch databases: point-in-time restore, compressed round trips, share-outage recovery,
-and alerting (raise once, stay quiet, resolve once).
+scratch databases:
+- point-in-time restore;
+- compressed round trips;
+- share-outage recovery;
+- alerting (raise once, stay quiet, resolve once);
+- restore testing (a full chain restores and checks clean, and a broken chain fails the test).
 
 `dist/` is gitignored: the source and the build script are the reviewable artifacts.
 
@@ -259,7 +288,8 @@ hours. That shipped once. The test now asserts the path the app actually used.
   restores to any minute; master and msdb stay full-only.
 - **A dead UNC path takes about 7.5 minutes to fail.** The task's execution time limit
   and a named mutex keep that contained, but a share outage makes a pass slow.
-- **Restore is not automated.** This produces verified, restorable files; restoring is
+- **Restoring over a live database is not automated.** Restore *testing* is: backups are
+  restored to scratch databases and checked, never over a real one. Restoring for real is
   a human decision. The procedure is written down: [docs/RESTORE.md](docs/RESTORE.md),
   including the permission trap that makes a perfectly good backup unreadable and a
   drill record proving a real database came back.

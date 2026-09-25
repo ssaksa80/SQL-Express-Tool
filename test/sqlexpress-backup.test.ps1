@@ -1918,6 +1918,73 @@ finally {
   Remove-Item -LiteralPath $alertRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ======================================================================================
+# RESTORE TESTING
+# ======================================================================================
+function New-CatEntry($kind, $file, $first, $last, $dbLsn, $ckpt, $finish) {
+  [pscustomobject]@{ Kind = $kind; File = $file; FirstLSN = [decimal]$first; LastLSN = [decimal]$last; DatabaseBackupLSN = [decimal]$dbLsn; CheckpointLSN = [decimal]$ckpt; Finish = [datetime]$finish }
+}
+# ---- RT-1. the latest-recoverable plan ------------------------------------------------
+$oldFull = New-CatEntry 'full' 'F1.bak' 100 200 0 150 '2026-09-24 00:00'
+$newFull = New-CatEntry 'full' 'F2.bak' 1000 1100 0 1050 '2026-09-25 00:00'
+$p = Get-SebLatestRestorePlan -Catalogue @($oldFull, $newFull)
+Assert ($null -eq $p.Error -and @($p.Steps).Count -eq 1 -and $p.Steps[0].File -eq 'F2.bak') 'full only: the NEWEST full is restored'
+Assert ($p.Steps[0].Recovery -and $null -eq $p.Steps[0].StopAt) 'and it is the recovering step, with no STOPAT'
+Assert ($p.RecoveredTo -eq [datetime]'2026-09-25 00:00') 'recovered to the full''s finish'
+$diffOld = New-CatEntry 'diff' 'D1.dif' 300 400 100 0 '2026-09-24 12:00'      # based on the old full's checkpoint? no: 100 != 150
+$diffOld2 = New-CatEntry 'diff' 'D0.dif' 300 400 150 0 '2026-09-24 12:00'     # based on the OLD full
+$diffNew = New-CatEntry 'diff' 'D2.dif' 1200 1300 1050 0 '2026-09-25 06:00'   # based on the new full
+$p = Get-SebLatestRestorePlan -Catalogue @($oldFull, $newFull, $diffOld, $diffOld2, $diffNew)
+Assert (@($p.Steps).Count -eq 2 -and $p.Steps[1].File -eq 'D2.dif' -and $p.Steps[1].Recovery) 'full + the differential taken on THAT full (CheckpointLSN), which recovers'
+Assert (-not $p.Steps[0].Recovery) 'the full before it does not recover'
+$l1 = New-CatEntry 'log' 'L1.trn' 1250 1350 0 0 '2026-09-25 06:15'   # starts before the diff's end, ends past it
+$l2 = New-CatEntry 'log' 'L2.trn' 1350 1400 0 0 '2026-09-25 06:30'
+$l2dup = New-CatEntry 'log' 'L2.trn.zip' 1350 1400 0 0 '2026-09-25 06:30'
+$lOld = New-CatEntry 'log' 'L0.trn' 900 1000 0 0 '2026-09-24 23:45'   # ends before the chain point
+$p = Get-SebLatestRestorePlan -Catalogue @($newFull, $diffNew, $lOld, $l2, $l1, $l2dup)
+Assert ((@($p.Steps) | ForEach-Object { $_.File }) -join ',' -eq 'F2.bak,D2.dif,L1.trn,L2.trn') "full, diff, then every later log in LSN order, older and duplicate logs skipped (got $((@($p.Steps) | ForEach-Object { $_.File }) -join ','))"
+Assert ($p.Steps[3].Recovery -and -not $p.Steps[2].Recovery -and -not $p.Steps[1].Recovery) 'only the last log recovers'
+Assert ($p.RecoveredTo -eq [datetime]'2026-09-25 06:30') 'recovered to the newest log - the whole chain is proven'
+$l3gap = New-CatEntry 'log' 'L3.trn' 1500 1600 0 0 '2026-09-25 07:00'
+$p = Get-SebLatestRestorePlan -Catalogue @($newFull, $diffNew, $l1, $l2, $l3gap)
+Assert ($p.Error -like '*chain is broken*L3.trn*') 'a gap in the log chain fails the test, naming the file after it'
+Assert ((Get-SebLatestRestorePlan -Catalogue @($l1)).Error -like '*no full backup*') 'no full at all: an error, not an empty plan'
+
+# ---- RT-2. the SQL for a final step without STOPAT ----------------------------------
+$sqlFull = Get-SebRestoreStepSql -Step ([pscustomobject]@{ Kind = 'full'; File = 'C:\s\F.bak'; Recovery = $true; StopAt = $null }) -RestoreAs 'T' -MoveClauses @("MOVE 'a' TO 'b'")
+Assert ($sqlFull -like "*WITH RECOVERY, MOVE 'a' TO 'b'") "a recovering full: WITH RECOVERY plus its MOVEs (got $sqlFull)"
+$sqlDiff = Get-SebRestoreStepSql -Step ([pscustomobject]@{ Kind = 'diff'; File = 'C:\s\D.dif'; Recovery = $true; StopAt = $null }) -RestoreAs 'T'
+Assert ($sqlDiff -like '*WITH RECOVERY') 'a recovering differential: WITH RECOVERY'
+$sqlLog = Get-SebRestoreStepSql -Step ([pscustomobject]@{ Kind = 'log'; File = 'C:\s\L.trn'; Recovery = $true; StopAt = $null }) -RestoreAs 'T'
+Assert ($sqlLog -like 'RESTORE LOG * WITH RECOVERY' -and $sqlLog -notlike '*STOPAT*') 'a recovering log with no target: WITH RECOVERY, no STOPAT'
+$sqlPit = Get-SebRestoreStepSql -Step ([pscustomobject]@{ Kind = 'full'; File = 'C:\s\F.bak'; Recovery = $false; StopAt = $null }) -RestoreAs 'T'
+Assert ($sqlPit -like '*WITH NORECOVERY*') 'a non-final full is unchanged: NORECOVERY'
+
+# ---- RT-3. rotation, naming, space, conditions ----------------------------------------
+$hist = ('{"B":{"LastUtc":"2026-09-20T03:30:00.0000000Z"},"A":{"LastUtc":"2026-09-24T03:30:00.0000000Z"}}' | ConvertFrom-Json)
+Assert ((Select-SebRestoreTestDatabase -Databases @('A', 'B', 'C') -History $hist) -eq 'C') 'a database never tested goes first'
+Assert ((Select-SebRestoreTestDatabase -Databases @('A', 'B') -History $hist) -eq 'B') 'then the one tested longest ago'
+Assert ((Select-SebRestoreTestDatabase -Databases @('Zed', 'Alpha') -History $null) -eq 'Alpha') 'ties go alphabetically'
+Assert ($null -eq (Select-SebRestoreTestDatabase -Databases @() -History $null)) 'nothing on the share: nothing to test'
+Assert ((Get-SebRestoreTestName -Database 'Sales-2026 (EU)') -eq 'SebRestoreTest_Sales_2026__EU_') 'the scratch name is the reserved prefix plus a sanitised name'
+Assert (Test-SebRestoreTestSpace -RequiredBytes 1000 -FreeBytes 1100) 'exactly 10% headroom is enough'
+Assert (-not (Test-SebRestoreTestSpace -RequiredBytes 1000 -FreeBytes 1099)) 'one byte less is not'
+$c = @(Get-SebRestoreTestConditions -Result ([pscustomobject]@{ Database = 'AppDb'; Result = 'failed'; Message = 'OS error 5' }))
+Assert ($c.Count -eq 1 -and $c[0].Key -eq 'restore-test-failed:AppDb' -and $c[0].Severity -eq 'critical' -and $c[0].Owner -eq 'restore-test:AppDb') 'a failed test: critical, keyed and owned per database'
+$c = @(Get-SebRestoreTestConditions -Result ([pscustomobject]@{ Database = 'AppDb'; Result = 'skipped'; Message = 'no space' }))
+Assert ($c.Count -eq 1 -and $c[0].Severity -eq 'warning') 'a skipped test: a warning'
+Assert (@(Get-SebRestoreTestConditions -Result ([pscustomobject]@{ Database = 'AppDb'; Result = 'ok'; Message = '' })).Count -eq 0) 'a passed test: nothing (and it resolves an earlier failure)'
+$threw = $false; try { Remove-SebRestoreTestDatabase -Connection $null -Name 'AppDb' } catch { $threw = ($_.Exception.Message -like '*not a restore-test database*') }
+Assert $threw 'the scratch-database drop refuses any name without the reserved prefix - before touching SQL'
+$c = Get-SebSetupCarryOver -Existing ([pscustomobject]@{ RestoreTesting = $true; RestoreTestTime = '02:15' }) -Bound @('Setup') -Values @{ RestoreTesting = $false; RestoreTestTime = '03:30' }
+Assert ($c.RestoreTesting -eq $true -and $c.RestoreTestTime -eq '02:15') 'a reconfigure keeps restore testing as it was'
+$wdCfg = [pscustomobject]@{ IntervalHours = 6; RecoveryMode = 'Simple'; RestoreTesting = $true; CreatedUtc = (Get-Date).ToUniversalTime().ToString('o') }
+$keys = @(Get-SebWatchdogConditions -AlertConfig (Get-SebAlertConfig $wdCfg) -Config $wdCfg -State ([pscustomobject]@{}) -Schedule ([pscustomobject]@{ ServicePresent = $false; MainTaskState = 'Ready'; LogTaskState = 'absent'; RestoreTestTaskState = 'Disabled' }) -NowUtc (Get-Date).ToUniversalTime() | ForEach-Object { $_.Key })
+Assert ($keys -contains 'restore-test-task-missing') 'the watchdog notices a disabled restore-test task'
+$wdCfg.RestoreTesting = $false
+$keys = @(Get-SebWatchdogConditions -AlertConfig (Get-SebAlertConfig $wdCfg) -Config $wdCfg -State ([pscustomobject]@{}) -Schedule ([pscustomobject]@{ ServicePresent = $false; MainTaskState = 'Ready'; LogTaskState = 'absent'; RestoreTestTaskState = 'absent' }) -NowUtc (Get-Date).ToUniversalTime() | ForEach-Object { $_.Key })
+Assert (-not ($keys -contains 'restore-test-task-missing')) 'but not when restore testing is off'
+
 # ---- ALERT-8. the app and the engine agree on the alert flags -----------------------
 # The app builds -ConfigureAlerts from its own string table; a renamed or misspelled flag
 # would fail only at the moment an operator saves, elevated, with a binding error. So every
@@ -1938,7 +2005,15 @@ foreach ($pair in @(@('AlertWebhookKind', @('None', 'Teams', 'Slack', 'Generic')
   $allowed = @($vs[0].PositionalArguments | ForEach-Object { $_.Value })
   foreach ($v in $pair[1]) { Assert ($allowed -contains $v) "the engine accepts -$($pair[0]) $v" }
 }
-foreach ($job in @('--configure-alerts', '--test-alert', '--clear-alerts')) {
+# The setup/reschedule flags the app emits (ProtectionArgs) - same rule.
+$pm = [regex]::Match($appSrc, '(?s)static string ProtectionArgs.*?\n    \}')
+Assert $pm.Success 'App.cs has ProtectionArgs'
+foreach ($f in @([regex]::Matches($pm.Value, '" -(\w+)') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)) {
+  Assert ($engineParams.ContainsKey($f)) "the engine has -$f (sent by setup and reschedule)"
+}
+$rtSet = @(@($engineParams['RestoreTesting'].Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' })[0].PositionalArguments | ForEach-Object { $_.Value })
+Assert (($rtSet -contains 'On') -and ($rtSet -contains 'Off')) 'the engine accepts -RestoreTesting On and Off, which is what the app sends'
+foreach ($job in @('--configure-alerts', '--test-alert', '--clear-alerts', '--test-restore')) {
   Assert ($appSrc -match [regex]::Escape('"' + $job + '"')) "App.cs handles the $job job"
 }
 

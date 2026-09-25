@@ -20,7 +20,7 @@ class ModernView
     GlowBar glow;
     LogPane log;
     Border activityArea;
-    TextBlock lastRunVal, schedVal, dbCountVal, instVal;
+    TextBlock lastRunVal, schedVal, dbCountVal, instVal, restoreTestVal, restoreTestLabel;
     Border alertBanner;
     StackPanel alertLines;
     bool busy;
@@ -95,13 +95,16 @@ class ModernView
         g.Children.Add(h);
 
         UniformGrid tiles = new UniformGrid();
-        tiles.Columns = 4; tiles.Margin = new Thickness(0, 14, 0, 0);
+        tiles.Columns = 5; tiles.Margin = new Thickness(0, 14, 0, 0);
         Border t1 = Ui.Tile("—", "last run", Theme.Ink); lastRunVal = TileValue(t1);
         Border t2 = Ui.Tile("—", "schedule", Theme.Ink); schedVal = TileValue(t2);
         Border t3 = Ui.Tile("—", "databases", Theme.Ink); dbCountVal = TileValue(t3);
         Border t4 = Ui.Tile("—", "instance", Theme.Ink); instVal = TileValue(t4);
-        foreach (Border t in new Border[] { t1, t2, t3, t4 }) { t.Margin = new Thickness(0, 0, 10, 0); }
-        tiles.Children.Add(t1); tiles.Children.Add(t2); tiles.Children.Add(t3); tiles.Children.Add(t4);
+        // The most recent restore test - "backed up" is a claim until one has come back.
+        Border t5 = Ui.Tile("—", "restore test", Theme.Ink); restoreTestVal = TileValue(t5); restoreTestLabel = TileLabel(t5);
+        t5.ToolTip = "The last automated restore test: a backup restored to a scratch copy and checked with DBCC CHECKDB";
+        foreach (Border t in new Border[] { t1, t2, t3, t4, t5 }) { t.Margin = new Thickness(0, 0, 10, 0); }
+        tiles.Children.Add(t1); tiles.Children.Add(t2); tiles.Children.Add(t3); tiles.Children.Add(t4); tiles.Children.Add(t5);
         Grid.SetRow(tiles, 1); g.Children.Add(tiles);
 
         // What is wrong right now, from the engine's alerting - hidden when nothing is.
@@ -143,8 +146,11 @@ class ModernView
         rest.Margin = new Thickness(0, 0, 9, 0);
         Border setup = Ui.GhostButton("Set up…", OpenSetup);
         setup.Margin = new Thickness(0, 0, 9, 0);
+        Border rtest = Ui.GhostButton("Test a restore", RunRestoreTest);
+        rtest.Margin = new Thickness(0, 0, 9, 0);
+        rtest.ToolTip = "Restore the newest backup of the database tested longest ago to a scratch copy, check it, and drop it";
         Border refresh = Ui.GhostButton("Refresh", delegate { Refresh(); });
-        actions.Children.Add(run); actions.Children.Add(self); actions.Children.Add(rest); actions.Children.Add(setup); actions.Children.Add(refresh);
+        actions.Children.Add(run); actions.Children.Add(self); actions.Children.Add(rest); actions.Children.Add(rtest); actions.Children.Add(setup); actions.Children.Add(refresh);
         Grid.SetRow(actions, 4); g.Children.Add(actions);
 
         activityArea = ActivityArea();
@@ -158,6 +164,11 @@ class ModernView
     {
         StackPanel sp = tile.Child as StackPanel;
         return sp.Children[0] as TextBlock;
+    }
+    static TextBlock TileLabel(Border tile)
+    {
+        StackPanel sp = tile.Child as StackPanel;
+        return sp.Children.Count > 1 ? sp.Children[1] as TextBlock : null;
     }
 
     // The activity area holds the glowing progress bar over a live/one-click log pane.
@@ -478,6 +489,7 @@ class ModernView
             lastRunVal.Text = "not set up"; lastRunVal.Foreground = Theme.Ink3;
         }
         FillAlertBanner(st);
+        FillRestoreTestTile(st);
 
         // group sets by database
         Dictionary<string, int> byDb = new Dictionary<string, int>();
@@ -595,6 +607,60 @@ class ModernView
             alertLines.Children.Add(t);
         }
         alertBanner.Visibility = Visibility.Visible;
+    }
+
+    void FillRestoreTestTile(BackupStatus st)
+    {
+        RestoreTestResult last = null;
+        foreach (RestoreTestResult r in st.RestoreTests)
+        {
+            if (last == null || string.CompareOrdinal(r.LastUtc, last.LastUtc) > 0) { last = r; }
+        }
+        if (last == null)
+        {
+            restoreTestVal.Text = st.RestoreTesting ? "pending" : "off";
+            restoreTestVal.Foreground = st.RestoreTesting ? Theme.Ink3 : Theme.Warn;
+            if (restoreTestLabel != null) { restoreTestLabel.Text = st.RestoreTesting ? "restore test · daily " + st.RestoreTestTime : "restore test · not on"; }
+            return;
+        }
+        restoreTestVal.Text = last.Result == "ok" ? "passed" : (last.Result == "skipped" ? "skipped" : "FAILED");
+        restoreTestVal.Foreground = last.Result == "ok" ? Theme.Ok : (last.Result == "skipped" ? Theme.Warn : Theme.Bad);
+        if (restoreTestLabel != null) { restoreTestLabel.Text = "restore test · " + last.Database + SinceText(last.LastUtc).Replace("  (since ", " · ").TrimEnd(')'); }
+    }
+
+    // One restore test now, as an elevated job (it restores and drops a database, and reads
+    // the SYSTEM-only credential for SQL-auth hosts) - same live glow and log as a backup.
+    void RunRestoreTest()
+    {
+        if (busy) { return; }
+        busy = true;
+        activityArea.Visibility = Visibility.Visible;
+        glow.Visibility = Visibility.Visible;
+        glow.Begin("Restore test (elevated)");
+        log.SetTitle("Restore test — elevated");
+        log.Clear();
+        log.Append("Approve the Windows elevation prompt to run a restore test…");
+        string stage = "starting";
+        string lastJson = null;
+        // An hour of SILENCE allowed: DBCC CHECKDB on a large database prints nothing until it ends.
+        Elevate.Run("--test-restore", 3600,
+            delegate(string line)
+            {
+                string tl = line.Trim();
+                if (tl.StartsWith("{") && tl.EndsWith("}")) { lastJson = tl; }
+                if (line.StartsWith("[STAGE]")) { stage = FieldRest(line, "stage"); glow.Update(stage.StartsWith("checkdb") ? 0.9 : 0.5, "Restore test  ·  " + stage); }
+                if (!line.StartsWith("[PROGRESS]")) { log.Append(line); }
+            },
+            delegate(bool ok, string output)
+            {
+                string result = Engine.JsonField(lastJson, "Result");
+                string db = Engine.JsonField(lastJson, "Database");
+                if (result == "ok") { glow.Finish(true, "Restore test passed — " + db + " restored and checked"); }
+                else if (result == "skipped") { glow.Finish(false, "Restore test skipped — " + Engine.JsonField(lastJson, "Message")); }
+                else if (result == "nothing to test") { glow.Finish(true, "Nothing to test yet — no backups on the share"); }
+                else { glow.Finish(false, "Restore test FAILED" + (db.Length > 0 ? " — " + db : "") + " (see the log)"); }
+                busy = false; Refresh();
+            });
     }
 
     static string SinceText(string utc)

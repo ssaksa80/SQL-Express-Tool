@@ -24,7 +24,8 @@ class SetupWizard
     Window win;
     TextBox shareBox, stagingBox, hourlyBox, dailyBox;
     ComboBox intervalBox, instanceBox, logIntervalBox, fullEveryBox;
-    CheckBox pitrBox, compressBox;
+    CheckBox pitrBox, compressBox, restoreTestBox;
+    TextBox restoreTimeBox;
     StackPanel pitrOptions;
     Border applyBtn;
     LogPane log;
@@ -102,6 +103,20 @@ class SetupWizard
         compressBox.IsChecked = configured && cur.CompressBackups;
         sp.Children.Add(compressBox);
 
+        restoreTestBox = Check("Test restores daily",
+            "Each day, restores the newest backup of one database (the one tested longest ago) to a scratch copy, runs DBCC CHECKDB on it, and drops it. A failure is an alert. Needs free space on the staging drive about the size of your largest database.");
+        // Ticked for a first setup - a backup nobody has restored is a hope - and as
+        // configured for a reconfigure.
+        restoreTestBox.IsChecked = configured ? cur.RestoreTesting : true;
+        sp.Children.Add(restoreTestBox);
+        StackPanel rtRow = new StackPanel(); rtRow.Orientation = Orientation.Horizontal; rtRow.Margin = new Thickness(26, 0, 0, 8);
+        rtRow.Children.Add(Ui.Text("at", 12, Theme.Ink2));
+        restoreTimeBox = new TextBox(); restoreTimeBox.Width = 60; restoreTimeBox.FontSize = 12.5; restoreTimeBox.Margin = new Thickness(8, 0, 8, 0);
+        restoreTimeBox.Text = configured ? cur.RestoreTestTime : "03:30";
+        rtRow.Children.Add(restoreTimeBox);
+        rtRow.Children.Add(Ui.Text("(24-hour, a quiet time)", 11, Theme.Ink3));
+        sp.Children.Add(rtRow);
+
         StackPanel act = new StackPanel(); act.Orientation = Orientation.Horizontal; act.Margin = new Thickness(0, 12, 0, 0);
         applyBtn = Ui.PrimaryButton("Set up & schedule", Apply);
         applyBtn.Margin = new Thickness(0, 0, 8, 0);
@@ -160,6 +175,15 @@ class SetupWizard
             d["FullEveryHours"] = ValueOf(fullEveryBox, 24);
         }
         d["CompressBackups"] = compressBox.IsChecked == true;
+        d["RestoreTesting"] = restoreTestBox.IsChecked == true;
+        string rt = restoreTimeBox.Text.Trim();
+        if (rt.Length == 4 && rt[1] == ':') { rt = "0" + rt; }   // 3:30 -> 03:30
+        if (restoreTestBox.IsChecked == true && !System.Text.RegularExpressions.Regex.IsMatch(rt, "^([01][0-9]|2[0-3]):[0-5][0-9]$"))
+        {
+            Flash("The restore-test time must be HH:mm on a 24-hour clock, e.g. 03:30.");
+            return;
+        }
+        d["RestoreTestTime"] = rt;
         string json = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(d);
         string tmp = Path.Combine(Path.GetTempPath(), "seb-setup-" + Guid.NewGuid().ToString("N") + ".json");
         try { File.WriteAllText(tmp, json); }

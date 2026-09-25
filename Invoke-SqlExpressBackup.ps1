@@ -111,6 +111,13 @@ param(
   # Alerting. -ConfigureAlerts sets what is bound and leaves the rest (like -Reschedule);
   # secrets come from -AlertSecretsFile (DPAPI CurrentUser JSON, deleted after reading)
   # or -AlertPromptSecrets, never from the command line where they would sit in history.
+  # Restore testing: -TestRestore runs one test now (the task runs it daily); -RestoreTesting
+  # On|Off and -RestoreTestTime set it up on -Setup/-Reschedule (unbound = unchanged).
+  [switch]$TestRestore,
+  [ValidateSet('On', 'Off')]
+  [string]$RestoreTesting = 'Off',
+  [ValidatePattern('^([01]\d|2[0-3]):[0-5]\d$')]
+  [string]$RestoreTestTime = '03:30',
   [switch]$ConfigureAlerts,
   [switch]$ClearAlerts,           # remove every alert setting, alert.dat and the watchdog task
   [switch]$TestAlert,             # send a test through every configured channel, report each
@@ -163,7 +170,7 @@ $script:SebShowKeys = @(
   'FullEveryHours', 'CompressBackups', 'SqlUser', 'UseWindowsAuth',
   'AlertEmailTo', 'AlertEmailFrom', 'AlertSmtpHost', 'AlertSmtpPort', 'AlertSmtpTls', 'AlertSmtpUser',
   'AlertWebhookKind', 'AlertRemindHours', 'AlertStaleHours', 'AlertPendingMinutes',
-  'AlertHasSmtpPassword', 'AlertHasWebhook', 'AlertHasHeartbeat',
+  'AlertHasSmtpPassword', 'AlertHasWebhook', 'AlertHasHeartbeat', 'RestoreTesting', 'RestoreTestTime',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -1068,6 +1075,21 @@ function Write-SebPublicSummary {
       }
       Add-Member -InputObject $public -MemberType NoteProperty -Name 'Alerts' -Value @($open) -Force
     }
+    # The last restore test of each database: when, what came of it, how far it proved.
+    if ($State.PSObject.Properties['RestoreTests'] -and $null -ne $State.RestoreTests) {
+      $tests = @()
+      $tmap = $State.RestoreTests
+      $tkeys = @()
+      if ($tmap -is [System.Collections.IDictionary]) { $tkeys = @($tmap.Keys) } else { $tkeys = @($tmap.PSObject.Properties | ForEach-Object { $_.Name }) }
+      foreach ($k in $tkeys) {
+        $t = $tmap.$k
+        $tests += [pscustomobject]@{
+          Database = [string]$k; Result = [string]$t.Result; Message = [string]$t.Message; LastUtc = [string]$t.LastUtc
+          RecoveredToUtc = [string]$t.RecoveredToUtc; DurationSeconds = [int]$t.DurationSeconds
+        }
+      }
+      Add-Member -InputObject $public -MemberType NoteProperty -Name 'RestoreTests' -Value @($tests) -Force
+    }
   }
   Add-Member -InputObject $public -MemberType NoteProperty -Name 'HostName' -Value $env:COMPUTERNAME -Force
   Add-Member -InputObject $public -MemberType NoteProperty -Name 'WrittenUtc' -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force
@@ -1420,6 +1442,11 @@ function Get-SebWatchdogConditions {
       [void]$out.Add((New-SebAlertCondition -Key 'task-missing' -Severity 'critical' -Owner 'watchdog' -Message (
             'The backup task is {0} - no backups will run until it is restored (re-run -Reschedule, or Change schedule in the app).' -f ([string]$Schedule.MainTaskState).ToLowerInvariant())))
     }
+    $testing = ($null -ne $Config -and $Config.PSObject.Properties['RestoreTesting'] -and [bool]$Config.RestoreTesting)
+    if ($testing -and $Schedule.PSObject.Properties['RestoreTestTaskState'] -and $dead -contains [string]$Schedule.RestoreTestTaskState) {
+      [void]$out.Add((New-SebAlertCondition -Key 'restore-test-task-missing' -Severity 'warning' -Owner 'watchdog' -Message (
+            'Restore testing is on but its task is {0} - backups are no longer being proven restorable (re-run -Reschedule).' -f ([string]$Schedule.RestoreTestTaskState).ToLowerInvariant())))
+    }
     if ($isFull -and $dead -contains [string]$Schedule.LogTaskState) {
       [void]$out.Add((New-SebAlertCondition -Key 'log-task-missing' -Severity 'critical' -Owner 'watchdog' -Message (
             'The transaction-log backup task is {0} - point-in-time recovery has stopped (re-run -Reschedule).' -f ([string]$Schedule.LogTaskState).ToLowerInvariant())))
@@ -1674,6 +1701,26 @@ function Read-SebAlertSecretsFile {
   finally {
     if ($null -ne $bytes) { [System.Array]::Clear($bytes, 0, $bytes.Length) }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Show-SebRestoreTestStatus {
+  $config = Read-SebConfig
+  Write-Host ''
+  Write-Host '== Restore testing ===================================================='
+  $on = ($config.PSObject.Properties['RestoreTesting'] -and [bool]$config.RestoreTesting)
+  $at = '03:30'
+  if ($config.PSObject.Properties['RestoreTestTime']) { $at = [string]$config.RestoreTestTime }
+  if ($on) { Write-Host ('   daily at {0}, one database per run (the one tested longest ago)' -f $at) }
+  else { Write-Host '   off - turn on with -Reschedule -RestoreTesting On, or run one now with -TestRestore' }
+  $state = Read-SebState
+  if (-not $state.PSObject.Properties['RestoreTests'] -or $null -eq $state.RestoreTests -or @($state.RestoreTests.PSObject.Properties).Count -eq 0) {
+    Write-Host '   no restore test has run yet'
+    return
+  }
+  foreach ($p in @($state.RestoreTests.PSObject.Properties | Sort-Object Name)) {
+    $t = $p.Value
+    Write-Host ('   {0,-30} {1,-8} {2}  {3}' -f $p.Name, ([string]$t.Result).ToUpperInvariant(), $t.LastUtc, $t.Message)
   }
 }
 
@@ -2977,6 +3024,38 @@ function Sync-SebWatchdogTask {
   return $true
 }
 
+function Get-SebRestoreTestTaskName {
+  param([string]$Base)
+  return ($Base + '-RestoreTest')
+}
+
+# The daily restore test's task, present only while RestoreTesting is on. Daily at
+# RestoreTestTime, as SYSTEM, and allowed the time a real restore plus CHECKDB takes.
+function Sync-SebRestoreTestTask {
+  param([string]$ScriptPath, [string]$ConfigDirectory)
+  $name = Get-SebRestoreTestTaskName -Base $script:SebTaskName
+  $config = Read-SebConfig
+  $on = ($config.PSObject.Properties['RestoreTesting'] -and [bool]$config.RestoreTesting)
+  if (-not $on) {
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+      Write-SebLog ('scheduled task "{0}" removed - restore testing is off' -f $name)
+    }
+    return $false
+  }
+  $at = '03:30'
+  if ($config.PSObject.Properties['RestoreTestTime'] -and [string]$config.RestoreTestTime -match '^([01]\d|2[0-3]):[0-5]\d$') { $at = [string]$config.RestoreTestTime }
+  $arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -TestRestore -ConfigDir "{1}"' -f $ScriptPath, $ConfigDirectory)
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+  $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]::ParseExact($at, 'HH:mm', [System.Globalization.CultureInfo]::InvariantCulture))
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 6)
+  [void](Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force)
+  Write-SebLog ('scheduled task "{0}" registered - a restore test daily at {1}' -f $name, $at)
+  return $true
+}
+
 # What the watchdog needs to know about the schedule, as plain values for the pure check.
 function Get-SebWatchdogSchedule {
   $taskState = {
@@ -2989,6 +3068,7 @@ function Get-SebWatchdogSchedule {
     ServicePresent = ($null -ne (Get-Service -Name $script:SebServiceName -ErrorAction SilentlyContinue))
     MainTaskState  = (& $taskState $script:SebTaskName)
     LogTaskState   = (& $taskState (Get-SebLogTaskName -Base $script:SebTaskName))
+    RestoreTestTaskState = (& $taskState (Get-SebRestoreTestTaskName -Base $script:SebTaskName))
   }
 }
 
@@ -3048,6 +3128,7 @@ function Install-SebTask {
   }
   # The dead-man check follows the alert config: present only while something can receive it.
   [void](Sync-SebWatchdogTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
+  [void](Sync-SebRestoreTestTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
 }
 
 function Resolve-SebNssm {
@@ -3117,6 +3198,7 @@ function Install-SebService {
   }
   # The dead-man check follows the alert config: present only while something can receive it.
   [void](Sync-SebWatchdogTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
+  [void](Sync-SebRestoreTestTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
 }
 
 function Uninstall-SebSchedule {
@@ -3133,11 +3215,13 @@ function Uninstall-SebSchedule {
     Unregister-ScheduledTask -TaskName $logTaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-SebLog ('scheduled task "{0}" removed' -f $logTaskName)
   }
-  # Removed with the backups it watches, or it would alert "backup task missing" forever.
-  $watchdogTaskName = Get-SebWatchdogTaskName -Base $script:SebTaskName
-  if (Get-ScheduledTask -TaskName $watchdogTaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $watchdogTaskName -Confirm:$false -ErrorAction SilentlyContinue
-    Write-SebLog ('scheduled task "{0}" removed' -f $watchdogTaskName)
+  # Removed with the backups they watch and test, or the watchdog would alert "backup task
+  # missing" forever and the restore test would test a share nobody writes to any more.
+  foreach ($extraTask in @((Get-SebWatchdogTaskName -Base $script:SebTaskName), (Get-SebRestoreTestTaskName -Base $script:SebTaskName))) {
+    if (Get-ScheduledTask -TaskName $extraTask -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $extraTask -Confirm:$false -ErrorAction SilentlyContinue
+      Write-SebLog ('scheduled task "{0}" removed' -f $extraTask)
+    }
   }
   if ($state.ServicePresent) {
     try { Stop-Service -Name $script:SebServiceName -Force -ErrorAction SilentlyContinue } catch { }
@@ -3160,7 +3244,7 @@ function Uninstall-SebSchedule {
 # =====================================================================
 
 function Invoke-SebSetup {
-  param([string]$PinnedInstance, [string]$Share, [string]$Staging, [int]$Hours, [int]$Hourly, [int]$DailyDays, [switch]$WindowsAuth, [switch]$SkipHash, [string]$RecoveryMode = 'Simple', [int]$LogIntervalMinutes = 15, [int]$FullEveryHours = 24, [switch]$CompressBackups)
+  param([string]$PinnedInstance, [string]$Share, [string]$Staging, [int]$Hours, [int]$Hourly, [int]$DailyDays, [switch]$WindowsAuth, [switch]$SkipHash, [string]$RecoveryMode = 'Simple', [int]$LogIntervalMinutes = 15, [int]$FullEveryHours = 24, [switch]$CompressBackups, [bool]$RestoreTesting = $false, [string]$RestoreTestTime = '03:30')
 
   if (-not (Test-Path -LiteralPath $script:SebConfigDir)) {
     [void](New-Item -ItemType Directory -Path $script:SebConfigDir -Force)
@@ -3314,6 +3398,8 @@ function Invoke-SebSetup {
       LogIntervalMinutes = $LogIntervalMinutes
       FullEveryHours     = $FullEveryHours
       CompressBackups    = [bool]$CompressBackups
+      RestoreTesting     = [bool]$RestoreTesting
+      RestoreTestTime    = $RestoreTestTime
       SqlUser       = $sqlUser
       SqlServiceAccount = $sqlAccount
       UseWindowsAuth = [bool]$WindowsAuth
@@ -4075,20 +4161,25 @@ function Get-SebRestoreStepSql {
   $file = $Step.File
   if (-not [string]::IsNullOrWhiteSpace($SourceFile)) { $file = $SourceFile }
   $literal = Get-SebSqlLiteral $file
+  # A step marked Recovery ends the sequence. With a StopAt that is a point-in-time log;
+  # without one (a restore test's "latest recoverable point") the last step - full, diff
+  # or log - simply recovers.
+  $state = 'NORECOVERY'
+  if ($Step.Recovery) { $state = 'RECOVERY' }
   if ($Step.Kind -eq 'full') {
-    $with = @('NORECOVERY')
+    $with = @($state)
     if ($Replace) { $with += 'REPLACE' }
     $with += $MoveClauses
     return ('RESTORE DATABASE {0} FROM DISK = {1} WITH {2}' -f $target, $literal, ($with -join ', '))
   }
   if ($Step.Kind -eq 'diff') {
-    return ('RESTORE DATABASE {0} FROM DISK = {1} WITH NORECOVERY' -f $target, $literal)
+    return ('RESTORE DATABASE {0} FROM DISK = {1} WITH {2}' -f $target, $literal, $state)
   }
-  if ($Step.Recovery) {
-    $stop = Get-SebSqlLiteral ($Step.StopAt.ToString('yyyy-MM-ddTHH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture))
+  if ($Step.Recovery -and $null -ne $Step.StopAt) {
+    $stop = Get-SebSqlLiteral (([datetime]$Step.StopAt).ToString('yyyy-MM-ddTHH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture))
     return ('RESTORE LOG {0} FROM DISK = {1} WITH STOPAT = {2}, RECOVERY' -f $target, $literal, $stop)
   }
-  return ('RESTORE LOG {0} FROM DISK = {1} WITH NORECOVERY' -f $target, $literal)
+  return ('RESTORE LOG {0} FROM DISK = {1} WITH {2}' -f $target, $literal, $state)
 }
 
 # Impure. Build the catalogue, plan the point-in-time restore, and run each step. The
@@ -4114,13 +4205,24 @@ function Invoke-SebRestoreToPoint {
         [string]$Database, [string]$RestoreAs, [datetime]$StopAt,
         [string]$DataDir, [string]$LogDir, [string]$WorkDir = '',
         [bool]$Replace = $false, [bool]$CloseConnections = $false)
+  $cat = @(Get-SebPointCatalogue -Connection $Connection -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database)
+  $plan = Get-SebRestorePlan -Catalogue $cat -StopAt $StopAt
+  if ($plan.Error) { throw ('cannot restore to that point in time: ' + $plan.Error) }
+  [void](Invoke-SebRestoreSteps -Connection $Connection -Steps $plan.Steps -RestoreAs $RestoreAs -DataDir $DataDir -LogDir $LogDir `
+    -WorkDir $WorkDir -Replace $Replace -CloseConnections $CloseConnections)
+}
+
+# Impure. Run an ordered restore plan (Get-SebRestorePlan or Get-SebLatestRestorePlan) into
+# RestoreAs - the one executor both the point-in-time restore and the restore test use.
+# Returns the full step's file list (sizes included) for callers that need it afterwards.
+function Invoke-SebRestoreSteps {
+  param($Connection, [object[]]$Steps, [string]$RestoreAs, [string]$DataDir, [string]$LogDir,
+        [string]$WorkDir = '', [bool]$Replace = $false, [bool]$CloseConnections = $false, [scriptblock]$BeforeRestore)
   $decompRoot = $WorkDir
   if ([string]::IsNullOrWhiteSpace($decompRoot)) { $decompRoot = $env:TEMP }
   $decompDir = Join-Path $decompRoot ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
+  $plan = [pscustomobject]@{ Steps = @($Steps) }
   try {
-    $cat = @(Get-SebPointCatalogue -Connection $Connection -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $Database)
-    $plan = Get-SebRestorePlan -Catalogue $cat -StopAt $StopAt
-    if ($plan.Error) { throw ('cannot restore to that point in time: ' + $plan.Error) }
 
     # A compressed source is expanded into $decompDir and RESTORE reads the plain file AS THE
     # SQL SERVICE ACCOUNT, which cannot read an operator temp folder. Grant that account read
@@ -4150,6 +4252,9 @@ function Invoke-SebRestoreToPoint {
         throw ('{0} already exists. Restoring would overwrite a file that may belong to another database. Choose a different name, or move that file first.' -f $target)
       }
     }
+    # A caller's last word before anything is written (the restore test's space check),
+    # with the real file list in hand. Throwing here stops the restore cleanly.
+    if ($null -ne $BeforeRestore) { & $BeforeRestore $fullInfo }
 
     if ($CloseConnections) {
       try { Invoke-SebSqlNonQuery -Connection $Connection -Sql ('ALTER DATABASE {0} SET SINGLE_USER WITH ROLLBACK IMMEDIATE' -f (Get-SebQuotedName $RestoreAs)) }
@@ -4169,10 +4274,204 @@ function Invoke-SebRestoreToPoint {
       Invoke-SebSqlNonQuery -Connection $Connection -Sql $sql
     }
     Write-SebStage -Database $RestoreAs -Stage 'restore complete'
+    return $fullInfo
   }
   finally {
     if (Test-Path -LiteralPath $decompDir) { Remove-Item -LiteralPath $decompDir -Recurse -Force -ErrorAction SilentlyContinue }
   }
+}
+
+# =====================================================================
+# Restore testing
+# =====================================================================
+#
+# A backup nobody has restored is a hope. Once a day (or on demand) the newest backup
+# chain of one database - the one tested longest ago - is restored to a scratch database,
+# checked with DBCC CHECKDB, recorded, and dropped. A failure is an alert.
+
+# Pure. The newest chain, to the latest point it reaches: the newest full, the newest
+# differential taken on THAT full (matched by CheckpointLSN, as Get-SebRestorePlan does),
+# then every log after it in LSN order. A gap is an error - a restore test that quietly
+# stopped early would prove less than it claims. The final step recovers.
+function Get-SebLatestRestorePlan {
+  param([object[]]$Catalogue = @())
+  $fulls = @($Catalogue | Where-Object { $_.Kind -eq 'full' } | Sort-Object Finish, FirstLSN)
+  if ($fulls.Count -eq 0) { return [pscustomobject]@{ Error = 'there is no full backup on the share to restore from' } }
+  $base = $fulls[$fulls.Count - 1]
+  $steps = New-Object System.Collections.ArrayList
+  [void]$steps.Add([pscustomobject]@{ Kind = 'full'; File = $base.File; Recovery = $false; StopAt = $null })
+  $chainLsn = [decimal]$base.LastLSN
+  $recoveredTo = $base.Finish
+  $diffs = @($Catalogue | Where-Object { $_.Kind -eq 'diff' -and [decimal]$_.DatabaseBackupLSN -eq [decimal]$base.CheckpointLSN } | Sort-Object Finish, FirstLSN)
+  if ($diffs.Count -gt 0) {
+    $diff = $diffs[$diffs.Count - 1]
+    [void]$steps.Add([pscustomobject]@{ Kind = 'diff'; File = $diff.File; Recovery = $false; StopAt = $null })
+    $chainLsn = [decimal]$diff.LastLSN
+    $recoveredTo = $diff.Finish
+  }
+  $prevLast = $chainLsn
+  # File as the tie-break so two copies of one log (plain and .zip) resolve the same way every run.
+  foreach ($log in @($Catalogue | Where-Object { $_.Kind -eq 'log' -and [decimal]$_.LastLSN -gt $chainLsn } | Sort-Object { [decimal]$_.FirstLSN }, File)) {
+    if ([decimal]$log.LastLSN -le $prevLast) { continue }   # already covered (a duplicate of an applied range)
+    if ([decimal]$log.FirstLSN -gt $prevLast) {
+      return [pscustomobject]@{ Error = ('the log chain is broken: nothing bridges LSN {0} to {1} ({2}) - a restore past that point is impossible' -f $prevLast, $log.FirstLSN, (Split-Path -Leaf ([string]$log.File))) }
+    }
+    [void]$steps.Add([pscustomobject]@{ Kind = 'log'; File = $log.File; Recovery = $false; StopAt = $null })
+    $prevLast = [decimal]$log.LastLSN
+    $recoveredTo = $log.Finish
+  }
+  $steps[$steps.Count - 1].Recovery = $true
+  return [pscustomobject]@{ Steps = @($steps.ToArray()); RecoveredTo = $recoveredTo }
+}
+
+# Pure. Which database to test: never tested first, then the longest ago, ties by name.
+function Select-SebRestoreTestDatabase {
+  param([string[]]$Databases = @(), $History)
+  $ranked = foreach ($db in @($Databases | Where-Object { $_ })) {
+    $last = $null
+    if ($null -ne $History) {
+      $entry = $null
+      if ($History -is [System.Collections.IDictionary]) { if ($History.Contains($db)) { $entry = $History[$db] } }
+      elseif ($History.PSObject.Properties[$db]) { $entry = $History.$db }
+      if ($null -ne $entry) { $last = ConvertFrom-SebUtc $entry.LastUtc }
+    }
+    if ($null -eq $last) { $last = [datetime]::MinValue }
+    [pscustomobject]@{ Name = $db; Last = $last }
+  }
+  $pick = @($ranked | Sort-Object Last, Name) | Select-Object -First 1
+  if ($null -eq $pick) { return $null }
+  return $pick.Name
+}
+
+# The scratch name. The prefix is reserved: leftovers carrying it are ours to drop.
+$script:SebRestoreTestPrefix = 'SebRestoreTest_'
+function Get-SebRestoreTestName {
+  param([string]$Database)
+  return ($script:SebRestoreTestPrefix + ($Database -replace '[^A-Za-z0-9_]', '_'))
+}
+
+function Test-SebRestoreTestSpace {
+  param([long]$RequiredBytes, [long]$FreeBytes)
+  return ($FreeBytes -ge [long]([math]::Ceiling($RequiredBytes * 1.1)))
+}
+
+function Get-SebRestoreTestConditions {
+  param($Result)
+  $owner = 'restore-test:' + $Result.Database
+  if ($Result.Result -eq 'failed') {
+    return @(New-SebAlertCondition -Key ('restore-test-failed:' + $Result.Database) -Severity 'critical' -Owner $owner -Message (
+        'The restore test of {0} FAILED - its newest backup could not be proven restorable: {1}' -f $Result.Database, $Result.Message))
+  }
+  if ($Result.Result -eq 'skipped') {
+    return @(New-SebAlertCondition -Key ('restore-test-skipped:' + $Result.Database) -Severity 'warning' -Owner $owner -Message (
+        'The restore test of {0} was skipped: {1}' -f $Result.Database, $Result.Message))
+  }
+  return @()
+}
+
+# Drop a scratch database, whatever state it is in (a failed RESTORE leaves it RESTORING,
+# where SET SINGLE_USER is refused, so that is attempted and allowed to fail).
+function Remove-SebRestoreTestDatabase {
+  param($Connection, [string]$Name)
+  if (-not $Name.StartsWith($script:SebRestoreTestPrefix, [System.StringComparison]::Ordinal)) { throw "refusing to drop $Name - not a restore-test database" }
+  $q = Get-SebQuotedName $Name
+  $lit = Get-SebSqlLiteral $Name
+  try { Invoke-SebSqlNonQuery -Connection $Connection -Sql ("IF DB_ID({0}) IS NOT NULL AND DATABASEPROPERTYEX({0}, 'Status') = 'ONLINE' ALTER DATABASE {1} SET SINGLE_USER WITH ROLLBACK IMMEDIATE" -f $lit, $q) } catch { }
+  Invoke-SebSqlNonQuery -Connection $Connection -Sql ("IF DB_ID({0}) IS NOT NULL DROP DATABASE {1}" -f $lit, $q)
+}
+
+# Impure. Test one database. Never throws: every outcome is a result.
+function Invoke-SebRestoreTest {
+  param($Connection, $Config, [string]$Database)
+  $started = (Get-Date).ToUniversalTime()
+  $watch = [System.Diagnostics.Stopwatch]::StartNew()
+  $name = Get-SebRestoreTestName -Database $Database
+  $workDir = Join-Path ([string]$Config.StagingPath) 'restore-test'
+  $result = [pscustomobject]@{ Database = $Database; Result = 'failed'; Message = ''; LastUtc = $started.ToString('o'); DurationSeconds = 0; Steps = 0; RecoveredToUtc = '' }
+  try {
+    # Anything left by an interrupted earlier test goes first - only ever our own prefix.
+    $leftovers = Invoke-SebSqlTable -Connection $Connection -Sql ("SELECT name FROM sys.databases WHERE name LIKE {0}" -f (Get-SebSqlLiteral ($script:SebRestoreTestPrefix.Replace('_', '[_]') + '%')))
+    foreach ($row in @($leftovers)) {
+      if ($null -eq $row) { continue }
+      $leftover = [string](Get-SebValue $row.name)
+      if ([string]::IsNullOrWhiteSpace($leftover)) { continue }   # an empty result set, not a database
+      Write-SebLog ('dropping {0}, left by an interrupted restore test' -f $leftover) 'WARN'
+      Remove-SebRestoreTestDatabase -Connection $Connection -Name $leftover
+    }
+    if (Test-Path -LiteralPath $workDir) { Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue }
+    [void](New-Item -ItemType Directory -Path $workDir -Force)
+    # Staging is granted to the SQL service account; say so again for the subfolder in case
+    # inheritance was broken, because RESTORE writes these files as that account.
+    # Whoever runs the test keeps the right to clean the folder up afterwards.
+    if (-not [string]::IsNullOrWhiteSpace([string]$Config.SqlServiceAccount)) {
+      try { Set-SebStagingAcl -Path $workDir -SqlAccount ([string]$Config.SqlServiceAccount) -AlsoGrant @([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) } catch { }
+    }
+
+    Write-SebLog ('restore test: {0} -> {1}' -f $Database, $name)
+    $cat = @(Get-SebPointCatalogue -Connection $Connection -Root ([string]$Config.SharePath) -HostName $env:COMPUTERNAME -InstanceLabel ([string]$Config.InstanceName) -Database $Database)
+    $plan = Get-SebLatestRestorePlan -Catalogue $cat
+    if ($plan.Error) { throw $plan.Error }
+    $result.Steps = @($plan.Steps).Count
+
+    # Invoked from inside Invoke-SebRestoreSteps; $workDir resolves to the same folder
+    # there (its -WorkDir) and here.
+    $spaceCheck = {
+      param($info)
+      $need = [long]0
+      foreach ($f in @($info.Files)) { $need += [long]$f.SizeBytes }
+      $drive = New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $workDir).Path))
+      if (-not (Test-SebRestoreTestSpace -RequiredBytes $need -FreeBytes $drive.AvailableFreeSpace)) {
+        throw ('SEB_RESTORE_TEST_SPACE the restored copy needs about {0} MB and the staging drive has {1} MB free' -f [long]($need * 1.1 / 1MB), [long]($drive.AvailableFreeSpace / 1MB))
+      }
+    }
+    [void](Invoke-SebRestoreSteps -Connection $Connection -Steps $plan.Steps -RestoreAs $name -DataDir $workDir -LogDir $workDir -WorkDir $workDir -BeforeRestore $spaceCheck)
+
+    Write-SebStage -Database $name -Stage 'checkdb'
+    Invoke-SebSqlNonQuery -Connection $Connection -Sql ('DBCC CHECKDB ({0}) WITH NO_INFOMSGS, ALL_ERRORMSGS' -f (Get-SebQuotedName $name))
+    $result.Result = 'ok'
+    $result.RecoveredToUtc = ([datetime]$plan.RecoveredTo).ToUniversalTime().ToString('o')
+    $result.Message = ('{0} step(s) restored to {1:yyyy-MM-dd HH:mm}; DBCC CHECKDB clean' -f $result.Steps, [datetime]$plan.RecoveredTo)
+  }
+  catch {
+    $msg = [string]$_.Exception.Message
+    if ($msg -match '^SEB_RESTORE_TEST_SPACE (.*)$') { $result.Result = 'skipped'; $result.Message = $Matches[1] }
+    else { $result.Result = 'failed'; $result.Message = $msg }
+  }
+  finally {
+    try { Remove-SebRestoreTestDatabase -Connection $Connection -Name $name }
+    catch { Write-SebLog ('could not drop the restore-test database {0}: {1}' -f $name, $_.Exception.Message) 'WARN' }
+    if (Test-Path -LiteralPath $workDir) { Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue }
+    $watch.Stop()
+    $result.DurationSeconds = [int]$watch.Elapsed.TotalSeconds
+  }
+  $level = 'INFO'
+  if ($result.Result -ne 'ok') { $level = 'WARN' }
+  Write-SebLog ('restore test of {0}: {1} - {2} ({3}s)' -f $Database, $result.Result, $result.Message, $result.DurationSeconds) $level
+  return $result
+}
+
+# The databases a restore test can choose from: those with a folder of backups for this
+# host and instance on the share.
+function Get-SebRestoreTestCandidates {
+  param($Config)
+  $root = Join-Path (Join-Path ([string]$Config.SharePath) (Get-SebSafeName $env:COMPUTERNAME)) (Get-SebSafeName ([string]$Config.InstanceName))
+  if (-not (Test-Path -LiteralPath $root)) { return @() }
+  return @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object {
+      @(Get-SebFolderFacts -Directory (Join-Path $_.FullName 'hourly')).Count -gt 0 -or @(Get-SebFolderFacts -Directory (Join-Path $_.FullName 'daily')).Count -gt 0
+    } | ForEach-Object { $_.Name })
+}
+
+# Record a result in state (next to the others) and hand it to alerting.
+function Save-SebRestoreTestResult {
+  param($Config, $Result)
+  $state = Read-SebState
+  $tests = [ordered]@{}
+  if ($state.PSObject.Properties['RestoreTests'] -and $null -ne $state.RestoreTests) {
+    foreach ($p in @($state.RestoreTests.PSObject.Properties)) { $tests[$p.Name] = $p.Value }
+  }
+  $tests[$Result.Database] = $Result
+  Write-SebState ([pscustomobject]@{ RestoreTests = $tests })
+  Invoke-SebAlertEvaluation -Config $Config -Owners @('restore-test:' + $Result.Database) -Conditions @(Get-SebRestoreTestConditions -Result $Result)
 }
 
 function Invoke-SebSelfTest {
@@ -4494,12 +4793,14 @@ try {
     $carry = Get-SebSetupCarryOver -Existing $existingConfig -Bound @($PSBoundParameters.Keys) -Values @{
       RecoveryMode = $RecoveryMode; LogIntervalMinutes = $LogIntervalMinutes; FullEveryHours = $FullEveryHours
       CompressBackups = $CompressBackups.IsPresent; NoHashVerify = $NoHashVerify.IsPresent
+      RestoreTesting = ($RestoreTesting -eq 'On'); RestoreTestTime = $RestoreTestTime
     }
     Invoke-SebSetup -PinnedInstance $Instance -Share $SharePath -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
       -WindowsAuth:$UseWindowsAuth -SkipHash:([bool]$carry.NoHashVerify) `
       -RecoveryMode ([string]$carry.RecoveryMode) -LogIntervalMinutes ([int]$carry.LogIntervalMinutes) `
-      -FullEveryHours ([int]$carry.FullEveryHours) -CompressBackups:([bool]$carry.CompressBackups)
+      -FullEveryHours ([int]$carry.FullEveryHours) -CompressBackups:([bool]$carry.CompressBackups) `
+      -RestoreTesting ([bool]$carry.RestoreTesting) -RestoreTestTime ([string]$carry.RestoreTestTime)
   }
   elseif ($Install) {
     Assert-SebElevated -Mode 'Install'
@@ -4541,6 +4842,8 @@ try {
     # $CompressBackups is a [switch]; persist its .IsPresent (a real bool), not the switch
     # object itself - ConvertTo-Json would not serialize a SwitchParameter as a plain true/false.
     if ($PSBoundParameters.ContainsKey('CompressBackups')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'CompressBackups' -Value $CompressBackups.IsPresent -Force }
+    if ($PSBoundParameters.ContainsKey('RestoreTesting')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'RestoreTesting' -Value ($RestoreTesting -eq 'On') -Force }
+    if ($PSBoundParameters.ContainsKey('RestoreTestTime')) { Add-Member -InputObject $config -MemberType NoteProperty -Name 'RestoreTestTime' -Value $RestoreTestTime -Force }
     Write-SebConfig -Config $config
     $schedule = Get-SebScheduleState
     $scriptPath = Get-SebScriptPath
@@ -4588,6 +4891,8 @@ try {
         LogIntervalMinutes = $echoLogIntervalMinutes
         FullEveryHours     = $echoFullEveryHours
         CompressBackups    = $echoCompressBackups
+        RestoreTesting     = ($config.PSObject.Properties['RestoreTesting'] -and [bool]$config.RestoreTesting)
+        RestoreTestTime    = $(if ($config.PSObject.Properties['RestoreTestTime']) { [string]$config.RestoreTestTime } else { '03:30' })
       } -Compress)
   }
   elseif ($RestoreList) {
@@ -4774,7 +5079,7 @@ try {
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
       -WindowsAuth -SkipHash:$NoHashVerify `
       -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours `
-      -CompressBackups:$CompressBackups
+      -CompressBackups:$CompressBackups -RestoreTesting ($RestoreTesting -eq 'On') -RestoreTestTime $RestoreTestTime
 
     Write-Host ''
     Write-Host '== 3/5  schedule ======================================================'
@@ -4814,7 +5119,52 @@ try {
   elseif ($Status) {
     Assert-SebElevated -Mode 'Status'
     Show-SebStatus
+    Show-SebRestoreTestStatus
     Show-SebAlertStatus
+  }
+  elseif ($TestRestore) {
+    Assert-SebElevated -Mode 'TestRestore'
+    $config = Read-SebConfig
+    $candidates = @(Get-SebRestoreTestCandidates -Config $config)
+    $pick = $null
+    if (-not [string]::IsNullOrWhiteSpace($Database)) {
+      $pick = Get-SebSafeName $Database
+      if ($candidates -notcontains $pick) { throw ("no backups of '{0}' on the share for this instance - nothing to test" -f $Database) }
+    }
+    else {
+      $st = Read-SebState
+      $history = $null
+      if ($st.PSObject.Properties['RestoreTests']) { $history = $st.RestoreTests }
+      $pick = Select-SebRestoreTestDatabase -Databases $candidates -History $history
+    }
+    if ($null -eq $pick) {
+      Write-SebLog 'restore test: there are no backups on the share yet - nothing to test'
+      Write-Host (ConvertTo-Json @{ Ok = $true; Result = 'nothing to test' } -Compress)
+    }
+    else {
+      $password = $null
+      $connection = $null
+      try {
+        if ($config.UseWindowsAuth) { $connection = New-SebSqlConnection -DataSource $config.DataSource -WindowsAuth }
+        else {
+          $master = Get-SebMasterKey
+          try { $password = Unprotect-SebSecureString -Blob ((Get-Content -LiteralPath (Get-SebCredPath) -Raw).Trim()) -Master $master }
+          finally { [System.Array]::Clear($master, 0, $master.Length) }
+          $connection = New-SebSqlConnection -DataSource $config.DataSource -User $config.SqlUser -Password $password
+        }
+        $testResult = Invoke-SebRestoreTest -Connection $connection -Config $config -Database $pick
+        Save-SebRestoreTestResult -Config $config -Result $testResult
+        Write-Host (ConvertTo-Json @{
+            Ok = ($testResult.Result -eq 'ok'); Database = $testResult.Database; Result = $testResult.Result; Message = $testResult.Message
+            Steps = $testResult.Steps; RecoveredToUtc = $testResult.RecoveredToUtc; DurationSeconds = $testResult.DurationSeconds
+          } -Compress)
+        if ($testResult.Result -eq 'skipped') { $exitCode = 1 } elseif ($testResult.Result -ne 'ok') { $exitCode = 2 }
+      }
+      finally {
+        if ($null -ne $connection) { $connection.Dispose() }
+        if ($null -ne $password) { $password.Dispose() }
+      }
+    }
   }
   elseif ($ConfigureAlerts) {
     Assert-SebElevated -Mode 'ConfigureAlerts'
@@ -5024,7 +5374,7 @@ catch {
   $failedMode = 'Run'
   foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest', 'BackupLog', 'Reschedule',
       'RestoreList', 'RestoreInspect', 'RestoreVerify', 'RestoreRun', 'RestoreToPoint',
-      'ConfigureAlerts', 'ClearAlerts', 'TestAlert', 'Watchdog')) {
+      'ConfigureAlerts', 'ClearAlerts', 'TestAlert', 'Watchdog', 'TestRestore')) {
     $v = Get-Variable -Name $m -ValueOnly -ErrorAction SilentlyContinue
     if ($v) { $failedMode = $m; break }
   }

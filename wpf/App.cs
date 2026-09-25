@@ -33,7 +33,7 @@ class SebWpf
         // writes a "exit=N\n<output>" result file the non-elevated UI polls.
         bool backupNow = false;
         string rescheduleJson = null, applySetupJson = null, liveFile = null;
-        string alertsJson = null; bool testAlert = false, clearAlerts = false;
+        string alertsJson = null; bool testAlert = false, clearAlerts = false, testRestore = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
@@ -50,6 +50,7 @@ class SebWpf
             if (args[i] == "--configure-alerts" && i + 1 < args.Length) { alertsJson = args[++i]; }
             if (args[i] == "--test-alert") { testAlert = true; }
             if (args[i] == "--clear-alerts") { clearAlerts = true; }
+            if (args[i] == "--test-restore") { testRestore = true; }
         }
 
         // Silent portable setup: extract to a folder and launch it there. Also the path
@@ -118,6 +119,12 @@ class SebWpf
             if (!Install.IsElevated()) { Install.Relaunch("--configure-alerts \"" + alertsJson + "\"" + LiveArg(liveFile), true); return 0; }
             AppSettings.Mode = Install.DetectMode();
             return WithJobEngine(liveFile, delegate { return RunEngineHeadless(BuildAlertArgs(alertsJson), liveFile); });
+        }
+        if (testRestore)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--test-restore" + LiveArg(liveFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless("-TestRestore", liveFile); });
         }
         if (testAlert || clearAlerts)
         {
@@ -332,6 +339,18 @@ class SebWpf
             bool on = false;
             try { on = Convert.ToBoolean(d["CompressBackups"]); } catch { }
             a += on ? " -CompressBackups" : " -NoCompressBackups";
+        }
+        if (d.ContainsKey("RestoreTesting"))
+        {
+            bool on = false;
+            try { on = Convert.ToBoolean(d["RestoreTesting"]); } catch { }
+            a += " -RestoreTesting " + (on ? "On" : "Off");
+        }
+        // HH:mm only - the engine's ValidatePattern would refuse anything else anyway, and
+        // refusing it here keeps a typo from failing the whole elevated job.
+        if (d.ContainsKey("RestoreTestTime") && System.Text.RegularExpressions.Regex.IsMatch(Str(d["RestoreTestTime"]), "^([01][0-9]|2[0-3]):[0-5][0-9]$"))
+        {
+            a += " -RestoreTestTime " + Str(d["RestoreTestTime"]);
         }
         return a;
     }
