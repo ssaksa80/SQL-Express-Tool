@@ -39,6 +39,7 @@ $sources = @(
   (Join-Path $here 'wpf\RestoreWindow.cs'),
   (Join-Path $here 'wpf\SetupWizard.cs'),
   (Join-Path $here 'wpf\AlertsWindow.cs'),
+  (Join-Path $here 'wpf\EncryptionWindow.cs'),
   (Join-Path $here 'wpf\Install.cs'),
   (Join-Path $here 'wpf\InstallProgress.cs'),
   (Join-Path $here 'wpf\FirstRun.cs')

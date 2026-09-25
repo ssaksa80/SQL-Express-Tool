@@ -34,6 +34,7 @@ class SebWpf
         bool backupNow = false;
         string rescheduleJson = null, applySetupJson = null, liveFile = null;
         string alertsJson = null; bool testAlert = false, clearAlerts = false, testRestore = false;
+        string setupEncryptionFile = null, importKeyFile = null; bool rotateKey = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
@@ -51,6 +52,9 @@ class SebWpf
             if (args[i] == "--test-alert") { testAlert = true; }
             if (args[i] == "--clear-alerts") { clearAlerts = true; }
             if (args[i] == "--test-restore") { testRestore = true; }
+            if (args[i] == "--setup-encryption" && i + 1 < args.Length) { setupEncryptionFile = args[++i]; }
+            if (args[i] == "--rotate") { rotateKey = true; }
+            if (args[i] == "--import-encryption-key" && i + 1 < args.Length) { importKeyFile = args[++i]; }
         }
 
         // Silent portable setup: extract to a folder and launch it there. Also the path
@@ -120,6 +124,21 @@ class SebWpf
             AppSettings.Mode = Install.DetectMode();
             return WithJobEngine(liveFile, delegate { return RunEngineHeadless(BuildAlertArgs(alertsJson), liveFile); });
         }
+        // Encryption key jobs. The passphrase / recovery key arrive in a DPAPI-CurrentUser
+        // file the engine reads and deletes; only that file's PATH is on a command line.
+        if (setupEncryptionFile != null)
+        {
+            string again = "--setup-encryption \"" + setupEncryptionFile + "\"" + (rotateKey ? " --rotate" : "");
+            if (!Install.IsElevated()) { Install.Relaunch(again + LiveArg(liveFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless("-SetupEncryption -EncryptionSecretsFile " + Engine.QuoteArg(setupEncryptionFile) + (rotateKey ? " -RotateKey" : ""), liveFile); });
+        }
+        if (importKeyFile != null)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--import-encryption-key \"" + importKeyFile + "\"" + LiveArg(liveFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless("-ImportEncryptionKey -EncryptionSecretsFile " + Engine.QuoteArg(importKeyFile), liveFile); });
+        }
         if (testRestore)
         {
             if (!Install.IsElevated()) { Install.Relaunch("--test-restore" + LiveArg(liveFile), true); return 0; }
@@ -163,8 +182,10 @@ class SebWpf
                 FrameworkElement d = new DbaView(null).Build();
                 FrameworkElement rw = new RestoreWindow().BuildRoot();
                 FrameworkElement aw = new AlertsWindow().BuildRoot();
+                FrameworkElement ew = new EncryptionWindow().BuildRoot();
                 File.WriteAllText(checkFile, "WPF-CHECK-OK view=" + settings.View + " theme=" + settings.Theme +
-                    " modern=" + (m != null) + " dba=" + (d != null) + " restore=" + (rw != null) + " alerts=" + (aw != null));
+                    " modern=" + (m != null) + " dba=" + (d != null) + " restore=" + (rw != null) + " alerts=" + (aw != null) +
+                    " encryption=" + (ew != null));
                 return 0;
             }
             catch (Exception ex)
@@ -339,6 +360,12 @@ class SebWpf
             bool on = false;
             try { on = Convert.ToBoolean(d["CompressBackups"]); } catch { }
             a += on ? " -CompressBackups" : " -NoCompressBackups";
+        }
+        if (d.ContainsKey("EncryptBackups"))
+        {
+            bool on = false;
+            try { on = Convert.ToBoolean(d["EncryptBackups"]); } catch { }
+            a += " -EncryptBackups " + (on ? "On" : "Off");
         }
         if (d.ContainsKey("RestoreTesting"))
         {

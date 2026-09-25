@@ -74,6 +74,7 @@ class ModernView
         sp.Children.Add(Ui.NavItem("", "Restore", false, openRestore));
         sp.Children.Add(Ui.NavItem("", "Schedule", false, ShowSchedule));
         sp.Children.Add(Ui.NavItem("", "Alerts", false, OpenAlerts));
+        sp.Children.Add(Ui.NavItem("", "Encryption", false, OpenEncryption));
         sp.Children.Add(Ui.NavItem("", "Activity", false, ShowFullLog));
 
         b.Child = sp;
@@ -668,6 +669,12 @@ class ModernView
         DateTime d;
         if (!DateTime.TryParse(utc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out d)) { return ""; }
         return "  (since " + d.ToLocalTime().ToString("d MMM HH:mm", CultureInfo.CurrentCulture) + ")";
+    }
+
+    void OpenEncryption()
+    {
+        EncryptionWindow w = new EncryptionWindow();
+        w.Show(Application.Current != null ? Application.Current.MainWindow : null, delegate { Refresh(); });
     }
 
     void OpenAlerts()

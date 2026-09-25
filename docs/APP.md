@@ -200,6 +200,19 @@ credential, so it runs elevated; when the app is not already elevated it runs th
 an elevated job and streams the same glowing progress bar and activity log a scheduled run
 would.
 
+### Encryption
+
+**Encryption** (in the sidebar) shows whether new backups are encrypted, and with which key. Each action is one elevated step:
+
+- **Set up encryption:** choose a passphrase (12+ characters, entered twice). The window then shows the **recovery key**, once, in its own panel with a **Copy** button. The window will not close until you tick that you have stored it. The recovery key never appears in the scrolling log.
+- **Make a new key:** rotation. New backups use the new key; the old one is kept, so older backups still restore.
+- **Stop / resume encrypting new backups:** keys are kept either way.
+- **Import a key:** for a server rebuilt after a loss. Enter the passphrase *or* the recovery key; the key copy is read from the share.
+
+The passphrase and recovery key go to the elevated step in a file encrypted with DPAPI for your user, never on a command line, and the engine deletes the file once read.
+
+Encrypted backups can only be read with keys that only administrators can open. So in the restore window, an encrypted set, or a point-in-time restore through one, shows **Open the restore window as administrator** in place of an inspect that could only fail.
+
 ### Restore testing
 
 The setup wizard's **Protection** section has **Test restores daily** at a time you choose. It is ticked for a first setup and matches the current setting on a reconfigure.
@@ -254,6 +267,8 @@ Useful for scripted deployment and for testing:
 | `--apply-setup <file>` | Configure and schedule from a JSON file, Windows auth (elevates). Behind the setup wizard. |
 | `--configure-alerts <file>` | Apply the alert settings in a JSON file; secrets come from the DPAPI file it names (elevates). Behind **Alerts → Save**. |
 | `--test-alert` | Send a test through every configured channel (elevates). Behind **Send test alert**. |
+| `--setup-encryption <file> [--rotate]` | Set up (or rotate) the encryption key; the passphrase comes from the DPAPI file named (elevates). Behind **Encryption**. |
+| `--import-encryption-key <file>` | Import a key from the share's escrow with the passphrase or recovery key in the DPAPI file named (elevates). |
 | `--test-restore` | Run one restore test now (elevates). Behind **Test a restore**. |
 | `--clear-alerts` | Remove all alert settings, secrets and the watchdog task (elevates). Behind **Turn alerts off**. |
 | `--live <file>` | With any elevated job above: stream the engine's output to `<file>`, ending in `[EXIT] N`, so the launching app can tail it live across the UAC boundary. |

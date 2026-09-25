@@ -378,6 +378,16 @@ class RestoreWindow
         selectedRow = row; row.Background = Theme.AccentBg;
         current = r; inspected = null;
         detail.Children.Clear();
+        // An encrypted set can only be read with the keys, which only an administrator can
+        // open. Say so and offer the elevated window, rather than run an inspect that can
+        // only fail and would read as "SQL cannot read this file".
+        if (IsEncrypted(r.Path) && !Install.IsElevated())
+        {
+            detail.Children.Add(Ui.Text(r.Database, 18, Theme.Ink, FontWeights.SemiBold));
+            detail.Children.Add(Margin(Ui.Text("from " + LocalTime(r.TakenUtc), 12.5, Theme.Ink3), 0, 2, 0, 14));
+            detail.Children.Add(ElevateNotice("This backup is encrypted. Its keys are readable only by administrators, so inspecting, verifying or restoring it needs the restore window opened as administrator."));
+            return;
+        }
         detail.Children.Add(Ui.Text("Reading " + System.IO.Path.GetFileName(r.Path) + "…", 13, Theme.Ink3));
         Thread t = new Thread(delegate ()
         {
@@ -796,6 +806,10 @@ class RestoreWindow
             detail.Children.Add(Ui.Text("No databases with backup sets yet.", 13, Theme.Ink3));
             return;
         }
+        if (!Install.IsElevated() && AnyEncrypted())
+        {
+            detail.Children.Add(Margin(ElevateNotice("Some of these backups are encrypted. Replaying them needs the keys, which only an administrator can open - a point-in-time restore through them will fail here."), 0, 0, 0, 14));
+        }
 
         detail.Children.Add(Ui.Eyebrow("Source database"));
         pointDbBox = new ComboBox(); pointDbBox.Width = 260; pointDbBox.FontSize = 12.5;
@@ -1096,6 +1110,33 @@ class RestoreWindow
         if (i < 0) return "";
         return line.Substring(i + key.Length + 1).TrimEnd();
     }
+    static bool IsEncrypted(string path) { return path != null && path.EndsWith(".enc", StringComparison.OrdinalIgnoreCase); }
+
+    bool AnyEncrypted()
+    {
+        foreach (List<RestoreSet> sets in byDb.Values) { foreach (RestoreSet s in sets) { if (IsEncrypted(s.Path)) { return true; } } }
+        return false;
+    }
+
+    // "Needs administrator" with the way through: this same window, relaunched elevated.
+    Border ElevateNotice(string text)
+    {
+        Border b = new Border();
+        b.CornerRadius = new CornerRadius(8); b.BorderThickness = new Thickness(1);
+        b.BorderBrush = Theme.Warn; b.Background = Theme.WarnBg; b.Padding = new Thickness(14, 12, 14, 12);
+        StackPanel sp = new StackPanel();
+        TextBlock t = Ui.Text(text, 12.5, Theme.Ink); t.TextWrapping = TextWrapping.Wrap;
+        sp.Children.Add(t);
+        Border go = Ui.PrimaryButton("Open the restore window as administrator", delegate
+        {
+            if (Install.Relaunch("--restore", true) && win != null) { win.Close(); }
+        });
+        go.HorizontalAlignment = HorizontalAlignment.Left; go.Margin = new Thickness(0, 10, 0, 0);
+        sp.Children.Add(go);
+        b.Child = sp;
+        return b;
+    }
+
     // Whether this host runs point-in-time (Full) mode, from the public summary. Read once
     // per window: it only picks which explanation to show, never what the restore does.
     bool? hostFullMode;

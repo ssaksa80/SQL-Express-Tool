@@ -1,7 +1,7 @@
 # Backup Encryption at Rest — Design Spec
 
 - **Date:** 2026-09-25
-- **Status:** Design decisions approved (key recovery model, existing backups). Increment 1 (engine) implemented and tested; increment 2 (app) next.
+- **Status:** Design decisions approved (key recovery model, existing backups). Increment 1 (engine) and increment 2 (app: Encryption window, one-time recovery-key reveal, elevated restore of encrypted sets) implemented.
 - **Component:** SQL-Express-Tool — `Invoke-SqlExpressBackup.ps1` (engine, increment 1); `wpf/` (increment 2)
 - **Feature:** Roadmap feature 2 ("Protect the backups"), **increment 2 of 3** — ENCRYPTION. Compression (increment 1) shipped; immutability/WORM is increment 3.
 

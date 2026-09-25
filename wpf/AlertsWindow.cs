@@ -212,7 +212,7 @@ class AlertsWindow
     }
 
     // DPAPI CurrentUser, base64 - the format the engine's Read-SebAlertSecretsFile expects.
-    static string WriteSecretsFile(Dictionary<string, string> secrets)
+    public static string WriteSecretsFile(Dictionary<string, string> secrets)
     {
         byte[] plain = System.Text.Encoding.UTF8.GetBytes(new JavaScriptSerializer().Serialize(secrets));
         try
@@ -225,7 +225,7 @@ class AlertsWindow
         finally { Array.Clear(plain, 0, plain.Length); }
     }
 
-    static void DeleteQuietly(string path)
+    public static void DeleteQuietly(string path)
     {
         if (path == null) { return; }
         try { if (File.Exists(path)) { File.Delete(path); } } catch { }

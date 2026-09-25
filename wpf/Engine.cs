@@ -40,6 +40,9 @@ class BackupStatus
     public bool RestoreTesting = false;
     public string RestoreTestTime = "03:30";
     public List<RestoreTestResult> RestoreTests = new List<RestoreTestResult>();
+    // Encryption: on for new backups, and the key they use (an id, never key material).
+    public bool EncryptBackups = false;
+    public string ActiveKeyId = "";
 }
 
 class RestoreTestResult
@@ -146,6 +149,8 @@ static class Engine
             s.AlertHasSmtpPassword = Bool(d, "AlertHasSmtpPassword");
             s.AlertHasWebhook = Bool(d, "AlertHasWebhook");
             s.AlertHasHeartbeat = Bool(d, "AlertHasHeartbeat");
+            s.EncryptBackups = Bool(d, "EncryptBackups");
+            s.ActiveKeyId = Str(d, "ActiveKeyId");
             s.RestoreTesting = Bool(d, "RestoreTesting");
             string rtt = Str(d, "RestoreTestTime");
             if (rtt.Length == 5) { s.RestoreTestTime = rtt; }

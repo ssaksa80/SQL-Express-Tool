@@ -2118,7 +2118,16 @@ foreach ($f in @([regex]::Matches($pm.Value, '" -(\w+)') | ForEach-Object { $_.G
 }
 $rtSet = @(@($engineParams['RestoreTesting'].Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' })[0].PositionalArguments | ForEach-Object { $_.Value })
 Assert (($rtSet -contains 'On') -and ($rtSet -contains 'Off')) 'the engine accepts -RestoreTesting On and Off, which is what the app sends'
-foreach ($job in @('--configure-alerts', '--test-alert', '--clear-alerts', '--test-restore')) {
+# Encryption jobs: every engine flag the app puts on their command lines must exist, and
+# the passphrase / recovery key only ever travel as a secrets FILE.
+foreach ($f in @('SetupEncryption', 'RotateKey', 'ImportEncryptionKey', 'EncryptionSecretsFile', 'EncryptBackups')) {
+  Assert ($appSrc -match ('-' + $f + '\b')) "App.cs emits -$f"
+  Assert ($engineParams.ContainsKey($f)) "the engine has -$f"
+}
+$ebSet = @(@($engineParams['EncryptBackups'].Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' })[0].PositionalArguments | ForEach-Object { $_.Value })
+Assert (($ebSet -contains 'On') -and ($ebSet -contains 'Off')) 'the engine accepts -EncryptBackups On and Off, which is what the app sends'
+Assert ($appSrc -notmatch '-Passphrase\b' -and $appSrc -notmatch '-RecoveryKey\b') 'the app never passes a passphrase or recovery key as a command-line value'
+foreach ($job in @('--configure-alerts', '--test-alert', '--clear-alerts', '--test-restore', '--setup-encryption', '--import-encryption-key')) {
   Assert ($appSrc -match [regex]::Escape('"' + $job + '"')) "App.cs handles the $job job"
 }
 
