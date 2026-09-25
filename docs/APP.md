@@ -269,6 +269,20 @@ embedded as a resource at build time.
 | `-OutDir <dir>` | Write the build somewhere other than `dist`. |
 | `-Quiet` | Suppress progress output. |
 
+### With the .NET SDK
+
+Where the .NET SDK is installed, `wpf\SqlExpressBackup.csproj` builds the same
+executable with `dotnet` (and opens in Visual Studio):
+
+```powershell
+dotnet build wpf\SqlExpressBackup.csproj -c Release
+```
+
+The result is `dist-dotnet\SqlExpressBackup.exe`. It still targets .NET Framework 4.8,
+so it runs on any server with no runtime to install, and it pins C# 5 to match the
+in-box compiler, so a change that builds one way builds the other. The project does not
+sign; run `Set-AuthenticodeSignature` on the output, or use `build-wpf.ps1 -SelfSign`.
+
 The `--check` smoke mode constructs every view and the restore window without showing a
 window, so a broken layout fails a build check rather than an operator's first click.
 

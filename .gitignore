@@ -3,9 +3,13 @@
 # trustworthy. Rebuild whenever needed.
 #   dist/          - the WPF app (build-wpf.ps1): installs, sets up, uninstalls
 #   dist-winforms/ - the legacy WinForms console (build-app.ps1)
+#   dist-dotnet/   - the WPF app via dotnet build (wpf/SqlExpressBackup.csproj)
 dist/
 dist-winforms/
 dist-wpf*/
+dist-dotnet/
+wpf/obj/
+wpf/bin/
 
 # Local run transcripts - may contain real host/account/DB names, never commit
 *-last-run.log

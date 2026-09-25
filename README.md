@@ -14,7 +14,7 @@ There are two ways to drive the same engine, and one engine underneath both:
 - **The application** — a modern, DPI-native Windows app with a Modern/DBA view toggle,
   a real restore window, and portable or installed modes with a self-registering
   installer. This is the one to reach for. See **[docs/APP.md](docs/APP.md)**, built
-  with `build-wpf.ps1`.
+  with `build-wpf.ps1` (no SDK needed) or `dotnet build wpf\SqlExpressBackup.csproj`.
 - **The console** — the original operator window described below, built with
   `build-app.ps1`. Still supported; lighter, and the reference for how the engine is
   set up and scheduled.

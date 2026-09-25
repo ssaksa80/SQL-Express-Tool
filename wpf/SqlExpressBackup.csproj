@@ -1,0 +1,45 @@
+<!--
+  The WPF shell as an SDK-style project, for `dotnet build` / Visual Studio.
+  build-wpf.ps1 (in-box csc, no SDK) stays as the fallback for build hosts without
+  dotnet; both produce the same single exe. Keep the two in step:
+    - it targets .NET Framework 4.8 so the exe runs on any Windows server with no
+      runtime install (JavaScriptSerializer does not exist on modern .NET anyway)
+    - LangVersion 5 matches the in-box csc, so code that builds here builds there
+    - the engine is embedded under the same resource name Install.cs extracts
+
+  Build:  dotnet build wpf\SqlExpressBackup.csproj -c Release
+  Output: dist-dotnet\SqlExpressBackup.exe
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>5</LangVersion>
+    <AssemblyName>SqlExpressBackup</AssemblyName>
+    <RootNamespace>SqlExpressBackup</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- One flat folder beside the other build outputs, not wpf\bin\Release\net48. -->
+    <OutputPath>$(MSBuildThisFileDirectory)..\dist-dotnet\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="..\Invoke-SqlExpressBackup.ps1">
+      <LogicalName>SqlExpressBackup.engine.ps1</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+</Project>
