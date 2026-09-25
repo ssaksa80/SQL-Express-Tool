@@ -106,7 +106,10 @@ class DbaView
             byDb[r.Database].Add(r);
         }
 
-        tree.Children.Add(TreeRow("", "APPSRV1\\SQLEXPRESS", 0, Theme.Accent, null));
+        BackupStatus st = Engine.ReadStatus();
+        string server = st.DataSource.Length > 0 ? st.DataSource
+            : (st.Host.Length > 0 ? st.Host + (st.Instance.Length > 0 ? "\\" + st.Instance : "") : "(not set up)");
+        tree.Children.Add(TreeRow("", server, 0, Theme.Accent, null));
         tree.Children.Add(TreeRow("", "Databases", 1, Theme.Ink2, null));
         foreach (string db in order)
         {

@@ -30,6 +30,7 @@ class RestoreWindow
     TextBox dataDirBox, logDirBox;
     CheckBox closeConnBox, restrictedBox;
     StackPanel confirmRow;
+    TextBlock confirmLabel;
     TextBox confirmBox;
     Border startBtn;
     GlowBar glow;
@@ -381,7 +382,10 @@ class RestoreWindow
         Thread t = new Thread(delegate ()
         {
             Dictionary<string, object> info = Engine.RestoreInspect(r.Path);
-            Dispatch(delegate { ApplyInspect(info); });
+            // Each inspect is its own powershell process, so they can finish out of order.
+            // A result for a set that is no longer selected is dropped: applied late, it
+            // paired one database's name and REPLACE confirmation with another's file.
+            Dispatch(delegate { if (current == r) { ApplyInspect(info); } });
         });
         t.IsBackground = true; t.Start();
     }
@@ -431,7 +435,8 @@ class RestoreWindow
 
         confirmRow = new StackPanel(); confirmRow.Orientation = Orientation.Horizontal;
         confirmRow.Margin = new Thickness(0, 8, 0, 0); confirmRow.Visibility = Visibility.Collapsed;
-        confirmRow.Children.Add(Margin(Ui.Text("This replaces the live database. Type " + db + " to confirm:", 12, Theme.Bad), 0, 4, 8, 0));
+        confirmLabel = Ui.Text("", 12, Theme.Bad);
+        confirmRow.Children.Add(Margin(confirmLabel, 0, 4, 8, 0));
         confirmBox = new TextBox(); confirmBox.Width = 150; confirmBox.FontSize = 12.5; confirmBox.FontFamily = Ui.Face;
         confirmBox.TextChanged += delegate { UpdateStart(db, readable); };
         confirmRow.Children.Add(confirmBox);
@@ -439,8 +444,18 @@ class RestoreWindow
 
         // greyed-unavailable
         detail.Children.Add(Margin(Ui.Eyebrow("Unavailable here"), 0, 16, 0, 6));
-        detail.Children.Add(Unavailable("Recovery point (STOPAT)", "no log chain — SIMPLE recovery"));
-        detail.Children.Add(Unavailable("Tail-log backup", "impossible under SIMPLE recovery"));
+        // Say why in terms of THIS host: under point-in-time mode the log chain exists and
+        // the other tab uses it, so "no log chain" would be wrong in the middle of an incident.
+        if (HostIsFullMode())
+        {
+            detail.Children.Add(Unavailable("Recovery point (STOPAT)", "restores one backup — use the \"Restore to a point in time\" tab to roll the log forward"));
+            detail.Children.Add(Unavailable("Tail-log backup", "not taken — the restore lands in a new database, leaving the source untouched"));
+        }
+        else
+        {
+            detail.Children.Add(Unavailable("Recovery point (STOPAT)", "no log chain — SIMPLE recovery"));
+            detail.Children.Add(Unavailable("Tail-log backup", "impossible under SIMPLE recovery"));
+        }
 
         // actions
         StackPanel act = new StackPanel(); act.Orientation = Orientation.Horizontal; act.Margin = new Thickness(0, 18, 0, 4);
@@ -474,8 +489,9 @@ class RestoreWindow
         targetBox = new TextBox(); targetBox.Text = TargetName(db);
         targetBox.Width = 260; targetBox.FontSize = 12.5; targetBox.FontFamily = Ui.Face;
         targetBox.HorizontalAlignment = HorizontalAlignment.Left;
-        bool readable = Engine.FieldBool(inspected, "Readable");
-        targetBox.TextChanged += delegate { UpdateStart(db, readable); };
+        // Through UpdateConfirm, not straight to UpdateStart: the confirmation depends on the
+        // target, so retyping the target after ticking REPLACE must re-decide it.
+        targetBox.TextChanged += delegate { UpdateConfirm(db); };
         return targetBox;
     }
     FrameworkElement RecoveryInput()
@@ -518,23 +534,33 @@ class RestoreWindow
         return g;
     }
 
+    // REPLACE always asks for the target's name to be typed. It used to ask only when the
+    // target equalled the source - but the check ran only when the box was ticked, so
+    // ticking first and then retyping the target to the live name skipped it, and REPLACE
+    // onto any OTHER existing database (which -RestoreReplace also lets overwrite files)
+    // never asked at all. The name typed is the database that would be overwritten.
     void UpdateConfirm(string db)
     {
-        bool overwrite = replaceBox.IsChecked == true &&
-            string.Equals(targetBox.Text.Trim(), db, StringComparison.OrdinalIgnoreCase);
-        // REPLACE only truly overwrites when the target IS the live database; if the
-        // target is a new name, REPLACE just allows overwriting stray files.
-        confirmRow.Visibility = (replaceBox.IsChecked == true && string.Equals(targetBox.Text.Trim(), db, StringComparison.OrdinalIgnoreCase))
-            ? Visibility.Visible : Visibility.Collapsed;
+        if (replaceBox == null || confirmRow == null || targetBox == null) { return; }
+        string target = targetBox.Text.Trim();
+        bool replace = replaceBox.IsChecked == true;
+        confirmRow.Visibility = replace ? Visibility.Visible : Visibility.Collapsed;
+        if (replace && confirmLabel != null)
+        {
+            confirmLabel.Text = string.Equals(target, db, StringComparison.OrdinalIgnoreCase)
+                ? "This replaces the LIVE database " + target + ". Type " + target + " to confirm:"
+                : "REPLACE overwrites " + target + " if it exists. Type " + target + " to confirm:";
+        }
         UpdateStart(db, Engine.FieldBool(inspected, "Readable"));
     }
 
     void UpdateStart(string db, bool readable)
     {
         bool ok = !busy && current != null && readable && targetBox != null && targetBox.Text.Trim().Length > 0;
-        if (confirmRow != null && confirmRow.Visibility == Visibility.Visible)
+        if (replaceBox != null && replaceBox.IsChecked == true)
         {
-            ok = ok && confirmBox != null && string.Equals(confirmBox.Text.Trim(), db, StringComparison.Ordinal);
+            ok = ok && confirmBox != null && targetBox != null &&
+                string.Equals(confirmBox.Text.Trim(), targetBox.Text.Trim(), StringComparison.Ordinal);
         }
         if (startBtn != null)
         {
@@ -582,11 +608,17 @@ class RestoreWindow
         sp.Children.Add(Ui.Eyebrow("Recovery details"));
         sp.Children.Add(Detail2("Database", db == "" ? "(unknown)" : db));
         sp.Children.Add(Detail2("Backup taken", LocalTime(current.TakenUtc)));
-        sp.Children.Add(Detail2("Compression", Engine.FieldBool(info, "Compressed") ? "compressed" : "none"));
+        // Two different things: SQL's own backup compression (never on Express) and the
+        // tool's zip on the share. Reading only SQL's flag called every zipped backup "none".
+        bool zipped = current.Path.EndsWith(".zip", StringComparison.OrdinalIgnoreCase);
+        sp.Children.Add(Detail2("Compression", zipped ? "zipped on the share — unzipped to a temp folder for the restore"
+            : (Engine.FieldBool(info, "Compressed") ? "SQL backup compression" : "none")));
         List<PlanFile> files = Files(info);
         long total = 0; foreach (PlanFile f in files) { total += f.Bytes; }
         sp.Children.Add(Detail2("Data size", (total / 1048576) + " MB across " + files.Count + " file(s)"));
-        sp.Children.Add(Detail2("Recovery model", "SIMPLE — full backup, restorable standalone (no log chain to validate)"));
+        sp.Children.Add(Detail2("Recovery model", HostIsFullMode()
+            ? "FULL — this full backup restores standalone; to land on a later minute, use the point-in-time tab"
+            : "SIMPLE — full backup, restorable standalone (no log chain to validate)"));
 
         sp.Children.Add(Divider());
         sp.Children.Add(Ui.Eyebrow("Restore plan (MOVE)"));
@@ -621,12 +653,13 @@ class RestoreWindow
 
         // run the live check
         glow.Status("Verifying " + System.IO.Path.GetFileName(current.Path) + " …");
-        string path = current.Path; string dbName = db;
+        string path = current.Path; string dbName = db; RestoreSet forSet = current;
         Thread t = new Thread(delegate ()
         {
             string err; bool ok = Engine.RestoreVerify(path, out err);
             Dispatch(delegate
             {
+                if (current != forSet) { return; }   // the operator has moved to another set
                 vIcon.Text = ok ? "✓" : "!";
                 vIcon.Foreground = ok ? Theme.Ok : Theme.Bad;
                 vText.Text = ok
@@ -688,11 +721,13 @@ class RestoreWindow
     {
         if (current == null || busy) { return; }
         string target = targetBox.Text.Trim();
+        // Re-check the gate here too, not only through the button's enabled state.
+        if (replaceBox.IsChecked == true && (confirmBox == null || !string.Equals(confirmBox.Text.Trim(), target, StringComparison.Ordinal))) { return; }
         string recovery = recoveryBox.SelectedItem == null ? "RECOVERY" : recoveryBox.SelectedItem.ToString();
-        string args = "-RestoreRun -RestoreFrom \"" + current.Path + "\" -RestoreAs \"" + target + "\" -RestoreRecoveryState " + recovery;
+        string args = "-RestoreRun -RestoreFrom " + Engine.QuoteArg(current.Path) + " -RestoreAs " + Engine.QuoteArg(target) + " -RestoreRecoveryState " + recovery;
         if (replaceBox.IsChecked == true) { args += " -RestoreReplace"; }
-        if (dataDirBox != null && dataDirBox.Text.Trim().Length > 0) { args += " -RestoreDataDir \"" + dataDirBox.Text.Trim() + "\""; }
-        if (logDirBox != null && logDirBox.Text.Trim().Length > 0) { args += " -RestoreLogDir \"" + logDirBox.Text.Trim() + "\""; }
+        if (dataDirBox != null && dataDirBox.Text.Trim().Length > 0) { args += " -RestoreDataDir " + Engine.QuoteArg(dataDirBox.Text.Trim()); }
+        if (logDirBox != null && logDirBox.Text.Trim().Length > 0) { args += " -RestoreLogDir " + Engine.QuoteArg(logDirBox.Text.Trim()); }
         if (closeConnBox != null && closeConnBox.IsChecked == true) { args += " -RestoreCloseConnections"; }
         if (restrictedBox != null && restrictedBox.IsChecked == true) { args += " -RestoreRestrictedUser"; }
 
@@ -704,8 +739,11 @@ class RestoreWindow
         Thread t = new Thread(delegate ()
         {
             int total = 1, index = 0; string stage = "starting"; int pct = -1;
-            Engine.Run(args, delegate(string line)
+            string lastJson = null;
+            int code = Engine.Run(args, delegate(string line)
             {
+                string tl = line.Trim();
+                if (tl.StartsWith("{") && tl.EndsWith("}")) { lastJson = tl; }
                 bool marker = false;
                 if (line.StartsWith("[JOB]")) { index = FieldInt(line, "index", index); total = FieldInt(line, "total", total); marker = true; }
                 else if (line.StartsWith("[STAGE]")) { stage = FieldRest(line, "stage"); marker = true; }
@@ -717,9 +755,19 @@ class RestoreWindow
                     if (!line.StartsWith("[PROGRESS]")) { log.Append(line); }
                 });
             });
+            // Success is the engine saying so: exit 0 AND a final {"Ok":true} line. An
+            // unreadable file, "file already exists", a SQL error or a failed CHECKDB used
+            // to end on the same green "Restore finished" as a good restore.
+            bool ok = code == 0 && Engine.JsonOk(lastJson);
+            string check = Engine.JsonField(lastJson, "Check");
             Dispatch(delegate
             {
-                glow.Finish(true, "Restore finished — " + target + " (source untouched)");
+                if (ok) { glow.Finish(true, "Restore finished — " + target + (replaceBox.IsChecked == true ? "" : " (source untouched)")); }
+                else
+                {
+                    glow.Finish(false, "Restore FAILED — " + target + (check.Length > 0 ? ": " + check : " (see the log above)"));
+                    logHost.Visibility = Visibility.Visible;
+                }
                 busy = false; UpdateStart(db, true);
             });
         });
@@ -1048,6 +1096,15 @@ class RestoreWindow
         if (i < 0) return "";
         return line.Substring(i + key.Length + 1).TrimEnd();
     }
+    // Whether this host runs point-in-time (Full) mode, from the public summary. Read once
+    // per window: it only picks which explanation to show, never what the restore does.
+    bool? hostFullMode;
+    bool HostIsFullMode()
+    {
+        if (!hostFullMode.HasValue) { hostFullMode = Engine.ReadStatus().RecoveryMode == "Full"; }
+        return hostFullMode.Value;
+    }
+
     static string LocalTime(string utc)
     {
         DateTime d;

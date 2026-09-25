@@ -535,7 +535,9 @@ class ModernView
         log.Clear();
         log.Append("Approve the Windows elevation prompt to run the backup as SYSTEM…");
         int total = 1, index = 0; string stage = "starting"; int pct = -1;
-        Elevate.Run("--backup-now", 600,
+        // 30 minutes of SILENCE, not of runtime: waiting out a log pass for the lock or
+        // copying a large .bak to a slow share prints nothing for a while.
+        Elevate.Run("--backup-now", 1800,
             delegate(string line)
             {
                 bool marker = false;
@@ -573,7 +575,7 @@ class ModernView
         Thread t = new Thread(delegate ()
         {
             int total = 1, index = 0; string stage = "starting"; int pct = -1;
-            Engine.Run(args, delegate(string line)
+            int code = Engine.Run(args, delegate(string line)
             {
                 bool marker = false;
                 if (line.StartsWith("[JOB]")) { index = FieldInt(line, "index", index); total = FieldInt(line, "total", total); marker = true; }
@@ -589,7 +591,15 @@ class ModernView
                     if (!line.StartsWith("[PROGRESS]")) { log.Append(line); }
                 });
             });
-            Dispatch(delegate { glow.Finish(true, label + " — finished"); busy = false; Refresh(); });
+            // The engine's exit code is the verdict (0 ok, 1 partial, anything else failed);
+            // this used to report "finished" in green whatever happened.
+            Dispatch(delegate
+            {
+                if (code == 0) { glow.Finish(true, label + " — finished"); }
+                else if (code == 1) { glow.Finish(false, label + " — finished with problems (see the log)"); }
+                else { glow.Finish(false, label + " — FAILED (exit " + code + ", see the log)"); }
+                busy = false; Refresh();
+            });
         });
         t.IsBackground = true; t.Start();
     }

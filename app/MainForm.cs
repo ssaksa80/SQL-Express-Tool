@@ -767,6 +767,8 @@ class MainForm : Form
             psi.UseShellExecute = false;
             psi.RedirectStandardOutput = true;
             psi.RedirectStandardError = true;
+            // the engine writes UTF-8 when redirected; the default (ANSI) mangled any non-ASCII database name
+            psi.StandardOutputEncoding = System.Text.Encoding.UTF8; psi.StandardErrorEncoding = System.Text.Encoding.UTF8;
             psi.CreateNoWindow = true;
             using (Process pr = Process.Start(psi))
             {

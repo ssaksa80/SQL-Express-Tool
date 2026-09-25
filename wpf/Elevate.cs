@@ -19,7 +19,10 @@ static class Elevate
     // flagArgs is the app flag plus any value, e.g. "--backup-now" or
     // "--reschedule \"C:\\path\\settings.json\"". onLine (may be null) receives each new
     // output line; onResult(ok, allOutput) fires once when the job finishes, times out, or
-    // the UAC prompt is declined.
+    // the UAC prompt is declined. timeoutSeconds is how long the job may go SILENT, not how
+    // long it may run: a backup of a large database outlived a fixed 10-minute deadline,
+    // was reported failed while still running, and a second click then stood down on the
+    // engine's lock and reported "finished".
     public static void Run(string flagArgs, int timeoutSeconds, Action<string> onLine, Action<bool, string> onResult)
     {
         string live = Path.Combine(Path.GetTempPath(), "seb-job-" + Guid.NewGuid().ToString("N") + ".log");
@@ -60,6 +63,7 @@ static class Elevate
                     }
                     acc.AppendLine(line);
                     if (onLine != null) { onLine(line); }
+                    deadline = DateTime.Now.AddSeconds(timeoutSeconds);
                 }
                 delivered = complete;
             }
@@ -67,7 +71,7 @@ static class Elevate
             {
                 timer.Stop();
                 try { File.Delete(live); } catch { }
-                onResult(false, "Timed out waiting for the elevated job to finish. It may still be running.");
+                onResult(false, "No output from the elevated job for " + timeoutSeconds + " seconds - stopped waiting. It may still be running; check the log before starting it again.");
             }
         };
         timer.Start();

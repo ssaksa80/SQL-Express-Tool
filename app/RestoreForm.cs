@@ -287,6 +287,8 @@ class RestoreForm : Form
         psi.UseShellExecute = false;
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
+        // the engine writes UTF-8 when redirected; the default (ANSI) mangled any non-ASCII database name
+        psi.StandardOutputEncoding = System.Text.Encoding.UTF8; psi.StandardErrorEncoding = System.Text.Encoding.UTF8;
         psi.CreateNoWindow = true;
         StringBuilder all = new StringBuilder();
         using (Process p = Process.Start(psi))

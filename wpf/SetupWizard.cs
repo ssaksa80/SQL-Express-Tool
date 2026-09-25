@@ -4,6 +4,11 @@
 // the app never touches a SQL password) then -Reschedule to register the task, both run
 // as one elevated job. -Reschedule creates the task if none exists and re-registers it if
 // one does, so this same window serves a first setup and a later reconfigure.
+//
+// On a host that is already set up, every field starts from what is configured (read
+// from public.json, no elevation), so a reconfigure changes only what the operator
+// touches. It used to open on defaults, and an unchanged "Set up" quietly reset the
+// retention - and, before the engine carried them over, turned point-in-time off.
 
 using System;
 using System.IO;
@@ -13,10 +18,14 @@ using System.Windows.Controls;
 class SetupWizard
 {
     static readonly int[] Hrs = new int[] { 1, 2, 3, 4, 6, 8, 12, 24 };
+    static readonly int[] LogMins = new int[] { 5, 10, 15, 30, 60 };
+    static readonly int[] FullHrs = new int[] { 12, 24, 48, 72, 168 };
 
     Window win;
     TextBox shareBox, stagingBox, hourlyBox, dailyBox;
-    ComboBox intervalBox, instanceBox;
+    ComboBox intervalBox, instanceBox, logIntervalBox, fullEveryBox;
+    CheckBox pitrBox, compressBox;
+    StackPanel pitrOptions;
     Border applyBtn;
     LogPane log;
     Action onDone;
@@ -39,19 +48,59 @@ class SetupWizard
         intro.TextWrapping = TextWrapping.Wrap; intro.Margin = new Thickness(0, 6, 0, 16);
         sp.Children.Add(intro);
 
+        BackupStatus cur = Engine.ReadStatus();
+        bool configured = cur.Found && cur.SharePath.Length > 0;
+        if (configured)
+        {
+            TextBlock note = Ui.Text("Already set up on this host - the fields show the current settings. Change what you need and apply.", 12, Theme.Ink2);
+            note.TextWrapping = TextWrapping.Wrap; note.Margin = new Thickness(0, -6, 0, 14);
+            sp.Children.Add(note);
+            if (!cur.UseWindowsAuth)
+            {
+                // The app only ever configures Windows authentication (it never handles a SQL
+                // password), so applying here changes how this host signs in. Say so first.
+                TextBlock auth = Ui.Text("This host signs in to SQL Server with a SQL login. Applying setup here switches it to Windows authentication (the SQL service account's own identity) and the stored SQL credential stops being used. To keep the SQL login, re-run -Setup from PowerShell instead.", 12, Theme.Bad);
+                auth.TextWrapping = TextWrapping.Wrap; auth.Margin = new Thickness(0, -6, 0, 14);
+                sp.Children.Add(auth);
+            }
+        }
+
         instanceBox = InstanceField(sp);
-        shareBox = Field(sp, "Backup share (UNC)", "", "Where backups are written, e.g. \\\\fileserver\\sqlbackups");
-        stagingBox = Field(sp, "Staging folder", "C:\\SqlBackupStaging", "Local scratch folder SQL writes to before copying to the share");
+        if (configured && cur.Instance.Length > 0) { instanceBox.Text = cur.Instance; }
+        shareBox = Field(sp, "Backup share (UNC)", configured ? cur.SharePath : "","Where backups are written, e.g. \\\\fileserver\\sqlbackups");
+        stagingBox = Field(sp, "Staging folder", (configured && cur.StagingPath.Length > 0) ? cur.StagingPath : "C:\\SqlBackupStaging","Local scratch folder SQL writes to before copying to the share");
 
         sp.Children.Add(Label("Interval"));
-        intervalBox = new ComboBox(); intervalBox.Width = 170; intervalBox.HorizontalAlignment = HorizontalAlignment.Left; intervalBox.FontSize = 12.5;
-        foreach (int h in Hrs) { intervalBox.Items.Add("every " + h + " hour" + (h == 1 ? "" : "s")); }
-        intervalBox.SelectedIndex = 4; // 6h
-        intervalBox.Margin = new Thickness(0, 4, 0, 12);
+        intervalBox = Combo(Hrs, "every {0} hour", "every {0} hours", configured ? cur.IntervalHours : 6, 4);
         sp.Children.Add(intervalBox);
 
-        hourlyBox = Field(sp, "Keep hourly (copies)", "3", "How many hourly backups to keep");
-        dailyBox = Field(sp, "Keep daily (days)", "7", "How many days of daily backups to keep");
+        hourlyBox = Field(sp, "Keep hourly (copies)", configured ? cur.HourlyKeep.ToString() : "3", "How many hourly backups to keep");
+        dailyBox = Field(sp, "Keep daily (days)", configured ? cur.DailyKeepDays.ToString() : "7", "How many days of daily backups to keep");
+
+        sp.Children.Add(Section("Protection"));
+        pitrBox = Check("Point-in-time recovery",
+            "Puts user databases in FULL recovery and backs their transaction log up on its own schedule, so a restore can land on any minute - not only on the last backup. master and msdb stay full-only.");
+        pitrBox.IsChecked = configured && cur.RecoveryMode == "Full";
+        sp.Children.Add(pitrBox);
+        pitrOptions = new StackPanel(); pitrOptions.Margin = new Thickness(26, 0, 0, 4);
+        pitrOptions.Children.Add(Label("Back up the log"));
+        logIntervalBox = Combo(LogMins, "every {0} minute", "every {0} minutes", configured ? cur.LogIntervalMinutes : 15, 2);
+        pitrOptions.Children.Add(logIntervalBox);
+        pitrOptions.Children.Add(Label("Take a full backup"));
+        fullEveryBox = Combo(FullHrs, "every {0} hour", "every {0} hours", configured ? cur.FullEveryHours : 24, 1);
+        pitrOptions.Children.Add(fullEveryBox);
+        TextBlock ph = Ui.Text("Between fulls, each backup pass takes a differential. At most one log interval of work can be lost.", 11, Theme.Ink3);
+        ph.TextWrapping = TextWrapping.Wrap; ph.Margin = new Thickness(0, 0, 0, 8);
+        pitrOptions.Children.Add(ph);
+        sp.Children.Add(pitrOptions);
+        pitrBox.Checked += delegate { pitrOptions.Visibility = Visibility.Visible; };
+        pitrBox.Unchecked += delegate { pitrOptions.Visibility = Visibility.Collapsed; };
+        pitrOptions.Visibility = pitrBox.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
+
+        compressBox = Check("Compress backups",
+            "Zips every backup on the share (SQL Express has no built-in backup compression). Restores unzip automatically. Usually much smaller on disk, at some CPU cost during the backup.");
+        compressBox.IsChecked = configured && cur.CompressBackups;
+        sp.Children.Add(compressBox);
 
         StackPanel act = new StackPanel(); act.Orientation = Orientation.Horizontal; act.Margin = new Thickness(0, 12, 0, 0);
         applyBtn = Ui.PrimaryButton("Set up & schedule", Apply);
@@ -94,7 +143,7 @@ class SetupWizard
     {
         string share = shareBox.Text.Trim();
         if (share.Length == 0) { Flash("A backup share (UNC path) is required."); return; }
-        int interval = Hrs[intervalBox.SelectedIndex < 0 ? 4 : intervalBox.SelectedIndex];
+        int interval = ValueOf(intervalBox, 6);
 
         System.Collections.Generic.Dictionary<string, object> d = new System.Collections.Generic.Dictionary<string, object>();
         d["Instance"] = instanceBox.Text.Trim();
@@ -103,6 +152,14 @@ class SetupWizard
         d["IntervalHours"] = interval;
         d["HourlyKeep"] = ParseInt(hourlyBox.Text, 3);
         d["DailyKeepDays"] = ParseInt(dailyBox.Text, 7);
+        bool pitr = pitrBox.IsChecked == true;
+        d["RecoveryMode"] = pitr ? "Full" : "Simple";
+        if (pitr)
+        {
+            d["LogIntervalMinutes"] = ValueOf(logIntervalBox, 15);
+            d["FullEveryHours"] = ValueOf(fullEveryBox, 24);
+        }
+        d["CompressBackups"] = compressBox.IsChecked == true;
         string json = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(d);
         string tmp = Path.Combine(Path.GetTempPath(), "seb-setup-" + Guid.NewGuid().ToString("N") + ".json");
         try { File.WriteAllText(tmp, json); }
@@ -135,6 +192,36 @@ class SetupWizard
         sp.Children.Add(h);
         return t;
     }
+    // A fixed-choice picker preselected on the configured value. A value from the command
+    // line that is not one of the choices is added, so an unchanged apply keeps it instead
+    // of snapping it to a default. The chosen value is read back through ValueOf.
+    static ComboBox Combo(int[] values, string one, string many, int current, int dfltIndex)
+    {
+        ComboBox c = new ComboBox(); c.Width = 170; c.HorizontalAlignment = HorizontalAlignment.Left; c.FontSize = 12.5;
+        c.Margin = new Thickness(0, 4, 0, 12);
+        foreach (int v in values) { c.Items.Add(new ComboBoxItem { Content = string.Format(v == 1 ? one : many, v), Tag = v }); }
+        int sel = Array.IndexOf(values, current);
+        if (sel < 0 && current > 0) { c.Items.Add(new ComboBoxItem { Content = string.Format(current == 1 ? one : many, current) + " (current)", Tag = current }); sel = c.Items.Count - 1; }
+        c.SelectedIndex = sel >= 0 ? sel : dfltIndex;
+        return c;
+    }
+    static int ValueOf(ComboBox c, int dflt)
+    {
+        ComboBoxItem it = c.SelectedItem as ComboBoxItem;
+        return (it != null && it.Tag is int) ? (int)it.Tag : dflt;
+    }
+    CheckBox Check(string label, string hint)
+    {
+        CheckBox cb = new CheckBox(); cb.Margin = new Thickness(0, 6, 0, 8);
+        cb.VerticalContentAlignment = VerticalAlignment.Top;
+        StackPanel p = new StackPanel();
+        p.Children.Add(Ui.Text(label, 12.5, Theme.Ink, FontWeights.SemiBold));
+        TextBlock h = Ui.Text(hint, 11, Theme.Ink3); h.TextWrapping = TextWrapping.Wrap; h.MaxWidth = 470; h.Margin = new Thickness(0, 2, 0, 0);
+        p.Children.Add(h);
+        cb.Content = p;
+        return cb;
+    }
+    TextBlock Section(string s) { TextBlock t = Ui.Text(s, 14, Theme.Ink, FontWeights.SemiBold); t.Margin = new Thickness(0, 10, 0, 2); return t; }
     TextBlock Label(string s) { TextBlock t = Ui.Text(s, 12, Theme.Ink2, FontWeights.SemiBold); t.Margin = new Thickness(0, 4, 0, 0); return t; }
     void Flash(string msg) { log.Visibility = Visibility.Visible; log.SetTitle("Check the form"); log.SetLines(new string[] { msg }); }
     static int ParseInt(string s, int dflt) { int v; return (int.TryParse((s == null ? "" : s).Trim(), out v) && v > 0) ? v : dflt; }

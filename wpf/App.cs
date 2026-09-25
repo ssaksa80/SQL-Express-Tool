@@ -95,25 +95,34 @@ class SebWpf
         {
             if (!Install.IsElevated()) { Install.Relaunch("--backup-now" + LiveArg(liveFile), true); return 0; }
             AppSettings.Mode = Install.DetectMode();
-            return RunEngineHeadless("-Run", liveFile);
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless("-Run", liveFile); });
         }
         if (rescheduleJson != null)
         {
             if (!Install.IsElevated()) { Install.Relaunch("--reschedule \"" + rescheduleJson + "\"" + LiveArg(liveFile), true); return 0; }
             AppSettings.Mode = Install.DetectMode();
-            return RunEngineHeadless(BuildRescheduleArgs(rescheduleJson), liveFile);
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless(BuildRescheduleArgs(rescheduleJson), liveFile); });
         }
         if (applySetupJson != null)
         {
             if (!Install.IsElevated()) { Install.Relaunch("--apply-setup \"" + applySetupJson + "\"" + LiveArg(liveFile), true); return 0; }
             AppSettings.Mode = Install.DetectMode();
-            return ApplySetup(applySetupJson, liveFile);
+            return WithJobEngine(liveFile, delegate { return ApplySetup(applySetupJson, liveFile); });
         }
 
         AppMode mode = Install.DetectMode();
         AppSettings.Mode = mode;
         settings = AppSettings.Load();
         Theme.Load(settings.Theme);
+        // An app started elevated outside Program Files runs "Back up now" and the self test
+        // in-process, as an administrator - so it takes the same admin-only engine copy an
+        // elevated job does, rather than the per-mode one a non-admin could have rewritten.
+        string elevatedJobDir = null;
+        if (checkFile == null && mode != AppMode.Installed && Install.IsElevated())
+        {
+            try { Engine.UseEngine(Install.PrepareJobEngine(out elevatedJobDir)); }
+            catch (Exception ex) { Install.RemoveJobEngine(elevatedJobDir); elevatedJobDir = null; LogCrash("elevated-engine", ex); }
+        }
         // Make sure the engine is unpacked for this mode before any view queries it.
         try { Engine.FindEngine(); } catch { }
 
@@ -141,6 +150,7 @@ class SebWpf
         }
 
         Application app = new Application();
+        if (elevatedJobDir != null) { app.Exit += delegate { Install.RemoveJobEngine(elevatedJobDir); }; }
 
         // An unhandled exception should be recorded and, on the UI thread, survived -
         // a single bad row or a malformed timestamp must not take the whole window down
@@ -180,6 +190,27 @@ class SebWpf
     // Run one engine mode, streaming each output line to the live file (append + flush)
     // so the UI can tail it in real time, then a final "[EXIT] N" sentinel that tells the
     // tailer the job is done and carries the exit code. Returns the engine exit code.
+    // Every elevated job runs an administrator-only copy of the engine (see
+    // Install.PrepareJobEngine), never the per-mode copy a non-admin could have rewritten.
+    // If that copy cannot be made, the job does not run - failing closed is the point.
+    static int WithJobEngine(string liveFile, Func<int> job)
+    {
+        string jobDir = null;
+        try { Engine.UseEngine(Install.PrepareJobEngine(out jobDir)); }
+        catch (Exception ex)
+        {
+            Install.RemoveJobEngine(jobDir);
+            using (System.IO.TextWriter w = OpenLive(liveFile))
+            {
+                WriteLive(w, "[ERROR] could not prepare an administrator-only copy of the engine: " + ex.Message);
+                WriteLive(w, "[EXIT] 9");
+            }
+            return 9;
+        }
+        try { return job(); }
+        finally { Install.RemoveJobEngine(jobDir); }
+    }
+
     static int RunEngineHeadless(string engineArgs, string liveFile)
     {
         int code = 9;
@@ -226,6 +257,29 @@ class SebWpf
             if (d.ContainsKey("IntervalHours")) { a += " -IntervalHours " + ToInt(d["IntervalHours"]); }
             if (d.ContainsKey("HourlyKeep")) { a += " -HourlyKeep " + ToInt(d["HourlyKeep"]); }
             if (d.ContainsKey("DailyKeepDays")) { a += " -DailyKeepDays " + ToInt(d["DailyKeepDays"]); }
+            a += ProtectionArgs(d);
+        }
+        return a;
+    }
+
+    // Point-in-time and compression flags, only for the keys the caller set - an absent key
+    // means "leave it as configured", which the engine honours for both -Setup and
+    // -Reschedule. Compression off is -NoCompressBackups: powershell.exe -File cannot pass
+    // -CompressBackups:$false. Values are whitelisted/integers, so nothing here needs quoting.
+    static string ProtectionArgs(System.Collections.Generic.Dictionary<string, object> d)
+    {
+        string a = "";
+        if (d.ContainsKey("RecoveryMode"))
+        {
+            a += " -RecoveryMode " + (string.Equals(Str(d["RecoveryMode"]), "Full", StringComparison.OrdinalIgnoreCase) ? "Full" : "Simple");
+        }
+        if (d.ContainsKey("LogIntervalMinutes") && ToInt(d["LogIntervalMinutes"]) > 0) { a += " -LogIntervalMinutes " + ToInt(d["LogIntervalMinutes"]); }
+        if (d.ContainsKey("FullEveryHours") && ToInt(d["FullEveryHours"]) > 0) { a += " -FullEveryHours " + ToInt(d["FullEveryHours"]); }
+        if (d.ContainsKey("CompressBackups"))
+        {
+            bool on = false;
+            try { on = Convert.ToBoolean(d["CompressBackups"]); } catch { }
+            a += on ? " -CompressBackups" : " -NoCompressBackups";
         }
         return a;
     }
@@ -241,12 +295,13 @@ class SebWpf
         {
             if (d == null) { WriteLive(w, "[ERROR] could not read the setup settings"); WriteLive(w, "[EXIT] 9"); return 9; }
             string setup = "-Setup -UseWindowsAuth";
-            if (d.ContainsKey("Instance") && Str(d["Instance"]).Length > 0) { setup += " -Instance \"" + Str(d["Instance"]) + "\""; }
-            if (d.ContainsKey("SharePath")) { setup += " -SharePath \"" + Str(d["SharePath"]) + "\""; }
-            if (d.ContainsKey("StagingPath") && Str(d["StagingPath"]).Length > 0) { setup += " -StagingPath \"" + Str(d["StagingPath"]) + "\""; }
+            if (d.ContainsKey("Instance") && Str(d["Instance"]).Length > 0) { setup += " -Instance " + Engine.QuoteArg(Str(d["Instance"])); }
+            if (d.ContainsKey("SharePath")) { setup += " -SharePath " + Engine.QuoteArg(Str(d["SharePath"])); }
+            if (d.ContainsKey("StagingPath") && Str(d["StagingPath"]).Length > 0) { setup += " -StagingPath " + Engine.QuoteArg(Str(d["StagingPath"])); }
             if (d.ContainsKey("IntervalHours")) { setup += " -IntervalHours " + ToInt(d["IntervalHours"]); }
             if (d.ContainsKey("HourlyKeep")) { setup += " -HourlyKeep " + ToInt(d["HourlyKeep"]); }
             if (d.ContainsKey("DailyKeepDays")) { setup += " -DailyKeepDays " + ToInt(d["DailyKeepDays"]); }
+            setup += ProtectionArgs(d);
 
             WriteLive(w, "== configuring ==");
             int code = 9;

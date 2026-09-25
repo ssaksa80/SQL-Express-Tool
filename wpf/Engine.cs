@@ -20,6 +20,16 @@ class BackupStatus
     public string LastResult = "";
     public string LastRunUtc = "";
     public int PendingCount = 0;
+    // The configured settings, from public.json's allow-list, so a reconfigure starts from
+    // what is set rather than from defaults that would quietly overwrite it.
+    public string StagingPath = "";
+    public int HourlyKeep = 3;
+    public int DailyKeepDays = 7;
+    public string RecoveryMode = "Simple";
+    public int LogIntervalMinutes = 15;
+    public int FullEveryHours = 24;
+    public bool CompressBackups = false;
+    public bool UseWindowsAuth = true;
 }
 
 class RestoreSet
@@ -37,6 +47,9 @@ static class Engine
     // or installed), the per-user extraction the console uses, or the ProgramData copy
     // the scheduled task runs.
     static string enginePath;
+    // Pin the engine this process runs (an elevated job's admin-only copy), bypassing the
+    // per-mode lookup below entirely.
+    public static void UseEngine(string path) { enginePath = path; }
     public static string FindEngine()
     {
         if (enginePath != null) { return enginePath; }
@@ -87,6 +100,15 @@ static class Engine
             s.LastRunUtc = Str(d, "LastRunUtc");
             s.IntervalHours = Int(d, "IntervalHours", 6);
             s.PendingCount = Int(d, "PendingCount", 0);
+            s.StagingPath = Str(d, "StagingPath");
+            s.HourlyKeep = Int(d, "HourlyKeep", 3);
+            s.DailyKeepDays = Int(d, "DailyKeepDays", 7);
+            string rm = Str(d, "RecoveryMode");
+            s.RecoveryMode = string.Equals(rm, "Full", StringComparison.OrdinalIgnoreCase) ? "Full" : "Simple";
+            s.LogIntervalMinutes = Int(d, "LogIntervalMinutes", 15);
+            s.FullEveryHours = Int(d, "FullEveryHours", 24);
+            s.CompressBackups = Bool(d, "CompressBackups");
+            s.UseWindowsAuth = !d.ContainsKey("UseWindowsAuth") || Bool(d, "UseWindowsAuth");
         }
         catch { }
         return s;
@@ -106,6 +128,8 @@ static class Engine
         psi.UseShellExecute = false;
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
+        // the engine writes UTF-8 when redirected; the default (ANSI) mangled any non-ASCII database name
+        psi.StandardOutputEncoding = System.Text.Encoding.UTF8; psi.StandardErrorEncoding = System.Text.Encoding.UTF8;
         psi.CreateNoWindow = true;
 
         using (Process p = Process.Start(psi))
@@ -117,6 +141,29 @@ static class Engine
             p.WaitForExit();
             return p.ExitCode;
         }
+    }
+
+    // One command-line argument, quoted by the rules powershell.exe -File parses with
+    // (CommandLineToArgvW): a quote is escaped as \", and backslashes are doubled only
+    // where they precede a quote. A bare "\"" + value + "\"" broke on the ordinary case of
+    // a folder typed with a trailing backslash - D:\SQLData\ escaped its own closing quote
+    // and swallowed every flag after it - and dropped any quote inside a database name.
+    public static string QuoteArg(string s)
+    {
+        if (s == null) { s = ""; }
+        StringBuilder b = new StringBuilder("\"");
+        int slashes = 0;
+        foreach (char c in s)
+        {
+            if (c == '\\') { slashes++; continue; }
+            if (c == '"') { b.Append('\\', slashes * 2 + 1); }
+            else { b.Append('\\', slashes); }
+            slashes = 0;
+            b.Append(c);
+        }
+        b.Append('\\', slashes * 2);
+        b.Append('"');
+        return b.ToString();
     }
 
     // Enumerate backup sets. Returns an empty list on any failure rather than throwing.
@@ -160,7 +207,7 @@ static class Engine
     public static Dictionary<string, object> RestoreInspect(string path)
     {
         StringBuilder all = new StringBuilder();
-        Run("-RestoreInspect \"" + path + "\"", delegate(string line) { all.AppendLine(line); });
+        Run("-RestoreInspect " + QuoteArg(path), delegate(string line) { all.AppendLine(line); });
         string json = LastJsonLine(all.ToString());
         if (json == null) { return null; }
         try
@@ -177,7 +224,7 @@ static class Engine
     {
         error = "";
         StringBuilder all = new StringBuilder();
-        Run("-RestoreVerify \"" + path + "\"", delegate(string line) { all.AppendLine(line); });
+        Run("-RestoreVerify " + QuoteArg(path), delegate(string line) { all.AppendLine(line); });
         string json = LastJsonLine(all.ToString());
         if (json == null) { error = "no response from engine"; return false; }
         try
@@ -202,8 +249,8 @@ static class Engine
     // read back off that final JSON line, the same way RestoreVerify reads "Ok" above.
     public static bool RestoreToPoint(string src, string asName, DateTime stopAt, bool replace, Action<string> onLine)
     {
-        string args = "-RestoreToPoint -Database \"" + src + "\" -RestoreAs \"" + asName +
-            "\" -StopAt \"" + stopAt.ToString("yyyy-MM-ddTHH:mm:ss") + "\"";
+        string args = "-RestoreToPoint -Database " + QuoteArg(src) + " -RestoreAs " + QuoteArg(asName) +
+            " -StopAt " + QuoteArg(stopAt.ToString("yyyy-MM-ddTHH:mm:ss", System.Globalization.CultureInfo.InvariantCulture));
         if (replace) { args += " -RestoreReplace"; }
 
         StringBuilder all = new StringBuilder();
@@ -329,6 +376,25 @@ static class Engine
         return false;
     }
 
+    // Whether an engine result line reads {"Ok":true,...}. A missing or unparseable line is
+    // a failure, never a success - the engine prints it last, only when it got that far.
+    public static bool JsonOk(string json)
+    {
+        if (json == null) { return false; }
+        try
+        {
+            Dictionary<string, object> d = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+            return d != null && d.ContainsKey("Ok") && d["Ok"] != null && Convert.ToBoolean(d["Ok"]);
+        }
+        catch { return false; }
+    }
+    public static string JsonField(string json, string key)
+    {
+        if (json == null) { return ""; }
+        try { return Str(new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json), key); }
+        catch { return ""; }
+    }
+
     static string LastJsonLine(string output)
     {
         string found = null;
@@ -349,6 +415,11 @@ static class Engine
     {
         if (d == null || !d.ContainsKey(k) || d[k] == null) { return ""; }
         return Convert.ToString(d[k], System.Globalization.CultureInfo.InvariantCulture);
+    }
+    static bool Bool(Dictionary<string, object> d, string k)
+    {
+        try { if (d != null && d.ContainsKey(k) && d[k] != null) { return Convert.ToBoolean(d[k]); } } catch { }
+        return false;
     }
     static int Int(Dictionary<string, object> d, string k, int dflt)
     {

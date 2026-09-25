@@ -93,6 +93,49 @@ static class Install
         return File.Exists(target) ? target : null;
     }
 
+    // A copy of the engine for an ELEVATED job (--backup-now / --reschedule / --apply-setup)
+    // that no non-admin can have touched. Those jobs run the engine as an administrator, and
+    // -Setup/-Reschedule copy the running script into the SYSTEM task's folder - so running
+    // the per-mode copy (a portable folder, or %LOCALAPPDATA%, both writable below the
+    // elevation boundary) handed whoever could write there a script SYSTEM runs. ExtractEngine
+    // also swallowed a failed rewrite and returned the stale file, so a tampered copy held
+    // open could not even be overwritten. Here: a fresh folder with a random name under
+    // %SystemRoot%\Temp (users can create there but not read or delete others' entries),
+    // created WITH an Administrators+SYSTEM-only ACL so there is no window before it is
+    // locked, written from the embedded resource every time, and failing closed.
+    public static string PrepareJobEngine(out string jobDir)
+    {
+        jobDir = null;
+        string parent = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "Temp");
+        System.Security.AccessControl.DirectorySecurity ds = new System.Security.AccessControl.DirectorySecurity();
+        ds.SetAccessRuleProtection(true, false);
+        foreach (System.Security.Principal.WellKnownSidType t in new System.Security.Principal.WellKnownSidType[] {
+            System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid, System.Security.Principal.WellKnownSidType.LocalSystemSid })
+        {
+            ds.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(
+                new System.Security.Principal.SecurityIdentifier(t, null),
+                System.Security.AccessControl.FileSystemRights.FullControl,
+                System.Security.AccessControl.InheritanceFlags.ContainerInherit | System.Security.AccessControl.InheritanceFlags.ObjectInherit,
+                System.Security.AccessControl.PropagationFlags.None, System.Security.AccessControl.AccessControlType.Allow));
+        }
+        string dir = Path.Combine(parent, "SqlExpressBackup-job-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir, ds);
+        jobDir = dir;
+        string target = Path.Combine(dir, "Invoke-SqlExpressBackup.ps1");
+        using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(EngineResource))
+        {
+            if (s == null) { throw new InvalidOperationException("this build carries no embedded engine"); }
+            using (StreamReader r = new StreamReader(s)) { File.WriteAllText(target, r.ReadToEnd()); }
+        }
+        return target;
+    }
+
+    public static void RemoveJobEngine(string jobDir)
+    {
+        if (jobDir == null) { return; }
+        try { Directory.Delete(jobDir, true); } catch { }
+    }
+
     // The engine path for the current mode, extracting the embedded copy if needed.
     public static string EnsureEngine(AppMode mode)
     {
@@ -237,7 +280,15 @@ static class Install
         if (onStep == null) { onStep = delegate { }; }
 
         onStep(0.10, "Stopping and removing the scheduled backup task…");
-        try { AppSettings.Mode = DetectMode(); Engine.Run("-Uninstall", null); } catch { }
+        // The engine's exit code decides whether the tasks are really gone; ignoring it
+        // reported "Uninstalled" while a SYSTEM task could still be registered and running.
+        int taskCode = 9;
+        try { AppSettings.Mode = DetectMode(); taskCode = Engine.Run("-Uninstall", null); } catch { }
+        bool tasksGone = taskCode == 0;
+        if (!tasksGone)
+        {
+            onStep(0.30, "Could not confirm the scheduled tasks were removed (exit " + taskCode + ") — check Task Scheduler for SqlExpressBackup and SqlExpressBackup-Log.");
+        }
 
         onStep(0.45, "Removing the Add / Remove Programs entry…");
         try { Microsoft.Win32.Registry.LocalMachine.DeleteSubKeyTree(UninstallKey, false); } catch { }
@@ -249,7 +300,9 @@ static class Install
         // installed exe and keeps it locked while the progress window is open, so a delete
         // now would fail. ScheduleInstallDirRemoval() is called instead as the process is
         // about to exit (window close, or right before return on --quiet).
-        onStep(1.0, "Uninstalled. The program folder is removed as this window closes.");
+        onStep(1.0, tasksGone
+            ? "Uninstalled. The program folder is removed as this window closes."
+            : "Uninstalled, but the scheduled tasks may still exist — remove SqlExpressBackup and SqlExpressBackup-Log in Task Scheduler.");
     }
 
     // Schedule removal of the install folder by a detached, retried cmd. The running exe
