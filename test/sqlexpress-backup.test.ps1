@@ -1534,4 +1534,145 @@ try {
 }
 finally { Remove-Item -LiteralPath $tmpP -Recurse -Force -ErrorAction SilentlyContinue }
 
+# ---- SETUP-1. a reconfigure keeps what it was not told to change --------------------
+# The app's reconfigure runs -Setup with only instance/share/cadence/keeps. Before the
+# carry-over, that wrote RecoveryMode=Simple over a Full host and -Reschedule then removed
+# the log task: point-in-time recovery switched off with nothing said.
+$defaults = @{ RecoveryMode = 'Simple'; LogIntervalMinutes = 15; FullEveryHours = 24; CompressBackups = $false; NoHashVerify = $false }
+$onDisk = [pscustomobject]@{ RecoveryMode = 'Full'; LogIntervalMinutes = 5; FullEveryHours = 12; CompressBackups = $true; NoHashVerify = $true }
+$c = Get-SebSetupCarryOver -Existing $onDisk -Bound @('Setup', 'UseWindowsAuth', 'Instance', 'SharePath', 'IntervalHours') -Values $defaults
+Assert ($c.RecoveryMode -eq 'Full') 'an unbound -RecoveryMode keeps Full from the existing config'
+Assert ($c.LogIntervalMinutes -eq 5 -and $c.FullEveryHours -eq 12) 'unbound log interval and full cadence keep their existing values'
+Assert ($c.CompressBackups -eq $true -and $c.NoHashVerify -eq $true) 'unbound switches keep their existing values'
+$c = Get-SebSetupCarryOver -Existing $onDisk -Bound @('Setup', 'RecoveryMode', 'CompressBackups') -Values @{ RecoveryMode = 'Simple'; LogIntervalMinutes = 15; FullEveryHours = 24; CompressBackups = $false; NoHashVerify = $false }
+Assert ($c.RecoveryMode -eq 'Simple') 'an explicitly passed -RecoveryMode wins over the existing config'
+Assert ($c.CompressBackups -eq $false) 'an explicitly passed -CompressBackups:$false wins over the existing config'
+Assert ($c.LogIntervalMinutes -eq 5) 'while the unbound ones in the same call still carry over'
+$c = Get-SebSetupCarryOver -Existing $null -Bound @('Setup') -Values $defaults
+Assert ($c.RecoveryMode -eq 'Simple' -and $c.LogIntervalMinutes -eq 15 -and $c.CompressBackups -eq $false) 'a first setup (no config yet) takes the parameter defaults'
+$c = Get-SebSetupCarryOver -Existing ([pscustomobject]@{ IntervalHours = 6 }) -Bound @('Setup') -Values $defaults
+Assert ($c.RecoveryMode -eq 'Simple' -and $c.FullEveryHours -eq 24) 'a pre-PITR config missing the keys falls back to the defaults'
+
+# ---- REVIEW-1. Full mode enrolls user databases only ---------------------------------
+# master accepts only a full backup, so enrolling it failed every diff and every log pass.
+Assert (-not (Test-SebPitrEligible -Name 'master' -ReadOnly $false)) 'master stays full-only'
+Assert (-not (Test-SebPitrEligible -Name 'MSDB' -ReadOnly $false)) 'msdb stays full-only (case-insensitive)'
+Assert (-not (Test-SebPitrEligible -Name 'Archive' -ReadOnly $true)) 'a read-only database is not enrolled (it cannot be ALTERed to FULL)'
+Assert (Test-SebPitrEligible -Name 'AppDb' -ReadOnly ([System.DBNull]::Value)) 'a user database with a DBNull read-only flag is enrolled (DBNull is not "true")'
+Assert (Test-SebPitrEligible -Name 'AppDb' -ReadOnly $false) 'a read-write user database is enrolled'
+$roRows = @([pscustomobject]@{ name = 'Archive'; is_read_only = $true }, [pscustomobject]@{ name = 'AppDb'; is_read_only = $false })
+$roMap = Get-SebReadOnlyMap -Rows $roRows
+Assert ($roMap['Archive'] -eq $true -and $roMap['AppDb'] -eq $false) 'the read-only map is built from sys.databases rows'
+Assert ((Get-SebReadOnlyMap -Rows @([pscustomobject]@{ name = 'X' })).Count -eq 0) 'rows without the column (an older query) leave the map empty, not throwing'
+
+# ---- REVIEW-2. a FULL database nobody backs the log up for is warned about ----------
+$mRows = @(
+  [pscustomobject]@{ name = 'master'; recovery_model_desc = 'FULL' },
+  [pscustomobject]@{ name = 'AppDb';  recovery_model_desc = 'FULL' },
+  [pscustomobject]@{ name = 'Plain';  recovery_model_desc = 'SIMPLE' },
+  [pscustomobject]@{ name = 'NotOurs'; recovery_model_desc = 'FULL' })
+$w = @(Get-SebUnmanagedFullLogWarnings -Rows $mRows -Databases @('master', 'AppDb', 'Plain') -FullMode $false -ReadOnlyMap @{})
+Assert ($w.Count -eq 2) "Simple mode warns for each FULL database it backs up (got $($w.Count))"
+Assert ((@($w) -join ' ') -notmatch 'NotOurs') 'a database outside the backup set is not warned about'
+$w = @(Get-SebUnmanagedFullLogWarnings -Rows $mRows -Databases @('master', 'AppDb', 'Plain') -FullMode $true -ReadOnlyMap @{})
+Assert ($w.Count -eq 1 -and $w[0] -like 'master *') 'Full mode warns only for the full-only ones (master), not for AppDb whose log it backs up'
+
+# ---- REVIEW-3. a staged log backup with no pending entry is adopted, not swept -------
+$tmpO = Join-Path $env:TEMP ('seb-orph-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpO -Force)
+try {
+  foreach ($n in @('App_Db_20260905-031500.trn', 'Other_20260905-031500.trn.zip', 'Other_20260905-031500.trn.zip.meta.json',
+                   'Half_20260905-031500.trn', 'Half_20260905-031500.trn.zip', 'Kept_20260905-031500.trn', 'Full_20260905-031500.bak',
+                   'Zipped_20260905-031500.trn')) {
+    Set-Content -LiteralPath (Join-Path $tmpO $n) -Value 'x'
+  }
+  $keep = @((Join-Path $tmpO 'Kept_20260905-031500.trn'), (Join-Path $tmpO 'Zipped_20260905-031500.trn.zip'))
+  $orph = @(Get-SebOrphanLogEntries -StagingPath $tmpO -KeepPaths $keep -Root '\\fs\share' -HostName 'H' -InstanceLabel 'I')
+  $staged = @($orph | ForEach-Object { Split-Path -Leaf $_.Staged })
+  Assert ($staged -contains 'App_Db_20260905-031500.trn') 'a loose plain .trn is adopted'
+  $appEntry = @($orph | Where-Object { $_.Staged -like '*App_Db_*' })[0]
+  Assert ($appEntry.Dest -eq '\\fs\share\H\I\App_Db\log\App_Db_20260905-031500.trn') "it is routed to its database's log folder, even with '_' in the name (got $($appEntry.Dest))"
+  Assert ($appEntry.Kind -eq 'log') 'and recorded as a log copy'
+  Assert (($staged -contains 'Other_20260905-031500.trn.zip') -and ($staged -contains 'Other_20260905-031500.trn.zip.meta.json')) 'a lone .trn.zip is adopted with its sidecar'
+  Assert (($staged -contains 'Half_20260905-031500.trn') -and -not ($staged -contains 'Half_20260905-031500.trn.zip')) 'with both plain and zip present the plain wins (the zip may be half-written)'
+  Assert (-not ($staged -contains 'Kept_20260905-031500.trn')) 'a file a pending entry already keeps is not adopted twice'
+  Assert (-not ($staged -contains 'Zipped_20260905-031500.trn')) 'a plain .trn whose zip is already pending is not shipped a second time'
+  Assert (-not ($staged -contains 'Full_20260905-031500.bak')) 'data backups are not adopted - only log backups break the chain'
+  Assert (Test-SebPendingEntry -Staged $appEntry.Staged -Dest $appEntry.Dest -StagingPath $tmpO -SharePath '\\fs\share') 'an adopted entry passes the pending-entry guard'
+}
+finally { Remove-Item -LiteralPath $tmpO -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ---- REVIEW-4. '..' is traversal only as a whole path segment ------------------------
+Assert (Test-SebPendingEntry -Staged 'C:\SqlBackupStaging\my..db_20260905-031500.trn' -Dest '\\fs\sqlbackups\H\I\my..db\log\my..db_20260905-031500.trn' -StagingPath 'C:\SqlBackupStaging' -SharePath '\\fs\sqlbackups') "a legal database name containing '..' keeps its pending copies"
+Assert (-not (Test-SebPendingEntry -Staged 'C:\SqlBackupStaging\a.bak' -Dest '\\fs\sqlbackups\x/../../evil.bak' -StagingPath 'C:\SqlBackupStaging' -SharePath '\\fs\sqlbackups')) "a '..' segment behind a forward slash is still refused"
+
+# ---- REVIEW-5. names and STOPAT do not depend on the host's culture -----------------
+$savedCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+try {
+  [System.Threading.Thread]::CurrentThread.CurrentCulture = New-Object System.Globalization.CultureInfo 'th-TH'
+  $n = Get-SebFileName -Database 'AppDb' -Stamp (Get-Date -Year 2026 -Month 9 -Day 4 -Hour 10 -Minute 30 -Second 0) -Extension 'trn'
+  Assert ($n -eq 'AppDb_20260904-103000.trn') "the file-name stamp is Gregorian under th-TH (got $n)"
+  [System.Threading.Thread]::CurrentThread.CurrentCulture = New-Object System.Globalization.CultureInfo 'fi-FI'
+  $sql = Get-SebRestoreStepSql -Step ([pscustomobject]@{ Kind = 'log'; File = 'C:\s\a.trn'; Recovery = $true; StopAt = (Get-Date -Year 2026 -Month 9 -Day 4 -Hour 10 -Minute 30 -Second 0) }) -RestoreAs 'A_R'
+  Assert ($sql -like "*STOPAT = '2026-09-04T10:30:00'*") "STOPAT keeps ':' separators under fi-FI (got: $sql)"
+}
+finally { [System.Threading.Thread]::CurrentThread.CurrentCulture = $savedCulture }
+
+# ---- REVIEW-6. a backup that could not be pruned keeps its sidecar -------------------
+$tmpS = Join-Path $env:TEMP ('seb-side-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $tmpS -Force)
+$lock = $null
+try {
+  $z = Join-Path $tmpS 'APPDB_20260905-000000.bak.zip'; Set-Content -LiteralPath $z -Value 'x'
+  Set-Content -LiteralPath (Get-SebSidecarName $z) -Value 'x'
+  $lock = [System.IO.File]::Open($z, 'Open', 'Read', 'None')
+  Remove-SebNamed -Directory $tmpS -Names @('APPDB_20260905-000000.bak.zip')
+  Assert (Test-Path -LiteralPath $z) 'precondition: the locked .zip could not be deleted'
+  Assert (Test-Path -LiteralPath (Get-SebSidecarName $z)) 'so its sidecar is kept, and the catalogue can still read it next time'
+}
+finally {
+  if ($null -ne $lock) { $lock.Dispose() }
+  Remove-Item -LiteralPath $tmpS -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---- REVIEW-7. an abandoned lock is taken over, not bypassed -------------------------
+# A task killed at its time limit dies holding the mutex. The old code caught the
+# AbandonedMutexException as a generic failure and fell through to a Local\ mutex no
+# other session shares - the next pass then ran with no exclusion at all.
+Add-Type -TypeDefinition 'using System.Threading; public static class SebAbandon { public static void Grab(string n) { var t = new Thread(() => { new Mutex(true, n); }); t.Start(); t.Join(); } }'
+[SebAbandon]::Grab('Global\SqlExpressBackup')
+[SebAbandon]::Grab('Local\SqlExpressBackup')
+$m = Get-SebMutex
+try {
+  Assert ($null -ne $m) 'an abandoned lock is acquired rather than refused'
+  $ownsIt = $true
+  try { $m.ReleaseMutex() } catch { $ownsIt = $false }
+  Assert $ownsIt 'and it is really owned (ReleaseMutex succeeds)'
+}
+finally { if ($null -ne $m) { $m.Dispose() } }
+
+# ---- REVIEW-8. the config folder is locked for write, readable by Users -------------
+# A folder first created unelevated gave that user CREATOR OWNER full control of it, and
+# full control of the PARENT is enough to rename engine\ away and plant a script the
+# SYSTEM task runs. The owner has to move too: an owner can always rewrite the rules.
+$sec = New-SebConfigDirSecurity
+$adminsSid = New-Object System.Security.Principal.SecurityIdentifier ([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+$usersSid = New-Object System.Security.Principal.SecurityIdentifier ([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
+Assert ($sec.AreAccessRulesProtected) 'the config folder ACL is protected (nothing inherited, no CREATOR OWNER grant)'
+Assert ($sec.GetOwner([System.Security.Principal.SecurityIdentifier]) -eq $adminsSid) 'and owned by Administrators, not whoever created it'
+$rules = @($sec.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))
+$userRules = @($rules | Where-Object { $_.IdentityReference -eq $usersSid })
+Assert ($userRules.Count -eq 1) 'Users hold exactly one rule'
+$writeBits = [System.Security.AccessControl.FileSystemRights]'WriteData, AppendData, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership, WriteAttributes, WriteExtendedAttributes'
+Assert ((([int]$userRules[0].FileSystemRights) -band ([int]$writeBits)) -eq 0) 'and it grants no write, delete or permission change'
+Assert ((([int]$userRules[0].FileSystemRights) -band ([int][System.Security.AccessControl.FileSystemRights]::ReadData)) -ne 0) 'but still grants read (public.json is the dashboard view)'
+Assert (@($rules | Where-Object { $_.IdentityReference -ne $usersSid -and $_.IdentityReference -ne $adminsSid -and $_.IdentityReference.Value -ne 'S-1-5-18' }).Count -eq 0) 'nobody else - only SYSTEM, Administrators and Users appear'
+
+# ---- REVIEW-9. restore-side sources: a plain file is used where it is --------------
+$plainSrc = Get-SebRestoreSource -Connection $null -File 'C:\share\APPDB_20260905-000000.bak'
+Assert ($plainSrc.Source -eq 'C:\share\APPDB_20260905-000000.bak') 'a plain backup is restored from where it lies (no copy)'
+Assert (-not (Test-Path -LiteralPath $plainSrc.TempDir)) 'and no temp folder is created for it'
+Remove-SebRestoreSource $plainSrc
+Remove-SebRestoreSource $null
+
 Write-Host 'ALL PASS'

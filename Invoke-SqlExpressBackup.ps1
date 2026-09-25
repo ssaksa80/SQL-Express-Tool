@@ -107,6 +107,7 @@ param(
   [int]$LogIntervalMinutes = 15,    # Full mode only: how often -BackupLog runs; same ContainsKey gating in -Reschedule
   [int]$FullEveryHours = 24,        # Full mode only: how often the data pass takes a full instead of a diff; same ContainsKey gating in -Reschedule
   [switch]$CompressBackups,       # zip every .bak/.dif/.trn to the share, with a facts sidecar; same ContainsKey gating in -Reschedule
+  [switch]$NoCompressBackups,     # turn compression OFF - the spelling of -CompressBackups:$false that powershell.exe -File can pass
   [switch]$UseWindowsAuth,
   [switch]$NoHashVerify,          # verify copies by length only (very large databases)
   [string]$NssmPath,
@@ -115,6 +116,15 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# powershell.exe -File (how the app and the scheduled task start this) cannot pass
+# -CompressBackups:$false - the "$false" arrives as a string and binding fails - so once
+# compression was on there was no way to turn it off from the app. -NoCompressBackups is
+# that same "bound, and false", which is exactly how -Setup/-Reschedule then see it.
+if ($NoCompressBackups) {
+  if ($CompressBackups) { throw 'pass -CompressBackups or -NoCompressBackups, not both' }
+  $PSBoundParameters['CompressBackups'] = [switch]$false
+}
 
 $script:SebTaskName    = 'SqlExpressBackup'
 $script:SebServiceName = 'SqlExpressBackup'
@@ -240,6 +250,50 @@ function Select-SebDatabase {
   return , @($keep.ToArray())
 }
 
+# Which of the backed-up databases take part in Full-mode point-in-time recovery. master
+# and msdb stay full-only, as the PITR design says: master accepts nothing but a full
+# backup, so enrolling it failed every differential and every log pass. A read-only
+# database cannot be ALTERed to FULL and has no log activity to capture anyway.
+function Test-SebPitrEligible {
+  param([string]$Name, $ReadOnly)
+  if ([string]::IsNullOrWhiteSpace($Name)) { return $false }
+  if (@('master', 'msdb', 'model', 'tempdb') -contains $Name.ToLowerInvariant()) { return $false }
+  $ro = Get-SebValue $ReadOnly
+  if ($null -ne $ro -and [bool]$ro) { return $false }
+  return $true
+}
+
+# Databases in FULL recovery whose log this tool is NOT backing up: a Simple-mode host
+# (including one switched back from Full - nothing reverts the databases it enrolled), or
+# a database Full mode leaves full-only (master/msdb, read-only). A FULL log is only
+# truncated by a log backup, so without one it grows until the disk fills. Warned, never
+# ALTERed back: the DBA may have set FULL on purpose and run log backups some other way.
+function Get-SebUnmanagedFullLogWarnings {
+  param([object[]]$Rows = @(), [string[]]$Databases = @(), [bool]$FullMode, [hashtable]$ReadOnlyMap = @{})
+  $out = New-Object System.Collections.ArrayList
+  foreach ($row in $Rows) {
+    $name = [string](Get-SebValue $row.name)
+    if (-not $name -or @($Databases) -notcontains $name) { continue }
+    if ([string](Get-SebValue $row.recovery_model_desc) -ne 'FULL') { continue }
+    if ($FullMode -and (Test-SebPitrEligible -Name $name -ReadOnly $ReadOnlyMap[$name])) { continue }
+    $why = 'point-in-time mode is off'
+    if ($FullMode) { $why = 'point-in-time mode leaves it full-only' }
+    [void]$out.Add(('{0} is in FULL recovery but this tool takes no log backups of it ({1}) - its log will grow until something does. Set it to SIMPLE, or back its log up another way.' -f $name, $why))
+  }
+  return @($out.ToArray())
+}
+
+# name -> is_read_only, from sys.databases-shaped rows, for Test-SebPitrEligible.
+function Get-SebReadOnlyMap {
+  param([object[]]$Rows = @())
+  $map = @{}
+  foreach ($row in $Rows) {
+    $name = [string](Get-SebValue $row.name)
+    if ($name -and $row.PSObject.Properties['is_read_only']) { $map[$name] = Get-SebValue $row.is_read_only }
+  }
+  return $map
+}
+
 function Get-SebBackupPath {
   param(
     [string]$Root,
@@ -257,7 +311,7 @@ function Get-SebBackupPath {
 
 function Get-SebFileName {
   param([string]$Database, [datetime]$Stamp, [ValidateSet('bak','dif','trn')][string]$Extension = 'bak')
-  return ('{0}_{1}.{2}' -f (Get-SebSafeName $Database), $Stamp.ToString('yyyyMMdd-HHmmss'), $Extension)
+  return ('{0}_{1}.{2}' -f (Get-SebSafeName $Database), $Stamp.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture), $Extension)
 }
 
 function Get-SebCompressedName { param([string]$PlainName) return ($PlainName + '.zip') }
@@ -822,6 +876,37 @@ function Get-SebEntropyPath { return (Join-Path $script:SebConfigDir 'key.entrop
 function Get-SebCredPath { return (Join-Path $script:SebConfigDir 'cred.dat') }
 function Get-SebConfigPath { return (Join-Path $script:SebConfigDir 'config.json') }
 function Get-SebStatePath { return (Join-Path $script:SebConfigDir 'state.json') }
+# The config folder itself: SYSTEM and Administrators full, Users read-only, owned by
+# Administrators. Its secrets are each locked on their own, but that is not enough on its
+# own: a folder first created by an unelevated process inherits CREATOR OWNER full
+# control for that user, and full control of the PARENT lets them rename the locked
+# engine\ folder away and put their own script where the SYSTEM task will run it. The
+# owner matters as much as the rules - an owner can always rewrite the rules - so the
+# owner moves to Administrators too. Users keep read: public.json and the logs are the
+# unelevated dashboard's whole view.
+function New-SebConfigDirSecurity {
+  $acl = New-Object System.Security.AccessControl.DirectorySecurity
+  $acl.SetAccessRuleProtection($true, $false)
+  $admins = New-Object System.Security.Principal.SecurityIdentifier ([System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+  $system = New-Object System.Security.Principal.SecurityIdentifier ([System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+  $users = New-Object System.Security.Principal.SecurityIdentifier ([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
+  $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+  $none = [System.Security.AccessControl.PropagationFlags]::None
+  $allow = [System.Security.AccessControl.AccessControlType]::Allow
+  foreach ($sid in @($system, $admins)) {
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inherit, $none, $allow)))
+  }
+  $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($users, [System.Security.AccessControl.FileSystemRights]::ReadAndExecute, $inherit, $none, $allow)))
+  $acl.SetOwner($admins)
+  return $acl
+}
+
+function Protect-SebConfigDir {
+  param([string]$Path)
+  Import-SebShippedModule -Command 'Set-Acl' -Module 'Microsoft.PowerShell.Security'
+  Set-Acl -LiteralPath $Path -AclObject (New-SebConfigDirSecurity)
+}
+
 function Get-SebPublicPath { return (Join-Path $script:SebConfigDir 'public.json') }
 function Get-SebLogDir { return (Join-Path $script:SebConfigDir 'logs') }
 
@@ -961,6 +1046,23 @@ function Read-SebConfig {
   $path = Get-SebConfigPath
   if (-not (Test-Path -LiteralPath $path)) { throw "no config at $path - run -Setup first" }
   return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json)
+}
+
+# -Setup on a host that is already configured must not reset what the caller did not
+# pass. The app's reconfigure only sends instance/share/cadence/keeps, so without this a
+# Full-mode host dropped back to Simple, and the -Reschedule that follows removed the log
+# task - point-in-time recovery switched off with nothing said. Same rule -Reschedule
+# already follows: a parameter that was not bound means "leave it as it is on disk".
+function Get-SebSetupCarryOver {
+  param($Existing, [string[]]$Bound, [hashtable]$Values)
+  $out = @{}
+  foreach ($k in @($Values.Keys)) {
+    $out[$k] = $Values[$k]
+    if ($null -ne $Existing -and @($Bound) -notcontains $k -and $Existing.PSObject.Properties[$k]) {
+      $out[$k] = $Existing.$k
+    }
+  }
+  return $out
 }
 
 function Write-SebConfig {
@@ -1347,6 +1449,38 @@ function Resolve-SebRestoreSource {
   return $plain
 }
 
+# A restore-side source SQL can read: a .zip is expanded into a fresh temp folder the SQL
+# service account is granted read on (a temp folder grants it nothing by default); a plain
+# file is used where it is. Shared by -RestoreInspect, -RestoreVerify and -RestoreRun -
+# inspect and verify used to hand the .zip straight to RESTORE FILELISTONLY/VERIFYONLY,
+# so every compressed set in the restore window read as "SQL cannot read this file".
+# The caller removes .TempDir (Remove-SebRestoreSource) when done.
+function Get-SebRestoreSource {
+  param($Connection, [string]$File)
+  $dir = Join-Path $env:TEMP ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
+  if ($File -like '*.zip') {
+    [void](New-Item -ItemType Directory -Path $dir -Force)
+    $svcAcct = Get-SebSqlServiceAccount -Connection $Connection
+    if (-not [string]::IsNullOrWhiteSpace($svcAcct)) {
+      try { Set-SebStagingAcl -Path $dir -SqlAccount $svcAcct -AlsoGrant @([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) }
+      catch { Write-SebLog ('could not grant the SQL service account read on the restore temp folder: {0}' -f $_.Exception.Message) 'WARN' }
+    }
+  }
+  try { $source = Resolve-SebRestoreSource -File $File -StagingDir $dir }
+  catch {
+    if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue }
+    throw
+  }
+  return [pscustomobject]@{ Source = $source; TempDir = $dir }
+}
+
+function Remove-SebRestoreSource {
+  param($Prepared)
+  if ($null -ne $Prepared -and (Test-Path -LiteralPath $Prepared.TempDir)) {
+    Remove-Item -LiteralPath $Prepared.TempDir -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Get-SebFolderFacts {
   param([string]$Directory)
   if (-not (Test-Path -LiteralPath $Directory)) { return @() }
@@ -1381,7 +1515,9 @@ function Test-SebPendingEntry {
   param([string]$Staged, [string]$Dest, [string]$StagingPath, [string]$SharePath)
   if ([string]::IsNullOrWhiteSpace($Staged) -or [string]::IsNullOrWhiteSpace($Dest)) { return $false }
   if ([string]::IsNullOrWhiteSpace($StagingPath) -or [string]::IsNullOrWhiteSpace($SharePath)) { return $false }
-  if ($Staged.Contains('..') -or $Dest.Contains('..')) { return $false }
+  # '..' as a path SEGMENT is traversal; inside a name ('my..db') it is a legal database
+  # name whose pending copies must not be refused and swept.
+  foreach ($p in @($Staged, $Dest)) { if (@($p -split '[\\/]') -contains '..') { return $false } }
   # The trailing separator is the whole point: without it 'C:\StagingEvil\x.bak'
   # starts with 'C:\Staging' as a plain string and walks straight through.
   $stagedRoot = $StagingPath.TrimEnd('\') + '\'
@@ -1413,8 +1549,10 @@ function Remove-SebNamed {
     }
     # A compressed backup carries a .meta.json sidecar; prune it with its backup so the
     # share does not accumulate orphaned sidecars. No-op for a plain backup (no sidecar).
+    # Only once the backup itself is gone: a .zip that could not be deleted keeps its
+    # sidecar, or the catalogue can no longer read it and it is never pruned again.
     $meta = Get-SebSidecarName $path
-    if (Test-Path -LiteralPath $meta) { Remove-Item -LiteralPath $meta -Force -ErrorAction SilentlyContinue }
+    if (-not (Test-Path -LiteralPath $path) -and (Test-Path -LiteralPath $meta)) { Remove-Item -LiteralPath $meta -Force -ErrorAction SilentlyContinue }
   }
 }
 
@@ -1495,6 +1633,40 @@ function Get-SebPublishSet {
   )
 }
 
+# Staged log backups no pending entry accounts for. BACKUP LOG has already truncated the
+# chain for each of these, so sweeping one away leaves a permanent point-in-time gap on the
+# share. They appear when a pass dies between BACKUP LOG and recording its copy - an
+# exception while compressing (staging disk full) or the task killed at its time limit,
+# since Pending is only written at the end of a pass. Each is returned as a pending entry
+# for its database's log folder, so the drain ships it instead of the sweep deleting it.
+# A plain .trn wins over a .trn.zip of the same backup (the zip may be half-written); a
+# lone .trn.zip is complete (the plain file is only removed after zipping) and travels
+# with its sidecar.
+function Get-SebOrphanLogEntries {
+  param([string]$StagingPath, [string[]]$KeepPaths = @(), [string]$Root, [string]$HostName, [string]$InstanceLabel)
+  $out = New-Object System.Collections.ArrayList
+  $files = @(Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction SilentlyContinue)
+  $plainNames = @($files | Where-Object { $_.Name -match '\.trn$' } | ForEach-Object { $_.Name })
+  foreach ($f in $files) {
+    if ($f.Name -notmatch '^(.+)_\d{8}-\d{6}\.trn(\.zip)?$') { continue }
+    $safeDb = $Matches[1]
+    $isZip = [bool]$Matches[2]
+    if (@($KeepPaths) -contains $f.FullName) { continue }
+    # its zip is already pending: shipping the plain file too would put the backup on the share twice
+    if (-not $isZip -and @($KeepPaths) -contains ($f.FullName + '.zip')) { continue }
+    if ($isZip -and ($plainNames -contains $f.Name.Substring(0, $f.Name.Length - 4))) { continue }
+    $logDir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $safeDb -Kind 'log'
+    [void]$out.Add([pscustomobject]@{ Staged = $f.FullName; Dest = (Join-Path $logDir $f.Name); Database = $safeDb; Kind = 'log' })
+    if ($isZip) {
+      $meta = Get-SebSidecarName $f.FullName
+      if ((Test-Path -LiteralPath $meta) -and @($KeepPaths) -notcontains $meta) {
+        [void]$out.Add([pscustomobject]@{ Staged = $meta; Dest = (Join-Path $logDir (Get-SebSidecarName $f.Name)); Database = $safeDb; Kind = 'log' })
+      }
+    }
+  }
+  return @($out.ToArray())
+}
+
 # Remove staged backup artifacts (.bak/.dif/.trn, their .zip variants, and .meta.json
 # sidecars) that no pending copy still points at - a backstop for the copy path's own
 # cleanup, run before a pass stages new files. Never removes a path in KeepPaths (a staged
@@ -1514,14 +1686,25 @@ function Clear-SebStagedExcept {
 function Get-SebMutex {
   # Global\ needs SeCreateGlobalPrivilege, which SYSTEM has and an unelevated
   # operator does not. Fall back rather than refuse to run by hand.
+  # -WaitSeconds: the data pass waits out a short log pass instead of losing its whole
+  # interval (at boot the two tasks fire together); the 15-minute log pass keeps 0.
+  param([int]$WaitSeconds = 0)
   foreach ($prefix in @('Global\', 'Local\')) {
+    $mutex = $null
     try {
       $created = $false
       $mutex = New-Object System.Threading.Mutex($true, ($prefix + 'SqlExpressBackup'), [ref]$created)
       if (-not $created) {
-        $held = $mutex.WaitOne(0)
+        $held = $mutex.WaitOne([TimeSpan]::FromSeconds($WaitSeconds))
         if (-not $held) { $mutex.Dispose(); return $null }
       }
+      return $mutex
+    }
+    catch [System.Threading.AbandonedMutexException] {
+      # The last holder died without releasing (a task killed at its time limit). The
+      # wait still granted ownership - take it, rather than falling through to a Local\
+      # mutex no other session shares, which would be no exclusion at all.
+      Write-SebLog 'the previous backup pass ended without releasing its lock - taking it over' 'WARN'
       return $mutex
     }
     catch {
@@ -1637,6 +1820,12 @@ function Invoke-SebBackupLogPass {
   # the same Get-SebMutex, so this read-drain-write is race-free against the data pass.
   $state = Read-SebState
   $pending = @($state.Pending)
+  $orphans = @(Get-SebOrphanLogEntries -StagingPath $StagingPath -KeepPaths @($pending | ForEach-Object { if ($null -ne $_) { [string]$_.Staged } }) `
+      -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel)
+  if ($orphans.Count -gt 0) {
+    Write-SebLog ('{0} staged log backup file(s) were never recorded for copy - adopting them so the chain reaches the share' -f $orphans.Count) 'WARN'
+    $pending = @($pending) + $orphans
+  }
   $pendingList = New-Object System.Collections.ArrayList
   if ($pending.Count -gt 0) {
     Write-SebLog ('{0} copy(s) pending from earlier runs - draining first' -f $pending.Count)
@@ -1651,10 +1840,11 @@ function Invoke-SebBackupLogPass {
   }
 
   $rows = Invoke-SebSqlTable -Connection $Connection -Sql @'
-SELECT d.name, d.state, d.source_database_id, d.is_in_standby
+SELECT d.name, d.state, d.source_database_id, d.is_in_standby, d.is_read_only
 FROM sys.databases AS d
 '@
   $databases = Select-SebDatabase -Rows $rows
+  $readOnly = Get-SebReadOnlyMap -Rows $rows
   if (-not [string]::IsNullOrWhiteSpace($OnlyDatabase)) {
     $databases = @($databases | Where-Object { $_ -eq $OnlyDatabase })
     if ($databases.Count -eq 0) { throw ("database '$OnlyDatabase' is not on this instance, or is not eligible for backup") }
@@ -1663,6 +1853,7 @@ FROM sys.databases AS d
   $succeeded = 0
   $failed = 0
   foreach ($db in $databases) {
+    if (-not (Test-SebPitrEligible -Name $db -ReadOnly $readOnly[$db])) { continue }
     try {
       $modelRows = Invoke-SebSqlTable -Connection $Connection -Sql (Get-SebRecoveryModelSql -Database $db)
       # Get-SebRecoveryModelFromRows defaults an unreadable/offline database to 'FULL' -
@@ -1738,6 +1929,12 @@ function Invoke-SebPass {
 
   $state = Read-SebState
   $pending = @($state.Pending)
+  $orphans = @(Get-SebOrphanLogEntries -StagingPath $staging -KeepPaths @($pending | ForEach-Object { if ($null -ne $_) { [string]$_.Staged } }) `
+      -Root ([string]$Config.SharePath) -HostName $env:COMPUTERNAME -InstanceLabel ([string]$Config.InstanceName))
+  if ($orphans.Count -gt 0) {
+    Write-SebLog ('{0} staged log backup file(s) were never recorded for copy - adopting them so the chain reaches the share' -f $orphans.Count) 'WARN'
+    $pending = @($pending) + $orphans
+  }
   $noHash = [bool]$Config.NoHashVerify
   $compress = $false
   if ($Config.PSObject.Properties['CompressBackups']) { $compress = [bool]$Config.CompressBackups }
@@ -1797,10 +1994,11 @@ function Invoke-SebPass {
     }
 
     $rows = Invoke-SebSqlTable -Connection $connection -Sql @'
-SELECT d.name, d.state, d.source_database_id, d.is_in_standby
+SELECT d.name, d.state, d.source_database_id, d.is_in_standby, d.is_read_only
 FROM sys.databases AS d
 '@
     $databases = Select-SebDatabase -Rows $rows
+    $readOnly = Get-SebReadOnlyMap -Rows $rows
     $only = ''
     if ($Config.PSObject.Properties['OnlyDatabase']) { $only = [string]$Config.OnlyDatabase }
     if (-not [string]::IsNullOrWhiteSpace($only)) {
@@ -1860,6 +2058,13 @@ GROUP BY database_id
       }
       $logSpaceRows = @(Invoke-SebSqlTable -Connection $connection -Sql 'DBCC SQLPERF(LOGSPACE)')
     }
+    try {
+      $modelRows = @(Invoke-SebSqlTable -Connection $connection -Sql 'SELECT name, recovery_model_desc FROM sys.databases')
+      foreach ($w in @(Get-SebUnmanagedFullLogWarnings -Rows $modelRows -Databases $databases -FullMode $isFullMode -ReadOnlyMap $readOnly)) {
+        Write-SebLog $w 'WARN'
+      }
+    }
+    catch { Write-SebLog ('could not check recovery models: {0}' -f $_.Exception.Message) 'WARN' }
 
     $dbIndex = 0
     foreach ($database in $databases) {
@@ -1867,7 +2072,7 @@ GROUP BY database_id
       $staged = $null
       try {
         $kind = 'full'
-        if ($isFullMode) {
+        if ($isFullMode -and (Test-SebPitrEligible -Name $database -ReadOnly $readOnly[$database])) {
           $justSwitched = Set-SebRecoveryFull -Connection $connection -Database $database
           $fullDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
           $hoursSinceFull = Get-SebHoursSinceNewestFull -Facts @(Get-SebFolderFacts -Directory $fullDir) -Now $stamp
@@ -2075,6 +2280,9 @@ function Get-SebScheduleState {
 # SYSTEM and Administrators can write, and registers THAT path.
 function Copy-SebEngineForService {
   param([string]$ScriptPath)
+  # Before anything else: a parent a non-admin controls makes the lock on engine\ moot.
+  # Runs on every -Install/-Reschedule, so an existing install is hardened on its next one.
+  Protect-SebConfigDir $script:SebConfigDir
   $dir = Join-Path $script:SebConfigDir 'engine'
   if (-not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Path $dir -Force) }
   Set-SebSecretAcl $dir
@@ -2257,11 +2465,12 @@ function Invoke-SebSetup {
   if (-not (Test-Path -LiteralPath $script:SebConfigDir)) {
     [void](New-Item -ItemType Directory -Path $script:SebConfigDir -Force)
   }
-  # NOT locked as a whole, deliberately. Every secret in here is locked individually -
-  # key.bin, key.entropy, cred.dat, config.json, state.json and engine\ - and locking
-  # the directory on top of that only takes public.json down with it, which is the one
-  # file an unelevated dashboard is supposed to be able to read. It also stopped the
-  # console starting at all, since it could no longer open its own state directory.
+  # Locked for WRITE, not for read. Every secret in here is also locked individually -
+  # key.bin, key.entropy, cred.dat, config.json, state.json and engine\. Locking the
+  # directory against reading took public.json down with it (the one file an unelevated
+  # dashboard is supposed to read) and stopped the console starting at all; leaving it
+  # writable let a non-admin swap engine\ out from under the SYSTEM task. Users keep read.
+  Protect-SebConfigDir $script:SebConfigDir
 
   Write-Host ''
   Write-Host '== Instances on this host ============================================='
@@ -3176,7 +3385,7 @@ function Get-SebRestoreStepSql {
     return ('RESTORE DATABASE {0} FROM DISK = {1} WITH NORECOVERY' -f $target, $literal)
   }
   if ($Step.Recovery) {
-    $stop = Get-SebSqlLiteral ($Step.StopAt.ToString('yyyy-MM-ddTHH:mm:ss'))
+    $stop = Get-SebSqlLiteral ($Step.StopAt.ToString('yyyy-MM-ddTHH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture))
     return ('RESTORE LOG {0} FROM DISK = {1} WITH STOPAT = {2}, RECOVERY' -f $target, $literal, $stop)
   }
   return ('RESTORE LOG {0} FROM DISK = {1} WITH NORECOVERY' -f $target, $literal)
@@ -3570,16 +3779,27 @@ FROM sys.databases
 
 if ($DotSourceOnly) { return }
 
+# When the app reads this output through a pipe, write UTF-8 - the console default (OEM
+# 437) turned a database named Cafe-with-an-accent into a name that does not exist, and
+# every restore/inspect aimed at it missed. An interactive console is left as it is.
+try { if ([Console]::IsOutputRedirected) { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } } catch { }
+
 $exitCode = 0
 $mutex = $null
 try {
   if ($Setup) {
     Assert-SebElevated -Mode 'Setup'
+    $existingConfig = $null
+    if (Test-Path -LiteralPath (Get-SebConfigPath)) { try { $existingConfig = Read-SebConfig } catch { } }
+    $carry = Get-SebSetupCarryOver -Existing $existingConfig -Bound @($PSBoundParameters.Keys) -Values @{
+      RecoveryMode = $RecoveryMode; LogIntervalMinutes = $LogIntervalMinutes; FullEveryHours = $FullEveryHours
+      CompressBackups = $CompressBackups.IsPresent; NoHashVerify = $NoHashVerify.IsPresent
+    }
     Invoke-SebSetup -PinnedInstance $Instance -Share $SharePath -Staging $StagingPath `
       -Hours $IntervalHours -Hourly $HourlyKeep -DailyDays $DailyKeepDays `
-      -WindowsAuth:$UseWindowsAuth -SkipHash:$NoHashVerify `
-      -RecoveryMode $RecoveryMode -LogIntervalMinutes $LogIntervalMinutes -FullEveryHours $FullEveryHours `
-      -CompressBackups:$CompressBackups
+      -WindowsAuth:$UseWindowsAuth -SkipHash:([bool]$carry.NoHashVerify) `
+      -RecoveryMode ([string]$carry.RecoveryMode) -LogIntervalMinutes ([int]$carry.LogIntervalMinutes) `
+      -FullEveryHours ([int]$carry.FullEveryHours) -CompressBackups:([bool]$carry.CompressBackups)
   }
   elseif ($Install) {
     Assert-SebElevated -Mode 'Install'
@@ -3688,19 +3908,28 @@ try {
   elseif (-not [string]::IsNullOrWhiteSpace($RestoreInspect)) {
     $config = Read-SebRestoreContext
     $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
-    try { Write-Host (ConvertTo-Json (Get-SebRestoreInspect -Connection $connection -Path $RestoreInspect) -Depth 4 -Compress) }
-    finally { $connection.Close() }
+    $prepared = $null
+    try {
+      $prepared = Get-SebRestoreSource -Connection $connection -File $RestoreInspect
+      $inspect = Get-SebRestoreInspect -Connection $connection -Path $prepared.Source
+      # Report the file the operator picked, not the temp copy it was read through.
+      $inspect['Path'] = $RestoreInspect
+      Write-Host (ConvertTo-Json $inspect -Depth 4 -Compress)
+    }
+    finally { Remove-SebRestoreSource $prepared; $connection.Close() }
   }
   elseif (-not [string]::IsNullOrWhiteSpace($RestoreVerify)) {
     $config = Read-SebRestoreContext
     $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
+    $prepared = $null
     try {
+      $prepared = Get-SebRestoreSource -Connection $connection -File $RestoreVerify
       Write-SebStage -Database '' -Stage 'verifying backup media'
-      Invoke-SebSqlNonQuery -Connection $connection -Sql ('RESTORE VERIFYONLY FROM DISK = {0} WITH CHECKSUM' -f (Get-SebSqlLiteral $RestoreVerify))
+      Invoke-SebSqlNonQuery -Connection $connection -Sql ('RESTORE VERIFYONLY FROM DISK = {0} WITH CHECKSUM' -f (Get-SebSqlLiteral $prepared.Source))
       Write-Host (ConvertTo-Json @{ Ok = $true; Error = '' } -Compress)
     }
     catch { Write-Host (ConvertTo-Json @{ Ok = $false; Error = [string]$_.Exception.Message } -Compress); $exitCode = 1 }
-    finally { $connection.Close() }
+    finally { Remove-SebRestoreSource $prepared; $connection.Close() }
   }
   elseif ($RestoreRun) {
     if ([string]::IsNullOrWhiteSpace($RestoreFrom)) { throw '-RestoreRun needs -RestoreFrom <path to .bak>' }
@@ -3708,19 +3937,12 @@ try {
     $config = Read-SebRestoreContext
     $connection = New-SebSqlConnection -DataSource ([string]$config.DataSource) -WindowsAuth
     # $env:TEMP is fine as the expansion root because the SQL service account is granted read
-    # on the per-restore subfolder below (Read-SebRestoreContext deliberately does not carry
+    # on the per-restore subfolder (Read-SebRestoreContext deliberately does not carry
     # StagingPath, and a temp folder is not readable by that account by default).
-    $decompDir = Join-Path $env:TEMP ('seb-restore-' + [Guid]::NewGuid().ToString('N'))
+    $prepared = $null
     try {
-      if ($RestoreFrom -like '*.zip') {
-        [void](New-Item -ItemType Directory -Path $decompDir -Force)
-        $svcAcct = Get-SebSqlServiceAccount -Connection $connection
-        if (-not [string]::IsNullOrWhiteSpace($svcAcct)) {
-          try { Set-SebStagingAcl -Path $decompDir -SqlAccount $svcAcct -AlsoGrant @([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) }
-          catch { Write-SebLog ('could not grant the SQL service account read on the restore temp folder: {0}' -f $_.Exception.Message) 'WARN' }
-        }
-      }
-      $restoreSource = Resolve-SebRestoreSource -File $RestoreFrom -StagingDir $decompDir
+      $prepared = Get-SebRestoreSource -Connection $connection -File $RestoreFrom
+      $restoreSource = $prepared.Source
       $info = Get-SebRestoreInspect -Connection $connection -Path $restoreSource
       if (-not $info.Readable) {
         throw ('SQL Server cannot read {0}. This is a PERMISSION fault, not a corrupt backup: the file is read by the SQL service account, not by you. Grant that account read on the folder. The symptom is identical to a damaged file, which is why it is checked before anything is committed.' -f $RestoreFrom)
@@ -3785,7 +4007,7 @@ try {
     }
     finally {
       $connection.Close()
-      if (Test-Path -LiteralPath $decompDir) { Remove-Item -LiteralPath $decompDir -Recurse -Force -ErrorAction SilentlyContinue }
+      Remove-SebRestoreSource $prepared
     }
   }
   elseif ($RestoreToPoint) {
@@ -3950,20 +4172,37 @@ try {
   else {
     Assert-SebElevated -Mode 'Run'
     $config = Read-SebConfig
-    $mutex = Get-SebMutex
-    if ($null -eq $mutex) {
-      Write-SebLog 'another backup pass is already running - this one is standing down' 'WARN'
-      exit 0
-    }
     if ($Loop) {
+      # The lock is taken per pass, never held across the sleep: holding it for the life of
+      # the service made every -BackupLog run stand down, so a service install in Full mode
+      # took no log backups at all. The config is re-read every cycle so a -Reschedule or a
+      # reconfigure (interval, compression, recovery mode, share) lands without a restart.
       Write-SebLog ('service loop starting - one pass every {0} hour(s)' -f $config.IntervalHours)
       while ($true) {
-        try { [void](Invoke-SebPass -Config $config) }
-        catch { Write-SebLog ('pass threw: {0}' -f $_.Exception.Message) 'ERROR' }
+        try { $config = Read-SebConfig }
+        catch { Write-SebLog ('could not re-read the config, keeping the last one: {0}' -f $_.Exception.Message) 'WARN' }
+        $mutex = Get-SebMutex -WaitSeconds 300
+        if ($null -eq $mutex) {
+          Write-SebLog 'another backup pass is still running - skipping this cycle' 'WARN'
+        }
+        else {
+          try { [void](Invoke-SebPass -Config $config) }
+          catch { Write-SebLog ('pass threw: {0}' -f $_.Exception.Message) 'ERROR' }
+          finally {
+            try { $mutex.ReleaseMutex() } catch { }
+            $mutex.Dispose()
+            $mutex = $null
+          }
+        }
         Start-Sleep -Seconds ([int]$config.IntervalHours * 3600)
       }
     }
     else {
+      $mutex = Get-SebMutex -WaitSeconds 300
+      if ($null -eq $mutex) {
+        Write-SebLog 'another backup pass is already running - this one is standing down' 'WARN'
+        exit 0
+      }
       $exitCode = Invoke-SebPass -Config $config
     }
   }
