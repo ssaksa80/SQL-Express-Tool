@@ -211,8 +211,10 @@ hours. That shipped once. The test now asserts the path the app actually used.
   file server when you have one — the schedule, retention and credential all stay.
 - **DPAPI is machine-bound.** Sealed credentials do not move between servers; re-run
   setup on the new host.
-- **No transaction-log backups.** The stated RPO is 6 hours; log chains bring real
-  operational complexity that does not buy anything at that RPO.
+- **Point-in-time recovery is opt-in.** By default databases stay in SIMPLE recovery
+  and the loss window is the backup interval (6 hours). Turn on *Point-in-time
+  recovery* in setup (or `-RecoveryMode Full`) for log backups every 15 minutes and
+  restores to any minute; master and msdb stay full-only.
 - **A dead UNC path takes about 7.5 minutes to fail.** The task's execution time limit
   and a named mutex keep that contained, but a share outage makes a pass slow.
 - **Restore is not automated.** This produces verified, restorable files; restoring is

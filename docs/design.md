@@ -21,9 +21,9 @@ We need one operator-runnable artifact that:
 
 * Restore automation. This produces verified backup files; restoring is a human
   decision and gets its own runbook.
-* Transaction-log backups / point-in-time recovery. The stated RPO is 6 hours.
-  Log chains bring real operational complexity (chain breaks, `NORECOVERY`
-  sequencing) that a 6-hour RPO does not justify.
+* ~~Transaction-log backups / point-in-time recovery.~~ Originally out of scope at
+  a 6-hour RPO; since shipped as an opt-in mode (`RecoveryMode = Full`). See
+  [the point-in-time recovery design](superpowers/specs/2026-09-04-point-in-time-recovery-design.md).
 * Off-host key escrow. The credential is deliberately machine-bound.
 
 ## Artifact

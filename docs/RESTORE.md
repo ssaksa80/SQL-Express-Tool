@@ -17,11 +17,16 @@ database is not a dead host. If the database is still online and you only need o
 table's contents, restore to a *new* name and copy the rows across. Do not restore
 over a live database because one table is wrong.
 
-**What will you lose?** These backups run on a fixed interval — six hours by
-default. Everything written since the last one is gone. There is no point-in-time
-recovery: every database on the instance is in SIMPLE recovery, which makes log
-backups impossible. If you need to lose less than an interval, that is a decision
-about recovery models, not a thing this procedure can give you.
+**What will you lose?** It depends on the host's recovery mode (the app's setup, or
+`RecoveryMode` in `-Status`):
+
+- **Simple (the default).** Backups run on a fixed interval — six hours by default.
+  Everything written since the last one is gone; you restore to a backup, never to a
+  moment.
+- **Point-in-time (Full).** User databases are in FULL recovery with log backups every
+  15 minutes by default, so you can restore to any minute the log chain covers — use
+  the app's *Restore to a point in time* tab, or `-RestoreToPoint -StopAt`. At most one
+  log interval is lost. master and msdb stay full-only.
 
 **Do you have the rights?** You need `sysadmin` on the instance, or at minimum
 `dbcreator` plus the ability to read the backup file.
@@ -196,9 +201,11 @@ kills open transactions, which is fine for a dead database and rude for a live o
 
 Stated plainly, so nobody discovers it mid-incident:
 
-- **No point-in-time recovery.** SIMPLE recovery on every database means no log
-  chain. You restore to a backup, never to a moment.
-- **The interval is the loss.** Six hours by default.
+- **In Simple mode, no point-in-time recovery.** SIMPLE recovery means no log
+  chain: you restore to a backup, never to a moment, and the interval is the loss
+  (six hours by default). Point-in-time mode is opt-in — see *What will you lose?*
+- **master and msdb restore to a backup only**, in either mode: SQL Server allows
+  nothing but a full backup of master.
 - **A local share is not disaster recovery.** If the backup destination is a share
   on the machine running SQL, a dead host takes both. Point the destination at
   another server.
