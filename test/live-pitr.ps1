@@ -16,7 +16,7 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $engine = Join-Path $root 'Invoke-SqlExpressBackup.ps1'
-$instance = '.\SQLEXPRESS'
+$sqlInstance = '.\SQLEXPRESS'
 $src = 'PitrProbe'
 $dst = 'PitrProbe_R'
 $pass = $true
@@ -28,7 +28,7 @@ function Check($cond, $msg) { if ($cond) { Write-Host "  PASS $msg" } else { Wri
 $script:SebCompression = 'off'   # Express has no backup compression
 
 # --- open a live connection (Windows auth) ------------------------------------------
-$cs = "Server=$instance;Integrated Security=SSPI;TrustServerCertificate=True;Connect Timeout=15"
+$cs = "Server=$sqlInstance;Integrated Security=SSPI;TrustServerCertificate=True;Connect Timeout=15"
 $conn = New-Object System.Data.SqlClient.SqlConnection $cs
 $conn.Open()
 function Exec($sql) { $k = $conn.CreateCommand(); $k.CommandText = $sql; [void]$k.ExecuteNonQuery() }
