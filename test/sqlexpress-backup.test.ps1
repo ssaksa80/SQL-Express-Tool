@@ -1675,4 +1675,247 @@ Assert (-not (Test-Path -LiteralPath $plainSrc.TempDir)) 'and no temp folder is 
 Remove-SebRestoreSource $plainSrc
 Remove-SebRestoreSource $null
 
+# ======================================================================================
+# ALERTING
+# ======================================================================================
+$savedConfigDir = $script:SebConfigDir
+$alertRoot = Join-Path $env:TEMP ('seb-alert-' + [Guid]::NewGuid().ToString('N'))
+[void](New-Item -ItemType Directory -Path $alertRoot -Force)
+$script:SebConfigDir = $alertRoot
+
+# A throwaway loopback server on a background runspace: accepts up to $Expect connections
+# until $TimeoutMs passes and returns what it saw. TcpListener, not HttpListener, so it needs
+# no URL reservation and runs unelevated. Mode 'http' answers 200; mode 'smtp' plays a minimal
+# SMTP dialogue and records the DATA section.
+function Start-TestListener {
+  param([ValidateSet('http', 'smtp')][string]$Mode, [int]$Expect = 1, [int]$TimeoutMs = 8000)
+  $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback, 0)
+  $listener.Start()
+  $ps = [powershell]::Create()
+  [void]$ps.AddScript({
+      param($listener, $mode, $expect, $timeoutMs)
+      $seen = New-Object System.Collections.ArrayList
+      $deadline = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
+      while ($seen.Count -lt $expect -and [DateTime]::UtcNow -lt $deadline) {
+        if (-not $listener.Pending()) { Start-Sleep -Milliseconds 50; continue }
+        $client = $listener.AcceptTcpClient()
+        $client.ReceiveTimeout = 5000
+        $stream = $client.GetStream()
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII)
+        $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::ASCII)
+        $writer.NewLine = "`r`n"; $writer.AutoFlush = $true
+        try {
+          if ($mode -eq 'http') {
+            $first = $reader.ReadLine(); $len = 0
+            while (($h = $reader.ReadLine()) -ne '' -and $null -ne $h) { if ($h -match '^Content-Length:\s*(\d+)') { $len = [int]$Matches[1] } }
+            $buf = New-Object char[] $len; $got = 0
+            while ($got -lt $len) { $n = $reader.Read($buf, $got, $len - $got); if ($n -le 0) { break }; $got += $n }
+            $writer.Write("HTTP/1.1 200 OK`r`nContent-Length: 2`r`nConnection: close`r`n`r`nok")
+            [void]$seen.Add([pscustomobject]@{ Request = $first; Body = (-join $buf) })
+          }
+          else {
+            $writer.WriteLine('220 localhost test')
+            $data = New-Object System.Text.StringBuilder; $rcpt = New-Object System.Collections.ArrayList
+            while ($true) {
+              $line = $reader.ReadLine(); if ($null -eq $line) { break }
+              if ($line -match '^(EHLO|HELO)') { $writer.WriteLine('250 localhost') }
+              elseif ($line -match '^MAIL FROM') { $writer.WriteLine('250 OK') }
+              elseif ($line -match '^RCPT TO:\s*<?([^>]+)>?') { [void]$rcpt.Add($Matches[1]); $writer.WriteLine('250 OK') }
+              elseif ($line -eq 'DATA') {
+                $writer.WriteLine('354 go ahead')
+                while (($d = $reader.ReadLine()) -ne '.') { [void]$data.AppendLine($d) }
+                $writer.WriteLine('250 queued')
+              }
+              elseif ($line -eq 'QUIT') { $writer.WriteLine('221 bye'); break }
+              else { $writer.WriteLine('250 OK') }
+            }
+            [void]$seen.Add([pscustomobject]@{ Rcpt = @($rcpt.ToArray()); Data = $data.ToString() })
+          }
+        }
+        finally { $client.Close() }
+      }
+      $listener.Stop()
+      return , @($seen.ToArray())
+    }).AddArgument($listener).AddArgument($Mode).AddArgument($Expect).AddArgument($TimeoutMs)
+  $handle = $ps.BeginInvoke()
+  return [pscustomobject]@{ Port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port; Ps = $ps; Handle = $handle }
+}
+function Stop-TestListener {
+  param($L)
+  $out = $L.Ps.EndInvoke($L.Handle)
+  $L.Ps.Dispose()
+  return @($out | ForEach-Object { $_ })
+}
+
+try {
+  # ---- ALERT-1. state writers no longer erase each other's fields -------------------
+  Write-SebState ([pscustomobject]@{ LastRunUtc = 'r1'; LastResult = 'ok'; Pending = @(); Alerts = @{ x = [pscustomobject]@{ Owner = 'watchdog' } }; LastLogSuccessUtc = 'L1' })
+  Write-SebState ([pscustomobject]@{ LastRunUtc = 'r2'; LastResult = 'partial'; Pending = @() })
+  $st = Read-SebState
+  Assert ($st.LastRunUtc -eq 'r2' -and $st.LastResult -eq 'partial') 'Write-SebState writes what it is given'
+  Assert ($st.LastLogSuccessUtc -eq 'L1' -and $null -ne $st.Alerts.x) 'and keeps fields it was not given (another writer''s alert state and log success)'
+
+  # ---- ALERT-2. the notification decision ------------------------------------------
+  $t0 = [datetime]::SpecifyKind([datetime]'2026-09-25 08:00:00', 'Utc')
+  $c1 = New-SebAlertCondition -Key 'data-pass-failed' -Severity 'critical' -Owner 'data' -Message 'boom'
+  $u = Update-SebAlertState -Previous $null -Current @($c1) -Owners @('data') -NowUtc $t0 -RemindHours 24
+  Assert ($u.Notifications.Count -eq 1 -and $u.Notifications[0].Event -eq 'raised') 'a new condition is raised'
+  Assert ($u.Alerts['data-pass-failed'].LastSentUtc -eq '') 'but not marked sent until delivery succeeds'
+  $u2 = Update-SebAlertState -Previous $u.Alerts -Current @($c1) -Owners @('data') -NowUtc $t0.AddHours(1) -RemindHours 24
+  Assert ($u2.Notifications.Count -eq 1 -and $u2.Notifications[0].Event -eq 'raised') 'an undelivered alert is raised again next time (a failed send is retried)'
+  Complete-SebAlertDelivery -Alerts $u2.Alerts -Notifications $u2.Notifications -NowUtc $t0.AddHours(1)
+  Assert ($u2.Alerts['data-pass-failed'].SinceUtc -eq $t0.ToString('o')) 'the start time survives re-evaluation'
+  # Round-trip through JSON, as it really is between runs.
+  $prevJson = ($u2.Alerts | ConvertTo-Json -Depth 5) | ConvertFrom-Json
+  $u3 = Update-SebAlertState -Previous $prevJson -Current @($c1) -Owners @('data') -NowUtc $t0.AddHours(24.9) -RemindHours 24
+  Assert ($u3.Notifications.Count -eq 0) 'a delivered alert is quiet until the reminder is due (23.9h after sending)'
+  $u4 = Update-SebAlertState -Previous $prevJson -Current @($c1) -Owners @('data') -NowUtc $t0.AddHours(25) -RemindHours 24
+  Assert ($u4.Notifications.Count -eq 1 -and $u4.Notifications[0].Event -eq 'reminder') 'and reminds exactly at the reminder interval'
+  $cWarn = New-SebAlertCondition -Key 'data-pass-failed' -Severity 'warning' -Owner 'data' -Message 'less boom'
+  $u5 = Update-SebAlertState -Previous $prevJson -Current @($cWarn) -Owners @('data') -NowUtc $t0.AddHours(2) -RemindHours 24
+  Assert ($u5.Notifications.Count -eq 1 -and $u5.Notifications[0].Event -eq 'raised') 'a change of severity is announced at once'
+  $u6 = Update-SebAlertState -Previous $prevJson -Current @() -Owners @('data') -NowUtc $t0.AddHours(3) -RemindHours 24
+  Assert ($u6.Notifications.Count -eq 1 -and $u6.Notifications[0].Event -eq 'resolved' -and -not $u6.Alerts.Contains('data-pass-failed')) 'a cleared condition is resolved once and dropped'
+  $u7 = Update-SebAlertState -Previous $prevJson -Current @() -Owners @('log', 'pending') -NowUtc $t0.AddHours(3) -RemindHours 24
+  Assert ($u7.Notifications.Count -eq 0 -and $u7.Alerts.Contains('data-pass-failed')) 'another owner''s evaluation neither resolves nor drops it'
+  $u8 = Update-SebAlertState -Previous $u.Alerts -Current @() -Owners @('data') -NowUtc $t0.AddHours(1) -RemindHours 24
+  Assert ($u8.Notifications.Count -eq 0) 'a condition that was never delivered clears silently (no "resolved" for an alert nobody saw)'
+
+  # ---- ALERT-3. conditions ----------------------------------------------------------
+  $now = $t0
+  Assert (@(Get-SebPendingCondition -Count 2 -SinceUtc $now.AddMinutes(-59).ToString('o') -NowUtc $now -PendingMinutes 60).Count -eq 0) 'copies pending 59 minutes: not yet'
+  $pc = @(Get-SebPendingCondition -Count 2 -SinceUtc $now.AddMinutes(-60).ToString('o') -NowUtc $now -PendingMinutes 60)
+  Assert ($pc.Count -eq 1 -and $pc[0].Key -eq 'copy-pending' -and $pc[0].Owner -eq 'pending') 'copies pending 60 minutes: raised, owned by both passes'
+  Assert (@(Get-SebPendingCondition -Count 0 -SinceUtc $now.AddDays(-1).ToString('o') -NowUtc $now).Count -eq 0) 'nothing pending: nothing raised'
+  Assert ((Get-SebPendingSince -Previous '' -Count 1 -NowUtc $now) -eq $now.ToString('o')) 'the pending clock starts when copies first queue'
+  Assert ((Get-SebPendingSince -Previous 'earlier' -Count 3 -NowUtc $now) -eq 'earlier') 'keeps running while they stay queued'
+  Assert ((Get-SebPendingSince -Previous 'earlier' -Count 0 -NowUtc $now) -eq '') 'and resets when they drain'
+  $dc = @(Get-SebDataPassConditions -Succeeded 0 -Failed 2 -FailedDatabases @('A', 'B'))
+  Assert ($dc.Count -eq 1 -and $dc[0].Key -eq 'data-pass-failed' -and $dc[0].Severity -eq 'critical' -and $dc[0].Message -like '*A, B*') 'every database failed: critical, naming them'
+  $dc = @(Get-SebDataPassConditions -Succeeded 3 -Failed 1 -FailedDatabases @('B'))
+  Assert ($dc.Count -eq 1 -and $dc[0].Key -eq 'data-pass-partial' -and $dc[0].Severity -eq 'warning') 'some failed: a partial warning'
+  Assert (@(Get-SebDataPassConditions -Succeeded 3 -Failed 0).Count -eq 0) 'all good: nothing'
+  $dc = @(Get-SebDataPassConditions -Succeeded 0 -Failed 0 -FailureMessage 'cannot reach SQL')
+  Assert ($dc.Count -eq 1 -and $dc[0].Message -like '*cannot reach SQL*') 'a pass that died outright is critical, with the reason'
+  Assert (@(Get-SebLogPassConditions -Failed 1 -FailedDatabases @('A'))[0].Key -eq 'log-pass-failed') 'a failed log backup is its own critical condition'
+
+  $ac = Get-SebAlertConfig ([pscustomobject]@{ IntervalHours = 6; LogIntervalMinutes = 15; AlertEmailTo = 'a@x.test; b@x.test ,'; AlertSmtpHost = 'smtp.x.test'; AlertEmailFrom = 'seb@x.test' })
+  Assert ($ac.StaleHours -eq 13) "stale threshold derives from the schedule: 2 x 6h + 1 (got $($ac.StaleHours))"
+  Assert ($ac.LogStaleMinutes -eq 60) 'log staleness is four missed log intervals'
+  Assert ($ac.EmailTo.Count -eq 2 -and $ac.EmailTo[1] -eq 'b@x.test') 'recipients split on , and ; with blanks dropped'
+  Assert ($ac.EmailConfigured -and $ac.SmtpPort -eq 587 -and $ac.SmtpTls) 'email counts as configured with defaults port 587 and TLS on'
+  Assert (-not (Get-SebAlertConfig ([pscustomobject]@{ AlertEmailTo = 'a@x.test' })).EmailConfigured) 'recipients alone (no host/from) are not a working email channel'
+
+  $cfg = [pscustomobject]@{ IntervalHours = 6; RecoveryMode = 'Full'; LogIntervalMinutes = 15; CreatedUtc = $now.AddDays(-30).ToString('o') }
+  $acW = Get-SebAlertConfig $cfg
+  $okSched = [pscustomobject]@{ ServicePresent = $false; MainTaskState = 'Ready'; LogTaskState = 'Ready' }
+  $fresh = [pscustomobject]@{ LastSuccessUtc = $now.AddHours(-12.9).ToString('o'); LastLogSuccessUtc = $now.AddMinutes(-59).ToString('o') }
+  Assert (@(Get-SebWatchdogConditions -AlertConfig $acW -Config $cfg -State $fresh -Schedule $okSched -NowUtc $now).Count -eq 0) 'a healthy host: the watchdog finds nothing'
+  $stale = [pscustomobject]@{ LastSuccessUtc = $now.AddHours(-13).ToString('o'); LastLogSuccessUtc = $now.AddMinutes(-60).ToString('o') }
+  $keys = @(Get-SebWatchdogConditions -AlertConfig $acW -Config $cfg -State $stale -Schedule $okSched -NowUtc $now | ForEach-Object { $_.Key })
+  Assert (($keys -contains 'backup-stale') -and ($keys -contains 'log-stale')) 'at the thresholds both staleness alerts fire'
+  $newCfg = [pscustomobject]@{ IntervalHours = 6; RecoveryMode = 'Simple'; CreatedUtc = $now.AddHours(-2).ToString('o') }
+  Assert (@(Get-SebWatchdogConditions -AlertConfig (Get-SebAlertConfig $newCfg) -Config $newCfg -State ([pscustomobject]@{}) -Schedule $okSched -NowUtc $now).Count -eq 0) 'a fresh install that has not run yet is not stale'
+  $keys = @(Get-SebWatchdogConditions -AlertConfig $acW -Config $cfg -State $fresh -Schedule ([pscustomobject]@{ ServicePresent = $false; MainTaskState = 'Disabled'; LogTaskState = 'absent' }) -NowUtc $now | ForEach-Object { $_.Key })
+  Assert (($keys -contains 'task-missing') -and ($keys -contains 'log-task-missing')) 'a disabled backup task and a missing log task are both critical'
+  $keys = @(Get-SebWatchdogConditions -AlertConfig $acW -Config $cfg -State $fresh -Schedule ([pscustomobject]@{ ServicePresent = $true; MainTaskState = 'absent'; LogTaskState = 'Ready' }) -NowUtc $now | ForEach-Object { $_.Key })
+  Assert (-not ($keys -contains 'task-missing')) 'a service install has no backup task, and that is fine'
+  $simpleCfg = [pscustomobject]@{ IntervalHours = 6; RecoveryMode = 'Simple'; CreatedUtc = $now.AddDays(-30).ToString('o') }
+  $keys = @(Get-SebWatchdogConditions -AlertConfig (Get-SebAlertConfig $simpleCfg) -Config $simpleCfg -State $fresh -Schedule ([pscustomobject]@{ ServicePresent = $false; MainTaskState = 'Ready'; LogTaskState = 'absent' }) -NowUtc $now | ForEach-Object { $_.Key })
+  Assert ($keys.Count -eq 0) 'Simple mode expects no log task and no log backups'
+
+  # ---- ALERT-4. rendering: every payload is valid JSON of the right shape -------------
+  $notes = @(
+    [pscustomobject]@{ Event = 'raised'; Key = 'backup-stale'; Severity = 'critical'; Message = 'No successful backup pass for 14 hours'; SinceUtc = $now.ToString('o') },
+    [pscustomobject]@{ Event = 'resolved'; Key = 'copy-pending'; Severity = 'warning'; Message = 'copies waiting'; SinceUtc = $now.ToString('o') })
+  $slack = Get-SebWebhookPayload -Kind 'slack' -Notifications $notes -Label 'HOST\SQLEXPRESS' -NowUtc $now | ConvertFrom-Json
+  Assert ($slack.text -like '*CRITICAL*backup-stale*' -and $slack.text -like '*RESOLVED*copy-pending*') 'Slack gets one text block with every line'
+  $teams = Get-SebWebhookPayload -Kind 'teams' -Notifications $notes -Label 'HOST\SQLEXPRESS' -NowUtc $now | ConvertFrom-Json
+  Assert ($teams.type -eq 'message' -and $teams.attachments[0].contentType -eq 'application/vnd.microsoft.card.adaptive') 'Teams gets an Adaptive Card message'
+  Assert ($teams.attachments[0].content.body.Count -eq 3 -and $teams.attachments[0].content.body[1].color -eq 'Attention' -and $teams.attachments[0].content.body[2].color -eq 'Good') 'with a title line, critical in red and resolved in green'
+  $generic = Get-SebWebhookPayload -Kind 'generic' -Notifications $notes -Label 'HOST\SQLEXPRESS' -NowUtc $now | ConvertFrom-Json
+  Assert ($generic.host -eq 'HOST' -and $generic.instance -eq 'SQLEXPRESS' -and @($generic.notifications).Count -eq 2 -and $generic.notifications[0].event -eq 'raised') 'generic JSON carries host, instance and each notification'
+  Assert ((Get-SebAlertSubject -Notifications $notes -Label 'H\I') -eq '[SQL Express Backup] H\I: CRITICAL - 1 problem(s)') 'the subject leads with the worst severity and counts open problems'
+  Assert ((Get-SebAlertSubject -Notifications @($notes[1]) -Label 'H\I') -like '*: resolved') 'an all-clear subject says resolved'
+
+  # ---- ALERT-5. secrets never leak and never travel insecurely ------------------------
+  $leak = Protect-SebAlertText 'The remote server returned an error: (404) at https://prod-12.westeurope.logic.azure.com/workflows/abc/triggers/manual/paths/invoke?sig=SECRET'
+  Assert ($leak -notlike '*SECRET*' -and $leak -notlike '*logic.azure*' -and $leak -like '*<url>*') 'a URL inside an error message is stripped before it is logged'
+  Assert (Test-SebWebhookUrl 'https://hooks.slack.com/services/T/B/X') 'an https webhook is accepted'
+  Assert (-not (Test-SebWebhookUrl 'http://hooks.example.com/x')) 'plain http to another host is refused - the URL is the credential'
+  Assert (Test-SebWebhookUrl 'http://127.0.0.1:8080/x') 'plain http to loopback is allowed (it never leaves the machine)'
+  Assert (-not (Test-SebWebhookUrl 'not a url')) 'garbage is refused'
+  $m = Merge-SebAlertSecrets -Existing @{ SmtpPassword = 'p'; WebhookUrl = 'https://a/1' } -Incoming @{ WebhookUrl = ''; HeartbeatUrl = 'https://hc-ping.com/uuid'; Bogus = 'x' }
+  Assert ($m['SmtpPassword'] -eq 'p' -and -not $m.ContainsKey('WebhookUrl') -and $m['HeartbeatUrl'] -eq 'https://hc-ping.com/uuid' -and -not $m.ContainsKey('Bogus')) 'secrets merge: absent keeps, empty removes, value sets, unknown keys ignored'
+  $threw = $false; try { [void](Merge-SebAlertSecrets -Existing @{} -Incoming @{ WebhookUrl = 'http://evil.example/x' }) } catch { $threw = $true }
+  Assert $threw 'an http webhook URL is refused before it is ever stored'
+  # The app's hand-off file: DPAPI CurrentUser, read once, gone afterwards.
+  Add-Type -AssemblyName System.Security
+  $hand = Join-Path $alertRoot 'handoff.bin'
+  $protected = [System.Security.Cryptography.ProtectedData]::Protect([System.Text.Encoding]::UTF8.GetBytes('{"SmtpPassword":"s3cret","WebhookUrl":""}'), $null, 'CurrentUser')
+  Set-Content -LiteralPath $hand -Value ([Convert]::ToBase64String($protected))
+  $got = Read-SebAlertSecretsFile -Path $hand
+  Assert ($got['SmtpPassword'] -eq 's3cret' -and $got.ContainsKey('WebhookUrl') -and $got['WebhookUrl'] -eq '') 'the app''s DPAPI hand-off file decrypts (empty value kept, meaning remove)'
+  Assert (-not (Test-Path -LiteralPath $hand)) 'and is deleted once read'
+
+  # ---- ALERT-6. transports, against loopback listeners --------------------------------
+  $l = Start-TestListener -Mode 'http' -Expect 1
+  Send-SebWebhook -Url ('http://127.0.0.1:{0}/hook' -f $l.Port) -Json '{"text":"hello"}'
+  $seen = @(Stop-TestListener $l)
+  Assert ($seen.Count -eq 1 -and $seen[0].Request -like 'POST /hook *' -and $seen[0].Body -eq '{"text":"hello"}') 'the webhook POSTs the JSON body'
+  $l = Start-TestListener -Mode 'http' -Expect 1
+  Send-SebHeartbeat -Url ('http://127.0.0.1:{0}/ping/abc' -f $l.Port)
+  $seen = @(Stop-TestListener $l)
+  Assert ($seen.Count -eq 1 -and $seen[0].Request -like 'GET /ping/abc *') 'the heartbeat is a GET to the ping URL'
+  $l = Start-TestListener -Mode 'smtp' -Expect 1
+  $mailAc = Get-SebAlertConfig ([pscustomobject]@{ AlertEmailTo = 'ops@x.test,dba@x.test'; AlertEmailFrom = 'seb@x.test'; AlertSmtpHost = '127.0.0.1'; AlertSmtpPort = $l.Port; AlertSmtpTls = $false })
+  Send-SebAlertEmail -AlertConfig $mailAc -Password '' -Subject (Get-SebAlertSubject -Notifications $notes -Label 'HOST\SQLEXPRESS') -Body (Get-SebAlertBody -Notifications $notes -Label 'HOST\SQLEXPRESS' -NowUtc $now)
+  $seen = @(Stop-TestListener $l)
+  Assert ($seen.Count -eq 1 -and @($seen[0].Rcpt).Count -eq 2) 'the email goes to every recipient'
+  # UTF-8 bodies go out base64-encoded (database names need not be ASCII); decode to check.
+  $parts = $seen[0].Data -split "\r?\n\r?\n", 2
+  $mailBody = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($parts[1] -replace '\s', '')))
+  Assert ($parts[0] -like '*Subject: `[SQL Express Backup`] HOST\SQLEXPRESS: CRITICAL*') 'with a subject that leads with the severity'
+  Assert ($mailBody -like '*[[]CRITICAL[]] backup-stale*' -and $mailBody -like '*[[]RESOLVED[]] copy-pending*') 'and a body naming each problem'
+
+  # ---- ALERT-7. end to end: raise once, stay quiet, resolve once, retry on failure -----
+  $realSecrets = ${function:Read-SebAlertSecrets}
+  try {
+    $hook = Start-TestListener -Mode 'http' -Expect 5 -TimeoutMs 20000
+    $script:TestHookUrl = ('http://127.0.0.1:{0}/hook' -f $hook.Port)
+    function Read-SebAlertSecrets { return @{ WebhookUrl = $script:TestHookUrl } }
+    $e2eCfg = [pscustomobject]@{ InstanceName = 'SQLEXPRESS'; IntervalHours = 6; AlertWebhookKind = 'generic' }
+    Write-SebState ([pscustomobject]@{ LastRunUtc = ''; LastResult = 'never'; Pending = @(); Alerts = @{} })
+    $cond = New-SebAlertCondition -Key 'data-pass-failed' -Severity 'critical' -Owner 'data' -Message 'e2e'
+    Invoke-SebAlertEvaluation -Config $e2eCfg -Owners @('data') -Conditions @($cond)
+    Invoke-SebAlertEvaluation -Config $e2eCfg -Owners @('data') -Conditions @($cond)
+    Invoke-SebAlertEvaluation -Config $e2eCfg -Owners @('data') -Conditions @()
+    $seen = @(Stop-TestListener $hook)
+    Assert ($seen.Count -eq 2) "raised once, silent while it persists, resolved once (got $($seen.Count) sends)"
+    Assert ((($seen[0].Body | ConvertFrom-Json).notifications[0].event -eq 'raised') -and (($seen[1].Body | ConvertFrom-Json).notifications[0].event -eq 'resolved')) 'in that order'
+    Assert (@((Read-SebState).Alerts.PSObject.Properties).Count -eq 0) 'and nothing is left open in state'
+    $pub = Get-Content -LiteralPath (Join-Path $alertRoot 'public.json') -Raw | ConvertFrom-Json
+    Assert ($null -ne $pub.PSObject.Properties['Alerts']) 'the public summary carries the open-alerts list for the dashboard'
+
+    # Nobody listening: the send fails, the alert stays unsent, and the next run retries.
+    $script:TestHookUrl = 'http://127.0.0.1:1/hook'
+    Invoke-SebAlertEvaluation -Config $e2eCfg -Owners @('data') -Conditions @($cond)
+    Assert ((Read-SebState).Alerts.'data-pass-failed'.LastSentUtc -eq '') 'an undeliverable alert is not marked sent'
+    $retry = Start-TestListener -Mode 'http' -Expect 1
+    $script:TestHookUrl = ('http://127.0.0.1:{0}/hook' -f $retry.Port)
+    Invoke-SebAlertEvaluation -Config $e2eCfg -Owners @('data') -Conditions @($cond)
+    $seen = @(Stop-TestListener $retry)
+    Assert ($seen.Count -eq 1 -and (($seen[0].Body | ConvertFrom-Json).notifications[0].event -eq 'raised')) 'so the next evaluation delivers it'
+    Assert ((Read-SebState).Alerts.'data-pass-failed'.LastSentUtc -ne '') 'and only then is it marked sent'
+    $pubOpen = Get-Content -LiteralPath (Join-Path $alertRoot 'public.json') -Raw | ConvertFrom-Json
+    Assert (@($pubOpen.Alerts).Count -eq 1 -and $pubOpen.Alerts[0].Key -eq 'data-pass-failed' -and $pubOpen.Alerts[0].Severity -eq 'critical') 'and the dashboard sees it open'
+    Assert (((Get-Content -LiteralPath (Join-Path $alertRoot 'public.json') -Raw) -notlike '*127.0.0.1*')) 'the public summary never contains a channel URL'
+  }
+  finally { Set-Item -Path function:Read-SebAlertSecrets -Value $realSecrets }
+}
+finally {
+  $script:SebConfigDir = $savedConfigDir
+  Remove-Item -LiteralPath $alertRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host 'ALL PASS'

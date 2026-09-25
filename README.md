@@ -136,6 +136,42 @@ setup, and a folder an administrator just created grants that account nothing.
 **Backup compression is decided by error number, not message text.** Error 1844 is
 stable across versions; the wording is not, and is localized.
 
+## Alerting
+
+A failure nobody sees is the worst kind on an unattended server, so the engine tells
+someone — once when a problem starts, a reminder every 24 hours while it lasts, and
+once when it clears:
+
+| Channel | How |
+|---|---|
+| Windows event log | Always on. Source `SqlExpressBackup`: **9100** raised, **9101** reminder, **9102** resolved — key your existing monitoring on them. |
+| Email | SMTP with STARTTLS (port 587 by default); Microsoft 365, Exchange or any relay. |
+| Webhook | Microsoft Teams (a Power Automate *Workflows* webhook — Adaptive Card), Slack, or generic JSON. HTTPS only. |
+| Heartbeat | A ping after every good pass to healthchecks.io, Uptime Kuma or similar — the only thing that notices a host that is **off**. |
+
+It raises alerts for:
+- a pass that failed or partly failed, or a log backup that failed;
+- copies stuck waiting for the share;
+- a transaction log filling up, or a FULL-recovery database with nobody backing up its log;
+- no successful backup (or log backup) for too long;
+- a backup task that was deleted or disabled.
+
+The last two come from an hourly **watchdog** task, which exists only while a channel is configured.
+
+```powershell
+# elevated; unset parameters are left as they are
+.\Invoke-SqlExpressBackup.ps1 -ConfigureAlerts -AlertEmailTo 'ops@example.com' -AlertEmailFrom 'sqlbackup@example.com' `
+    -AlertSmtpHost 'smtp.office365.com' -AlertSmtpUser 'sqlbackup@example.com' -AlertWebhookKind Teams -AlertPromptSecrets
+.\Invoke-SqlExpressBackup.ps1 -TestAlert      # sends a test through every channel and reports each
+.\Invoke-SqlExpressBackup.ps1 -Status         # shows the channels and any open alerts
+.\Invoke-SqlExpressBackup.ps1 -ClearAlerts
+```
+
+The SMTP password and the webhook and heartbeat URLs (which carry their own tokens) are
+secrets. They are prompted for, never passed on the command line, and sealed in
+`alert.dat` the same way as the SQL credential. The design is in
+[docs/superpowers/specs/2026-09-25-alerting-design.md](docs/superpowers/specs/2026-09-25-alerting-design.md).
+
 ## Security
 
 This ships a tool that runs as SYSTEM and holds a database credential, so:
@@ -161,8 +197,10 @@ This ships a tool that runs as SYSTEM and holds a database credential, so:
 - **The pass validates what it reads.** Pending copies recorded in state are checked
   against the configured staging and share folders before anything is copied, so a
   tampered state file is not a "put this anywhere, as SYSTEM" primitive.
-- **Nothing is fetched at runtime, ever.** No network calls, no CDN, no update
-  check. The exe carries the engine and nothing else.
+- **Nothing is fetched at runtime, ever.** No CDN, no update check; the exe carries the
+  engine and nothing else. The only outbound traffic besides the share is alerting,
+  and only to the email server, webhook and heartbeat URL you configure: webhooks
+  over HTTPS only, and URLs stripped from anything logged.
 
 ## Requirements
 
@@ -190,6 +228,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build-app.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\test\sqlexpress-backup.test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\test\backup-app.test.ps1
 ```
+
+Where SQL Express is installed, the `test\live-*.ps1` scripts prove the real thing against
+scratch databases: point-in-time restore, compressed round trips, share-outage recovery,
+and alerting (raise once, stay quiet, resolve once).
 
 `dist/` is gitignored: the source and the build script are the reviewable artifacts.
 

@@ -108,6 +108,27 @@ param(
   [int]$FullEveryHours = 24,        # Full mode only: how often the data pass takes a full instead of a diff; same ContainsKey gating in -Reschedule
   [switch]$CompressBackups,       # zip every .bak/.dif/.trn to the share, with a facts sidecar; same ContainsKey gating in -Reschedule
   [switch]$NoCompressBackups,     # turn compression OFF - the spelling of -CompressBackups:$false that powershell.exe -File can pass
+  # Alerting. -ConfigureAlerts sets what is bound and leaves the rest (like -Reschedule);
+  # secrets come from -AlertSecretsFile (DPAPI CurrentUser JSON, deleted after reading)
+  # or -AlertPromptSecrets, never from the command line where they would sit in history.
+  [switch]$ConfigureAlerts,
+  [switch]$ClearAlerts,           # remove every alert setting, alert.dat and the watchdog task
+  [switch]$TestAlert,             # send a test through every configured channel, report each
+  [switch]$Watchdog,              # the dead-man check the watchdog task runs
+  [string]$AlertEmailTo,          # comma-separated
+  [string]$AlertEmailFrom,
+  [string]$AlertSmtpHost,
+  [int]$AlertSmtpPort = 587,
+  [ValidateSet('On', 'Off')]
+  [string]$AlertSmtpTls = 'On',   # STARTTLS; Off only for an internal relay on port 25
+  [string]$AlertSmtpUser,
+  [ValidateSet('None', 'Teams', 'Slack', 'Generic')]
+  [string]$AlertWebhookKind = 'None',
+  [int]$AlertRemindHours = 24,
+  [int]$AlertStaleHours = 0,      # 0 = derive from the schedule (2 x interval + 1h)
+  [int]$AlertPendingMinutes = 60,
+  [string]$AlertSecretsFile,
+  [switch]$AlertPromptSecrets,
   [switch]$UseWindowsAuth,
   [switch]$NoHashVerify,          # verify copies by length only (very large databases)
   [string]$NssmPath,
@@ -140,6 +161,8 @@ $script:SebShowKeys = @(
   'Instance', 'InstanceName', 'DataSource', 'SharePath', 'StagingPath',
   'IntervalHours', 'HourlyKeep', 'DailyKeepDays', 'RecoveryMode', 'LogIntervalMinutes',
   'FullEveryHours', 'CompressBackups', 'SqlUser', 'UseWindowsAuth',
+  'AlertEmailTo', 'AlertEmailFrom', 'AlertSmtpHost', 'AlertSmtpPort', 'AlertSmtpTls', 'AlertSmtpUser',
+  'AlertWebhookKind', 'AlertRemindHours', 'AlertStaleHours', 'AlertPendingMinutes',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -1030,6 +1053,20 @@ function Write-SebPublicSummary {
     Add-Member -InputObject $public -MemberType NoteProperty -Name 'LastRunUtc' -Value $State.LastRunUtc -Force
     Add-Member -InputObject $public -MemberType NoteProperty -Name 'LastResult' -Value $State.LastResult -Force
     Add-Member -InputObject $public -MemberType NoteProperty -Name 'PendingCount' -Value (@($State.Pending).Count) -Force
+    # Open alerts for the dashboard: what is wrong and since when. Condition messages name
+    # databases and counts - the same things the logs beside this file already say - never
+    # a secret or a path to one.
+    if ($State.PSObject.Properties['Alerts'] -and $null -ne $State.Alerts) {
+      $open = @()
+      $map = $State.Alerts
+      $keys = @()
+      if ($map -is [System.Collections.IDictionary]) { $keys = @($map.Keys) } else { $keys = @($map.PSObject.Properties | ForEach-Object { $_.Name }) }
+      foreach ($k in $keys) {
+        $a = $map.$k
+        $open += [pscustomobject]@{ Key = [string]$k; Severity = [string]$a.Severity; Message = [string]$a.Message; SinceUtc = [string]$a.SinceUtc }
+      }
+      Add-Member -InputObject $public -MemberType NoteProperty -Name 'Alerts' -Value @($open) -Force
+    }
   }
   Add-Member -InputObject $public -MemberType NoteProperty -Name 'HostName' -Value $env:COMPUTERNAME -Force
   Add-Member -InputObject $public -MemberType NoteProperty -Name 'WrittenUtc' -Value ((Get-Date).ToUniversalTime().ToString('o')) -Force
@@ -1085,13 +1122,587 @@ function Read-SebState {
 
 function Write-SebState {
   param($State)
-  $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Get-SebStatePath) -Encoding ASCII
+  # Keep what the caller did not set. Three writers share this file - the data pass, the
+  # log pass and the watchdog - and each only knows its own fields; writing a fresh object
+  # used to erase the others' (alert state, the log pass's last success).
+  $path = Get-SebStatePath
+  if (Test-Path -LiteralPath $path) {
+    $previous = $null
+    try { $previous = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { }
+    if ($null -ne $previous) {
+      foreach ($prop in @($previous.PSObject.Properties)) {
+        if (-not $State.PSObject.Properties[$prop.Name]) {
+          Add-Member -InputObject $State -MemberType NoteProperty -Name $prop.Name -Value $prop.Value -Force
+        }
+      }
+    }
+  }
+  $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $path -Encoding ASCII
   # NOT ACL'd. Locking it stops an unelevated -SelfTest rewriting its own throwaway
   # state, and it was never the right control anyway: what matters is that the pass
   # does not act on paths it reads back. See Test-SebPendingEntry.
   $cfg = $null
   try { $cfg = Read-SebConfig } catch { $cfg = $null }
   Write-SebPublicSummary -Config $cfg -State $State
+}
+
+# =====================================================================
+# Alerting
+# =====================================================================
+#
+# Conditions are raised by the pass that can see them (its "owner"), kept in state.json
+# under Alerts, and turned into notifications by Update-SebAlertState: once when a
+# condition starts, a reminder every AlertRemindHours while it lasts, once when it clears.
+# A condition is only ever resolved by an evaluation of its own owner - the data pass
+# must not clear a log-pass alert just because it did not look at logs. Channels: the
+# event log (always), SMTP email and an HTTPS webhook (when configured), plus a success
+# ping to an external monitor for the case no in-box check can see: a dead host.
+# Nothing in here may take a backup down - every entry point catches and logs.
+
+# When the current run of pending copies started: kept while copies stay pending, set
+# when they first appear, cleared when the list drains. copy-pending ages off this.
+function Get-SebPendingSince {
+  param([string]$Previous, [int]$Count, [datetime]$NowUtc)
+  if ($Count -le 0) { return '' }
+  if (-not [string]::IsNullOrWhiteSpace($Previous)) { return $Previous }
+  return $NowUtc.ToString('o')
+}
+
+# A round-trip ('o') timestamp from state.json back to UTC, or $null. Untyped on purpose:
+# PowerShell 7's ConvertFrom-Json hands back [datetime], 5.1 hands back the string.
+function ConvertFrom-SebUtc {
+  param($Value)
+  if ($null -eq $Value) { return $null }
+  if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+  $text = [string]$Value
+  if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+  $parsed = [datetime]::MinValue
+  if ([datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+    return $parsed.ToUniversalTime()
+  }
+  return $null
+}
+
+function New-SebAlertCondition {
+  param([string]$Key, [ValidateSet('warning', 'critical')][string]$Severity, [string]$Owner, [string]$Message)
+  return [pscustomobject]@{ Key = $Key; Severity = $Severity; Owner = $Owner; Message = $Message }
+}
+
+# Everything alert-related from config, with the defaults filled in. Staleness derives from
+# the schedule when not set: two missed data passes plus an hour, four missed log passes.
+function Get-SebAlertConfig {
+  param($Config)
+  $get = {
+    param([string]$Name, $Default)
+    if ($null -ne $Config -and $Config.PSObject.Properties[$Name] -and $null -ne $Config.$Name -and [string]$Config.$Name -ne '') { return $Config.$Name }
+    return $Default
+  }
+  $interval = [int](& $get 'IntervalHours' 6)
+  $logMinutes = [int](& $get 'LogIntervalMinutes' 15)
+  $stale = [double](& $get 'AlertStaleHours' 0)
+  if ($stale -le 0) { $stale = 2 * $interval + 1 }
+  $to = @(([string](& $get 'AlertEmailTo' '')) -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  $kind = ([string](& $get 'AlertWebhookKind' '')).ToLowerInvariant()
+  if ($kind -eq 'none') { $kind = '' }
+  $ac = [pscustomobject]@{
+    EmailTo         = $to
+    EmailFrom       = [string](& $get 'AlertEmailFrom' '')
+    SmtpHost        = [string](& $get 'AlertSmtpHost' '')
+    SmtpPort        = [int](& $get 'AlertSmtpPort' 587)
+    SmtpTls         = [bool](& $get 'AlertSmtpTls' $true)
+    SmtpUser        = [string](& $get 'AlertSmtpUser' '')
+    WebhookKind     = $kind
+    RemindHours     = [double](& $get 'AlertRemindHours' 24)
+    StaleHours      = $stale
+    LogStaleMinutes = 4 * $logMinutes
+    PendingMinutes  = [int](& $get 'AlertPendingMinutes' 60)
+    EmailConfigured = $false
+  }
+  $ac.EmailConfigured = ($ac.EmailTo.Count -gt 0 -and $ac.SmtpHost -ne '' -and $ac.EmailFrom -ne '')
+  return $ac
+}
+
+function Get-SebAlertSecretsPath { return (Join-Path $script:SebConfigDir 'alert.dat') }
+
+# The SMTP password and the webhook / heartbeat URLs (both carry their own tokens) - sealed
+# with the same machine key and AES+HMAC scheme as cred.dat, locked like it, never printed.
+function Read-SebAlertSecrets {
+  $path = Get-SebAlertSecretsPath
+  $out = @{}
+  if (-not (Test-Path -LiteralPath $path)) { return $out }
+  $master = Get-SebMasterKey
+  try {
+    $json = Unprotect-SebString -Blob ((Get-Content -LiteralPath $path -Raw).Trim()) -Master $master
+    $obj = $json | ConvertFrom-Json
+    foreach ($p in @($obj.PSObject.Properties)) { if ([string]$p.Value -ne '') { $out[$p.Name] = [string]$p.Value } }
+  }
+  finally { [System.Array]::Clear($master, 0, $master.Length) }
+  return $out
+}
+
+function Write-SebAlertSecrets {
+  param([hashtable]$Secrets)
+  $path = Get-SebAlertSecretsPath
+  $clean = @{}
+  foreach ($k in @($Secrets.Keys)) { if ([string]$Secrets[$k] -ne '') { $clean[$k] = [string]$Secrets[$k] } }
+  if ($clean.Count -eq 0) {
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    return
+  }
+  $master = Get-SebMasterKey -Create
+  try { $blob = Protect-SebString -Plain ($clean | ConvertTo-Json -Compress) -Master $master }
+  finally { [System.Array]::Clear($master, 0, $master.Length) }
+  Set-Content -LiteralPath $path -Value $blob -Encoding ASCII
+  Set-SebSecretAcl $path
+}
+
+function Test-SebAlertsConfigured {
+  param($AlertConfig, [hashtable]$Secrets)
+  if ($AlertConfig.EmailConfigured) { return $true }
+  if ($AlertConfig.WebhookKind -ne '' -and $Secrets.ContainsKey('WebhookUrl')) { return $true }
+  if ($Secrets.ContainsKey('HeartbeatUrl')) { return $true }
+  return $false
+}
+
+# Anything URL-shaped out of text that is about to be logged or sent: a delivery error
+# from a webhook can quote the URL, and the URL IS the credential.
+function Protect-SebAlertText {
+  param([string]$Text)
+  if ($null -eq $Text) { return '' }
+  return ($Text -replace '(?i)\b[a-z][a-z0-9+.-]*://\S+', '<url>')
+}
+
+# The notification decision, pure. Previous is state.json's Alerts (a pscustomobject from
+# JSON, or a hashtable); Current the conditions this evaluation found; Owners the owners
+# this evaluation speaks for. Returns the next Alerts map and what to send. LastSentUtc is
+# NOT set here - only once delivery succeeded (Complete-SebAlertDelivery), so a failed
+# send is retried at the next evaluation instead of being marked done.
+function Update-SebAlertState {
+  param($Previous, [object[]]$Current = @(), [string[]]$Owners = @(), [datetime]$NowUtc, [double]$RemindHours = 24)
+  $prev = [ordered]@{}
+  if ($null -ne $Previous) {
+    if ($Previous -is [System.Collections.IDictionary]) { foreach ($k in @($Previous.Keys)) { $prev[[string]$k] = $Previous[$k] } }
+    else { foreach ($p in @($Previous.PSObject.Properties)) { $prev[$p.Name] = $p.Value } }
+  }
+  $next = [ordered]@{}
+  $notes = New-Object System.Collections.ArrayList
+
+  # Other owners' alerts pass through untouched.
+  foreach ($k in @($prev.Keys)) {
+    if (@($Owners) -notcontains [string]$prev[$k].Owner) { $next[$k] = $prev[$k] }
+  }
+
+  $seen = @{}
+  foreach ($c in @($Current)) {
+    if ($null -eq $c -or $seen.ContainsKey($c.Key)) { continue }
+    $seen[$c.Key] = $true
+    if ($prev.Contains($c.Key) -and @($Owners) -contains [string]$prev[$c.Key].Owner) {
+      $old = $prev[$c.Key]
+      $entry = [pscustomobject]@{
+        Severity = $c.Severity; Owner = $c.Owner; Message = $c.Message
+        SinceUtc = [string]$old.SinceUtc; LastSentUtc = [string]$old.LastSentUtc
+      }
+      $lastSent = ConvertFrom-SebUtc $old.LastSentUtc
+      $event = ''
+      if ($null -eq $lastSent -or [string]$old.Severity -ne $c.Severity) { $event = 'raised' }   # never delivered, or it got worse
+      elseif (($NowUtc - $lastSent).TotalHours -ge $RemindHours) { $event = 'reminder' }
+      if ($event) { [void]$notes.Add([pscustomobject]@{ Event = $event; Key = $c.Key; Severity = $c.Severity; Message = $c.Message; SinceUtc = $entry.SinceUtc }) }
+      $next[$c.Key] = $entry
+    }
+    else {
+      $since = $NowUtc.ToString('o')
+      $next[$c.Key] = [pscustomobject]@{ Severity = $c.Severity; Owner = $c.Owner; Message = $c.Message; SinceUtc = $since; LastSentUtc = '' }
+      [void]$notes.Add([pscustomobject]@{ Event = 'raised'; Key = $c.Key; Severity = $c.Severity; Message = $c.Message; SinceUtc = $since })
+    }
+  }
+
+  foreach ($k in @($prev.Keys)) {
+    $old = $prev[$k]
+    if (@($Owners) -contains [string]$old.Owner -and -not $seen.ContainsKey($k)) {
+      # Only announce a clear for something that was actually announced.
+      if ($null -ne (ConvertFrom-SebUtc $old.LastSentUtc)) {
+        [void]$notes.Add([pscustomobject]@{ Event = 'resolved'; Key = $k; Severity = [string]$old.Severity; Message = [string]$old.Message; SinceUtc = [string]$old.SinceUtc })
+      }
+    }
+  }
+  return [pscustomobject]@{ Alerts = $next; Notifications = @($notes.ToArray()) }
+}
+
+function Complete-SebAlertDelivery {
+  param($Alerts, [object[]]$Notifications = @(), [datetime]$NowUtc)
+  foreach ($n in @($Notifications)) {
+    if ($n.Event -ne 'resolved' -and $Alerts.Contains($n.Key)) { $Alerts[$n.Key].LastSentUtc = $NowUtc.ToString('o') }
+  }
+}
+
+# ---- conditions -----------------------------------------------------------------
+
+function Get-SebPendingCondition {
+  param([int]$Count, $SinceUtc, [datetime]$NowUtc, [int]$PendingMinutes = 60)
+  if ($Count -le 0) { return @() }
+  $since = ConvertFrom-SebUtc $SinceUtc
+  if ($null -eq $since) { return @() }
+  $minutes = [int][math]::Floor(($NowUtc - $since).TotalMinutes)
+  if ($minutes -lt $PendingMinutes) { return @() }
+  return @(New-SebAlertCondition -Key 'copy-pending' -Severity 'warning' -Owner 'pending' -Message (
+      '{0} backup copy(s) have been waiting for the share for {1} minute(s) - until the share is reachable those backups exist only on this server.' -f $Count, $minutes))
+}
+
+function Get-SebDataPassConditions {
+  param([int]$Succeeded, [int]$Failed, [string[]]$FailedDatabases = @(), [string]$FailureMessage = '')
+  $names = (@($FailedDatabases) | Where-Object { $_ }) -join ', '
+  if ($FailureMessage -ne '') {
+    return @(New-SebAlertCondition -Key 'data-pass-failed' -Severity 'critical' -Owner 'data' -Message ('The backup pass failed before backing anything up: {0}' -f $FailureMessage))
+  }
+  if ($Succeeded -eq 0 -and $Failed -gt 0) {
+    return @(New-SebAlertCondition -Key 'data-pass-failed' -Severity 'critical' -Owner 'data' -Message ('The backup pass backed up nothing - every database failed: {0}' -f $names))
+  }
+  if ($Failed -gt 0) {
+    return @(New-SebAlertCondition -Key 'data-pass-partial' -Severity 'warning' -Owner 'data' -Message ('{0} database(s) failed to back up: {1}' -f $Failed, $names))
+  }
+  return @()
+}
+
+function Get-SebLogPassConditions {
+  param([int]$Failed, [string[]]$FailedDatabases = @(), [string]$FailureMessage = '')
+  if ($FailureMessage -ne '') {
+    return @(New-SebAlertCondition -Key 'log-pass-failed' -Severity 'critical' -Owner 'log' -Message ('The transaction-log backup pass failed: {0}' -f $FailureMessage))
+  }
+  if ($Failed -gt 0) {
+    return @(New-SebAlertCondition -Key 'log-pass-failed' -Severity 'critical' -Owner 'log' -Message (
+        'Transaction-log backups failed for {0} database(s): {1} - point-in-time recovery for them stops at the last good log.' -f $Failed, ((@($FailedDatabases) | Where-Object { $_ }) -join ', ')))
+  }
+  return @()
+}
+
+# The dead-man checks, pure. Schedule: { ServicePresent; MainTaskState; LogTaskState } where
+# a task state is 'absent', 'Disabled' or anything else (Ready/Running/Queued). CreatedUtc is
+# the baseline for a host that has not completed a pass yet, so a fresh install is not stale.
+function Get-SebWatchdogConditions {
+  param($AlertConfig, $Config, $State, $Schedule, [datetime]$NowUtc)
+  $out = New-Object System.Collections.ArrayList
+  $created = $null
+  if ($null -ne $Config -and $Config.PSObject.Properties['CreatedUtc']) { $created = ConvertFrom-SebUtc $Config.CreatedUtc }
+  $isFull = ($null -ne $Config -and [string]$Config.RecoveryMode -eq 'Full')
+
+  $lastData = $null
+  if ($null -ne $State -and $State.PSObject.Properties['LastSuccessUtc']) { $lastData = ConvertFrom-SebUtc $State.LastSuccessUtc }
+  $anchor = $lastData
+  if ($null -eq $anchor -or ($null -ne $created -and $created -gt $anchor)) { $anchor = $created }
+  if ($null -ne $anchor) {
+    $hours = ($NowUtc - $anchor).TotalHours
+    if ($hours -ge $AlertConfig.StaleHours) {
+      $when = 'never'
+      if ($null -ne $lastData) { $when = $lastData.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) + ' UTC' }
+      [void]$out.Add((New-SebAlertCondition -Key 'backup-stale' -Severity 'critical' -Owner 'watchdog' -Message (
+            'No successful backup pass for {0} hours (last success: {1}). Expected one every {2} hour(s).' -f [int][math]::Floor($hours), $when, [int]$Config.IntervalHours)))
+    }
+  }
+
+  if ($isFull) {
+    $lastLog = $null
+    if ($null -ne $State -and $State.PSObject.Properties['LastLogSuccessUtc']) { $lastLog = ConvertFrom-SebUtc $State.LastLogSuccessUtc }
+    $logAnchor = $lastLog
+    if ($null -eq $logAnchor -or ($null -ne $created -and $created -gt $logAnchor)) { $logAnchor = $created }
+    if ($null -ne $logAnchor) {
+      $minutes = ($NowUtc - $logAnchor).TotalMinutes
+      if ($minutes -ge $AlertConfig.LogStaleMinutes) {
+        [void]$out.Add((New-SebAlertCondition -Key 'log-stale' -Severity 'critical' -Owner 'watchdog' -Message (
+              'No successful transaction-log backup pass for {0} minutes - the point-in-time recovery window is not advancing.' -f [int][math]::Floor($minutes))))
+      }
+    }
+  }
+
+  if ($null -ne $Schedule) {
+    $dead = @('absent', 'Disabled')
+    if (-not $Schedule.ServicePresent -and $dead -contains [string]$Schedule.MainTaskState) {
+      [void]$out.Add((New-SebAlertCondition -Key 'task-missing' -Severity 'critical' -Owner 'watchdog' -Message (
+            'The backup task is {0} - no backups will run until it is restored (re-run -Reschedule, or Change schedule in the app).' -f ([string]$Schedule.MainTaskState).ToLowerInvariant())))
+    }
+    if ($isFull -and $dead -contains [string]$Schedule.LogTaskState) {
+      [void]$out.Add((New-SebAlertCondition -Key 'log-task-missing' -Severity 'critical' -Owner 'watchdog' -Message (
+            'The transaction-log backup task is {0} - point-in-time recovery has stopped (re-run -Reschedule).' -f ([string]$Schedule.LogTaskState).ToLowerInvariant())))
+    }
+  }
+  return @($out.ToArray())
+}
+
+# ---- rendering ------------------------------------------------------------------
+
+function Get-SebAlertSubject {
+  param([object[]]$Notifications, [string]$Label)
+  $open = @($Notifications | Where-Object { $_.Event -ne 'resolved' -and $_.Event -ne 'test' })
+  if (@($Notifications | Where-Object { $_.Event -eq 'test' }).Count -gt 0) { return ('[SQL Express Backup] {0}: test alert' -f $Label) }
+  if ($open.Count -eq 0) { return ('[SQL Express Backup] {0}: resolved' -f $Label) }
+  $worst = 'WARNING'
+  if (@($open | Where-Object { $_.Severity -eq 'critical' }).Count -gt 0) { $worst = 'CRITICAL' }
+  return ('[SQL Express Backup] {0}: {1} - {2} problem(s)' -f $Label, $worst, $open.Count)
+}
+
+function Get-SebAlertLine {
+  param($Note)
+  $tag = switch ($Note.Event) { 'resolved' { 'RESOLVED' } 'reminder' { 'STILL ' + ([string]$Note.Severity).ToUpperInvariant() } 'test' { 'TEST' } default { ([string]$Note.Severity).ToUpperInvariant() } }
+  return ('[{0}] {1}: {2}' -f $tag, $Note.Key, $Note.Message)
+}
+
+function Get-SebAlertBody {
+  param([object[]]$Notifications, [string]$Label, [datetime]$NowUtc)
+  $lines = New-Object System.Collections.ArrayList
+  [void]$lines.Add(('SQL Express Backup on {0}, {1} UTC' -f $Label, $NowUtc.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)))
+  [void]$lines.Add('')
+  foreach ($n in @($Notifications)) { [void]$lines.Add((Get-SebAlertLine $n)) }
+  [void]$lines.Add('')
+  [void]$lines.Add('Details: run Invoke-SqlExpressBackup.ps1 -Status on the server, or open the app.')
+  return ($lines -join "`r`n")
+}
+
+function Get-SebWebhookPayload {
+  param([string]$Kind, [object[]]$Notifications, [string]$Label, [datetime]$NowUtc)
+  $subject = Get-SebAlertSubject -Notifications $Notifications -Label $Label
+  switch ($Kind) {
+    'slack' {
+      $text = $subject + "`n" + ((@($Notifications) | ForEach-Object { Get-SebAlertLine $_ }) -join "`n")
+      return (ConvertTo-Json @{ text = $text } -Compress)
+    }
+    'teams' {
+      # A Power Automate "Workflows" webhook (Office 365 connectors are retired) posting an
+      # Adaptive Card, which is the shape those workflows' "post card" step accepts.
+      $body = New-Object System.Collections.ArrayList
+      [void]$body.Add(@{ type = 'TextBlock'; size = 'Medium'; weight = 'Bolder'; wrap = $true; text = $subject })
+      foreach ($n in @($Notifications)) {
+        $color = 'Warning'
+        if ($n.Event -eq 'resolved') { $color = 'Good' } elseif ($n.Severity -eq 'critical') { $color = 'Attention' }
+        [void]$body.Add(@{ type = 'TextBlock'; wrap = $true; color = $color; text = (Get-SebAlertLine $n) })
+      }
+      $card = @{ '$schema' = 'http://adaptivecards.io/schemas/adaptive-card.json'; type = 'AdaptiveCard'; version = '1.4'; body = @($body.ToArray()) }
+      return (ConvertTo-Json @{ type = 'message'; attachments = @(@{ contentType = 'application/vnd.microsoft.card.adaptive'; contentUrl = $null; content = $card }) } -Depth 10 -Compress)
+    }
+    default {
+      $items = @(@($Notifications) | ForEach-Object {
+          @{ event = $_.Event; severity = $_.Severity; key = $_.Key; message = $_.Message; sinceUtc = [string]$_.SinceUtc }
+        })
+      $parts = $Label -split '\\', 2
+      $instance = ''
+      if ($parts.Count -gt 1) { $instance = $parts[1] }
+      return (ConvertTo-Json @{ source = 'SqlExpressBackup'; host = $parts[0]; instance = $instance; timeUtc = $NowUtc.ToString('o'); notifications = $items } -Depth 6 -Compress)
+    }
+  }
+}
+
+# ---- transports -----------------------------------------------------------------
+
+function Set-SebTls12 {
+  # Windows PowerShell 5.1 can still default to TLS 1.0 on older hosts; every endpoint
+  # worth sending to refuses it.
+  try { [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12 } catch { }
+}
+
+# https only - the URL is a credential and so is whatever the payload says - except for
+# loopback, which never leaves the machine (and is how this is tested).
+function Test-SebWebhookUrl {
+  param([string]$Url)
+  $u = $null
+  if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$u)) { return $false }
+  if ($u.Scheme -eq 'https') { return $true }
+  return ($u.Scheme -eq 'http' -and $u.IsLoopback)
+}
+
+function Send-SebWebhook {
+  param([string]$Url, [string]$Json)
+  if (-not (Test-SebWebhookUrl $Url)) { throw 'the webhook URL must be https://' }
+  Set-SebTls12
+  Import-SebShippedModule -Command 'Invoke-RestMethod' -Module 'Microsoft.PowerShell.Utility'
+  [void](Invoke-RestMethod -Method Post -Uri $Url -Body ([System.Text.Encoding]::UTF8.GetBytes($Json)) -ContentType 'application/json; charset=utf-8' -TimeoutSec 30 -UseBasicParsing)
+}
+
+function Send-SebHeartbeat {
+  param([string]$Url)
+  Set-SebTls12
+  Import-SebShippedModule -Command 'Invoke-WebRequest' -Module 'Microsoft.PowerShell.Utility'
+  [void](Invoke-WebRequest -Method Get -Uri $Url -TimeoutSec 15 -UseBasicParsing)
+}
+
+function Send-SebAlertEmail {
+  param($AlertConfig, [string]$Password, [string]$Subject, [string]$Body)
+  Set-SebTls12
+  $msg = New-Object System.Net.Mail.MailMessage
+  $client = New-Object System.Net.Mail.SmtpClient($AlertConfig.SmtpHost, $AlertConfig.SmtpPort)
+  try {
+    $msg.From = New-Object System.Net.Mail.MailAddress($AlertConfig.EmailFrom)
+    foreach ($to in @($AlertConfig.EmailTo)) { $msg.To.Add($to) }
+    $msg.Subject = $Subject
+    $msg.Body = $Body
+    $msg.BodyEncoding = [System.Text.Encoding]::UTF8
+    $client.EnableSsl = [bool]$AlertConfig.SmtpTls
+    $client.Timeout = 30000
+    if ($AlertConfig.SmtpUser -ne '') { $client.Credentials = New-Object System.Net.NetworkCredential($AlertConfig.SmtpUser, $Password) }
+    $client.Send($msg)
+  }
+  finally { $msg.Dispose(); $client.Dispose() }
+}
+
+function Write-SebAlertEvent {
+  param($Note, [string]$Label)
+  $id = 9100; $type = 'Warning'
+  switch ($Note.Event) {
+    'reminder' { $id = 9101 }
+    'resolved' { $id = 9102; $type = 'Information' }
+    'test'     { $id = 9103; $type = 'Information' }
+  }
+  if ($Note.Event -ne 'resolved' -and $Note.Event -ne 'test' -and $Note.Severity -eq 'critical') { $type = 'Error' }
+  try {
+    if (-not [System.Diagnostics.EventLog]::SourceExists($script:SebEventSource)) {
+      New-EventLog -LogName Application -Source $script:SebEventSource -ErrorAction Stop
+    }
+    Write-EventLog -LogName Application -Source $script:SebEventSource -EntryType $type -EventId $id -Message ('{0}: {1}' -f $Label, (Get-SebAlertLine $Note)) -ErrorAction Stop
+    return $true
+  }
+  catch { return $false }
+}
+
+# Every channel gets the batch; each failure is logged (sanitized) and does not stop the
+# others. Delivered = at least one external channel took it, or - with none configured -
+# the event log did. That verdict decides whether LastSentUtc advances.
+function Send-SebAlertNotifications {
+  param([object[]]$Notifications, $AlertConfig, [hashtable]$Secrets, [string]$Label, [datetime]$NowUtc)
+  $eventOk = $false
+  foreach ($n in @($Notifications)) { if (Write-SebAlertEvent -Note $n -Label $Label) { $eventOk = $true } }
+  $external = 0; $delivered = 0
+  $subject = Get-SebAlertSubject -Notifications $Notifications -Label $Label
+  if ($AlertConfig.EmailConfigured) {
+    $external++
+    try {
+      $pw = ''
+      if ($Secrets.ContainsKey('SmtpPassword')) { $pw = $Secrets['SmtpPassword'] }
+      Send-SebAlertEmail -AlertConfig $AlertConfig -Password $pw -Subject $subject -Body (Get-SebAlertBody -Notifications $Notifications -Label $Label -NowUtc $NowUtc)
+      $delivered++
+    }
+    catch { Write-SebLog ('alert email failed: {0}' -f (Protect-SebAlertText $_.Exception.Message)) 'WARN' }
+  }
+  if ($AlertConfig.WebhookKind -ne '' -and $Secrets.ContainsKey('WebhookUrl')) {
+    $external++
+    try {
+      Send-SebWebhook -Url $Secrets['WebhookUrl'] -Json (Get-SebWebhookPayload -Kind $AlertConfig.WebhookKind -Notifications $Notifications -Label $Label -NowUtc $NowUtc)
+      $delivered++
+    }
+    catch { Write-SebLog ('alert webhook failed: {0}' -f (Protect-SebAlertText $_.Exception.Message)) 'WARN' }
+  }
+  if ($external -gt 0) { return ($delivered -gt 0) }
+  return $eventOk
+}
+
+function Get-SebAlertLabel {
+  param($Config)
+  $instance = ''
+  if ($null -ne $Config -and $Config.PSObject.Properties['InstanceName']) { $instance = [string]$Config.InstanceName }
+  if ($instance -eq '') { return $env:COMPUTERNAME }
+  return ('{0}\{1}' -f $env:COMPUTERNAME, $instance)
+}
+
+# The one entry point a pass calls. Never throws.
+function Invoke-SebAlertEvaluation {
+  param($Config, [string[]]$Owners, [object[]]$Conditions = @())
+  try {
+    $ac = Get-SebAlertConfig $Config
+    $secrets = @{}
+    try { $secrets = Read-SebAlertSecrets }
+    catch { Write-SebLog ('could not read the alert secrets: {0}' -f (Protect-SebAlertText $_.Exception.Message)) 'WARN' }
+    $state = Read-SebState
+    $now = (Get-Date).ToUniversalTime()
+    $previous = $null
+    if ($state.PSObject.Properties['Alerts']) { $previous = $state.Alerts }
+    $update = Update-SebAlertState -Previous $previous -Current $Conditions -Owners $Owners -NowUtc $now -RemindHours $ac.RemindHours
+    if ($update.Notifications.Count -gt 0) {
+      # INFO, not WARN: WARN would also write a 9001 event, doubling the 9100/9101/9102 one.
+      foreach ($n in $update.Notifications) { Write-SebLog ('alert {0}: {1}' -f $n.Event, (Get-SebAlertLine $n)) }
+      $label = Get-SebAlertLabel $Config
+      if (Send-SebAlertNotifications -Notifications $update.Notifications -AlertConfig $ac -Secrets $secrets -Label $label -NowUtc $now) {
+        Complete-SebAlertDelivery -Alerts $update.Alerts -Notifications $update.Notifications -NowUtc $now
+      }
+    }
+    Write-SebState ([pscustomobject]@{ Alerts = $update.Alerts })
+  }
+  catch { Write-SebLog ('alerting failed: {0}' -f (Protect-SebAlertText $_.Exception.Message)) 'WARN' }
+}
+
+function Invoke-SebHeartbeat {
+  try {
+    $secrets = Read-SebAlertSecrets
+    if (-not $secrets.ContainsKey('HeartbeatUrl')) { return }
+    Send-SebHeartbeat -Url $secrets['HeartbeatUrl']
+  }
+  catch { Write-SebLog ('heartbeat ping failed: {0}' -f (Protect-SebAlertText $_.Exception.Message)) 'WARN' }
+}
+
+# Apply an update to the sealed secrets: a key present with a value sets it, present and
+# empty removes it, absent leaves it. Only the three known secrets are accepted, and a
+# webhook URL that is not https is refused rather than stored.
+function Merge-SebAlertSecrets {
+  param([hashtable]$Existing = @{}, [hashtable]$Incoming = @{})
+  $out = @{}
+  foreach ($k in @($Existing.Keys)) { $out[$k] = $Existing[$k] }
+  foreach ($k in @('SmtpPassword', 'WebhookUrl', 'HeartbeatUrl')) {
+    if (-not $Incoming.ContainsKey($k)) { continue }
+    $v = [string]$Incoming[$k]
+    if ($v -eq '') { [void]$out.Remove($k); continue }
+    if ($k -eq 'WebhookUrl' -and -not (Test-SebWebhookUrl $v)) { throw 'the webhook URL must be https://' }
+    if ($k -eq 'HeartbeatUrl') {
+      $u = $null
+      if (-not [System.Uri]::TryCreate($v, [System.UriKind]::Absolute, [ref]$u) -or ($u.Scheme -ne 'https' -and $u.Scheme -ne 'http')) { throw 'the heartbeat URL must be an http(s) URL' }
+    }
+    $out[$k] = $v
+  }
+  return $out
+}
+
+# The app hands secrets over in a file it protected with DPAPI CurrentUser - readable by
+# this elevated run because elevation is the same user, by nobody else - and the file is
+# deleted as soon as it is read, whether or not it could be.
+function Read-SebAlertSecretsFile {
+  param([string]$Path)
+  Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+  $bytes = $null
+  try {
+    $raw = (Get-Content -LiteralPath $Path -Raw).Trim()
+    $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($raw), $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    $obj = [System.Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+    $out = @{}
+    foreach ($p in @($obj.PSObject.Properties)) { $out[$p.Name] = [string]$p.Value }
+    return $out
+  }
+  finally {
+    if ($null -ne $bytes) { [System.Array]::Clear($bytes, 0, $bytes.Length) }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Show-SebAlertStatus {
+  $config = Read-SebConfig
+  $ac = Get-SebAlertConfig $config
+  $secrets = @{}
+  try { $secrets = Read-SebAlertSecrets } catch { }
+  Write-Host ''
+  Write-Host '== Alerting ==========================================================='
+  $email = 'not configured'
+  if ($ac.EmailConfigured) { $email = ('{0} via {1}:{2} (TLS {3})' -f ($ac.EmailTo -join ', '), $ac.SmtpHost, $ac.SmtpPort, $(if ($ac.SmtpTls) { 'on' } else { 'OFF' })) }
+  $hook = 'not configured'
+  if ($ac.WebhookKind -ne '' -and $secrets.ContainsKey('WebhookUrl')) { $hook = $ac.WebhookKind + ' (URL sealed)' }
+  $beat = 'not configured'
+  if ($secrets.ContainsKey('HeartbeatUrl')) { $beat = 'on every successful pass (URL sealed)' }
+  Write-Host ('   email      : {0}' -f $email)
+  Write-Host ('   webhook    : {0}' -f $hook)
+  Write-Host ('   heartbeat  : {0}' -f $beat)
+  Write-Host ('   event log  : always (source SqlExpressBackup, events 9100 raised / 9101 reminder / 9102 resolved)')
+  Write-Host ('   watchdog   : {0}' -f $(if (Get-ScheduledTask -TaskName (Get-SebWatchdogTaskName -Base $script:SebTaskName) -ErrorAction SilentlyContinue) { 'task registered (hourly)' } else { 'no task' }))
+  Write-Host ('   thresholds : stale after {0}h, copies pending {1}min, remind every {2}h' -f $ac.StaleHours, $ac.PendingMinutes, $ac.RemindHours)
+  $state = Read-SebState
+  $open = @()
+  if ($state.PSObject.Properties['Alerts'] -and $null -ne $state.Alerts) { $open = @($state.Alerts.PSObject.Properties) }
+  if ($open.Count -eq 0) { Write-Host '   open alerts: none' }
+  else {
+    Write-Host ('   open alerts: {0}' -f $open.Count)
+    foreach ($p in $open) { Write-Host ('     [{0}] {1} since {2}: {3}' -f ([string]$p.Value.Severity).ToUpperInvariant(), $p.Name, $p.Value.SinceUtc, $p.Value.Message) }
+  }
 }
 
 # =====================================================================
@@ -1852,6 +2463,7 @@ FROM sys.databases AS d
 
   $succeeded = 0
   $failed = 0
+  $failedNames = New-Object System.Collections.ArrayList
   foreach ($db in $databases) {
     if (-not (Test-SebPitrEligible -Name $db -ReadOnly $readOnly[$db])) { continue }
     try {
@@ -1897,18 +2509,25 @@ FROM sys.databases AS d
     }
     catch {
       $failed++
+      [void]$failedNames.Add($db)
       Write-SebLog ('{0} FAILED: {1}' -f $db, $_.Exception.Message) 'ERROR'
     }
   }
 
   # Persist the merged Pending so the next run drains it. Pending is all this pass owns of
   # state.json - preserve the data pass's LastRunUtc/LastResult, which drive the status view.
-  Write-SebState ([pscustomobject]@{
-      LastRunUtc = $state.LastRunUtc
-      LastResult = $state.LastResult
-      Pending    = @($pendingList.ToArray())
-    })
-  return [pscustomobject]@{ Succeeded = $succeeded; Failed = $failed; Pending = $pendingList.Count }
+  $nowUtc = (Get-Date).ToUniversalTime()
+  $newState = [pscustomobject]@{
+    LastRunUtc      = $state.LastRunUtc
+    LastResult      = $state.LastResult
+    Pending         = @($pendingList.ToArray())
+    PendingSinceUtc = (Get-SebPendingSince -Previous ([string]$state.PendingSinceUtc) -Count $pendingList.Count -NowUtc $nowUtc)
+  }
+  # A log pass with no database failure is a live log chain for the watchdog - including
+  # "nothing was in FULL recovery this cycle", which is the pass doing its job.
+  if ($failed -eq 0) { Add-Member -InputObject $newState -MemberType NoteProperty -Name 'LastLogSuccessUtc' -Value $nowUtc.ToString('o') }
+  Write-SebState $newState
+  return [pscustomobject]@{ Succeeded = $succeeded; Failed = $failed; Pending = $pendingList.Count; FailedDatabases = @($failedNames.ToArray()) }
 }
 
 function Invoke-SebPass {
@@ -2042,6 +2661,9 @@ GROUP BY database_id
     $instanceLabel = $Config.InstanceName
     $pendingList = New-Object System.Collections.ArrayList
     foreach ($item in $pending) { [void]$pendingList.Add($item) }
+    # What this pass will report to alerting at the end (owner 'data-health').
+    $failedNames = New-Object System.Collections.ArrayList
+    $healthConditions = New-Object System.Collections.ArrayList
 
     # Log-growth WARN inputs, read ONCE per pass rather than once per database: both
     # queries already return every database's row in a single result set, so the
@@ -2062,6 +2684,8 @@ GROUP BY database_id
       $modelRows = @(Invoke-SebSqlTable -Connection $connection -Sql 'SELECT name, recovery_model_desc FROM sys.databases')
       foreach ($w in @(Get-SebUnmanagedFullLogWarnings -Rows $modelRows -Databases $databases -FullMode $isFullMode -ReadOnlyMap $readOnly)) {
         Write-SebLog $w 'WARN'
+        $wDb = ($w -split ' is in FULL recovery', 2)[0]
+        [void]$healthConditions.Add((New-SebAlertCondition -Key ('log-unmanaged:' + $wDb) -Severity 'warning' -Owner 'data-health' -Message $w))
       }
     }
     catch { Write-SebLog ('could not check recovery models: {0}' -f $_.Exception.Message) 'WARN' }
@@ -2161,7 +2785,9 @@ GROUP BY database_id
           if ($logWaitByDb.ContainsKey($database)) { $logWait = $logWaitByDb[$database] }
           $usedPct = Get-SebLogSpaceUsedPct -Rows $logSpaceRows -Database $database
           if (Get-SebLogGrowthWarning -Wait $logWait -UsedPct $usedPct) {
-            Write-SebLog ('WARNING: {0} log is {1}% full and waiting on a log backup - is the -BackupLog task running?' -f $database, $usedPct) 'WARN'
+            $growth = ('{0} log is {1}% full and waiting on a log backup - is the -BackupLog task running?' -f $database, $usedPct)
+            Write-SebLog ('WARNING: ' + $growth) 'WARN'
+            [void]$healthConditions.Add((New-SebAlertCondition -Key ('log-growth:' + $database) -Severity 'warning' -Owner 'data-health' -Message $growth))
           }
         }
         else {
@@ -2217,6 +2843,7 @@ GROUP BY database_id
       }
       catch {
         $failed++
+        [void]$failedNames.Add($database)
         Write-SebLog ('{0} FAILED: {1}' -f $database, $_.Exception.Message) 'ERROR'
         if ($staged) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
       }
@@ -2228,13 +2855,26 @@ GROUP BY database_id
     $result = 'ok'
     if ($pendingList.Count -gt 0 -or ($failed -gt 0 -and $succeeded -gt 0)) { $result = 'partial' }
     if ($succeeded -eq 0) { $result = 'failed' }
-    Write-SebState ([pscustomobject]@{
-        LastRunUtc = (Get-Date).ToUniversalTime().ToString('o')
-        LastResult = $result
-        Pending    = @($pendingList.ToArray())
-      })
+    $nowUtc = (Get-Date).ToUniversalTime()
+    $newState = [pscustomobject]@{
+      LastRunUtc      = $nowUtc.ToString('o')
+      LastResult      = $result
+      Pending         = @($pendingList.ToArray())
+      PendingSinceUtc = (Get-SebPendingSince -Previous ([string]$state.PendingSinceUtc) -Count $pendingList.Count -NowUtc $nowUtc)
+    }
+    # "Backups are being taken" for the watchdog's staleness check: any database done.
+    if ($succeeded -gt 0) { Add-Member -InputObject $newState -MemberType NoteProperty -Name 'LastSuccessUtc' -Value $nowUtc.ToString('o') }
+    Write-SebState $newState
 
     Write-SebLog ('pass finished: {0} succeeded, {1} failed, {2} copy(s) pending' -f $succeeded, $failed, $pendingList.Count)
+    $ac = Get-SebAlertConfig $Config
+    $conditions = @(Get-SebDataPassConditions -Succeeded $succeeded -Failed $failed -FailedDatabases @($failedNames.ToArray())) +
+      @($healthConditions.ToArray()) +
+      @(Get-SebPendingCondition -Count $pendingList.Count -SinceUtc $newState.PendingSinceUtc -NowUtc $nowUtc -PendingMinutes $ac.PendingMinutes)
+    Invoke-SebAlertEvaluation -Config $Config -Owners @('data', 'data-health', 'pending') -Conditions $conditions
+    # "Backups are being taken" for an external dead-man monitor. Not on a pass where a
+    # database failed - that is exactly the run the monitor should not hear from.
+    if ($succeeded -gt 0 -and $failed -eq 0) { Invoke-SebHeartbeat }
     Remove-SebOldLog
     if ($succeeded -eq 0) { return 2 }
     if ($failed -gt 0 -or $pendingList.Count -gt 0) { return 1 }
@@ -2302,6 +2942,55 @@ function Get-SebLogTaskName {
   return ($Base + '-Log')
 }
 
+function Get-SebWatchdogTaskName {
+  param([string]$Base)
+  return ($Base + '-Watchdog')
+}
+
+# The dead-man check's own task: hourly, and 10 minutes after boot, as SYSTEM. It exists
+# only while an alert channel or heartbeat is configured - a watchdog with nowhere to bark
+# would only fill the event log - so every install path reconciles it through here.
+function Sync-SebWatchdogTask {
+  param([string]$ScriptPath, [string]$ConfigDirectory)
+  $name = Get-SebWatchdogTaskName -Base $script:SebTaskName
+  $config = Read-SebConfig
+  $secrets = @{}
+  try { $secrets = Read-SebAlertSecrets } catch { }
+  if (-not (Test-SebAlertsConfigured -AlertConfig (Get-SebAlertConfig $config) -Secrets $secrets)) {
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+      Write-SebLog ('scheduled task "{0}" removed - no alert channel is configured' -f $name)
+    }
+    return $false
+  }
+  $arguments = ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Watchdog -ConfigDir "{1}"' -f $ScriptPath, $ConfigDirectory)
+  $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+  $hourly = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(7) -RepetitionInterval (New-TimeSpan -Hours 1)
+  $atStartup = New-ScheduledTaskTrigger -AtStartup
+  $atStartup.Delay = 'PT10M'
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
+    -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+  [void](Register-ScheduledTask -TaskName $name -Action $action -Trigger @($hourly, $atStartup) -Principal $principal -Settings $settings -Force)
+  Write-SebLog ('scheduled task "{0}" registered - hourly dead-man check' -f $name)
+  return $true
+}
+
+# What the watchdog needs to know about the schedule, as plain values for the pure check.
+function Get-SebWatchdogSchedule {
+  $taskState = {
+    param([string]$Name)
+    $t = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+    if ($null -eq $t) { return 'absent' }
+    return [string]$t.State
+  }
+  return [pscustomobject]@{
+    ServicePresent = ($null -ne (Get-Service -Name $script:SebServiceName -ErrorAction SilentlyContinue))
+    MainTaskState  = (& $taskState $script:SebTaskName)
+    LogTaskState   = (& $taskState (Get-SebLogTaskName -Base $script:SebTaskName))
+  }
+}
+
 function Install-SebTask {
   param([string]$ScriptPath, [string]$ConfigDirectory, [int]$Hours)
   $ScriptPath = Copy-SebEngineForService -ScriptPath $ScriptPath
@@ -2356,6 +3045,8 @@ function Install-SebTask {
         -Trigger $logTrigger -Principal $principal -Settings $logSettings -Force)
     Write-SebLog ('scheduled task "{0}" registered - every {1} minute(s), transaction-log backups for Full-recovery databases' -f $logTaskName, $logMinutes)
   }
+  # The dead-man check follows the alert config: present only while something can receive it.
+  [void](Sync-SebWatchdogTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
 }
 
 function Resolve-SebNssm {
@@ -2423,6 +3114,8 @@ function Install-SebService {
         -Trigger $logTrigger -Principal $principal -Settings $logSettings -Force)
     Write-SebLog ('scheduled task "{0}" registered - every {1} minute(s), transaction-log backups for Full-recovery databases' -f $logTaskName, $logMinutes)
   }
+  # The dead-man check follows the alert config: present only while something can receive it.
+  [void](Sync-SebWatchdogTask -ScriptPath $ScriptPath -ConfigDirectory $ConfigDirectory)
 }
 
 function Uninstall-SebSchedule {
@@ -2438,6 +3131,12 @@ function Uninstall-SebSchedule {
   if (Get-ScheduledTask -TaskName $logTaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $logTaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-SebLog ('scheduled task "{0}" removed' -f $logTaskName)
+  }
+  # Removed with the backups it watches, or it would alert "backup task missing" forever.
+  $watchdogTaskName = Get-SebWatchdogTaskName -Base $script:SebTaskName
+  if (Get-ScheduledTask -TaskName $watchdogTaskName -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName $watchdogTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Write-SebLog ('scheduled task "{0}" removed' -f $watchdogTaskName)
   }
   if ($state.ServicePresent) {
     try { Stop-Service -Name $script:SebServiceName -Force -ErrorAction SilentlyContinue } catch { }
@@ -4114,6 +4813,104 @@ try {
   elseif ($Status) {
     Assert-SebElevated -Mode 'Status'
     Show-SebStatus
+    Show-SebAlertStatus
+  }
+  elseif ($ConfigureAlerts) {
+    Assert-SebElevated -Mode 'ConfigureAlerts'
+    $config = Read-SebConfig
+    # Bound parameters only, exactly like -Reschedule: an unbound one means "leave it".
+    foreach ($name in @('AlertEmailTo', 'AlertEmailFrom', 'AlertSmtpHost', 'AlertSmtpPort', 'AlertSmtpTls', 'AlertSmtpUser',
+        'AlertWebhookKind', 'AlertRemindHours', 'AlertStaleHours', 'AlertPendingMinutes')) {
+      if (-not $PSBoundParameters.ContainsKey($name)) { continue }
+      $value = Get-Variable -Name $name -ValueOnly
+      if ($name -eq 'AlertSmtpTls') { $value = ($value -eq 'On') }
+      if ($name -eq 'AlertWebhookKind') { $value = $(if ($value -eq 'None') { '' } else { $value.ToLowerInvariant() }) }
+      Add-Member -InputObject $config -MemberType NoteProperty -Name $name -Value $value -Force
+    }
+    $secrets = @{}
+    try { $secrets = Read-SebAlertSecrets } catch { Write-SebLog ('the existing alert secrets could not be read and will be replaced: {0}' -f $_.Exception.Message) 'WARN' }
+    $incoming = @{}
+    if (-not [string]::IsNullOrWhiteSpace($AlertSecretsFile)) { $incoming = Read-SebAlertSecretsFile -Path $AlertSecretsFile }
+    if ($AlertPromptSecrets) {
+      foreach ($k in @('SmtpPassword', 'WebhookUrl', 'HeartbeatUrl')) {
+        $secure = Read-Host -AsSecureString ('{0} (blank = keep, a single - = remove)' -f $k)
+        $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+        if ($plain -eq '-') { $incoming[$k] = '' } elseif ($plain -ne '') { $incoming[$k] = $plain }
+      }
+    }
+    if ($incoming.Count -gt 0) { $secrets = Merge-SebAlertSecrets -Existing $secrets -Incoming $incoming; Write-SebAlertSecrets -Secrets $secrets }
+    Write-SebConfig -Config $config
+    $ac = Get-SebAlertConfig $config
+    $watchdogOn = $false
+    $schedule = Get-SebScheduleState
+    if ($schedule.TaskPresent -or $schedule.ServicePresent) {
+      $watchdogOn = Sync-SebWatchdogTask -ScriptPath (Copy-SebEngineForService -ScriptPath (Get-SebScriptPath)) -ConfigDirectory $script:SebConfigDir
+    }
+    Write-SebLog ('alerting configured: email={0} webhook={1} heartbeat={2} watchdog={3}' -f $ac.EmailConfigured, ($ac.WebhookKind -ne '' -and $secrets.ContainsKey('WebhookUrl')), $secrets.ContainsKey('HeartbeatUrl'), $watchdogOn)
+    Write-Host (ConvertTo-Json @{
+        Ok = $true; Email = $ac.EmailConfigured; Webhook = ($ac.WebhookKind -ne '' -and $secrets.ContainsKey('WebhookUrl'))
+        WebhookKind = $ac.WebhookKind; Heartbeat = $secrets.ContainsKey('HeartbeatUrl'); Watchdog = $watchdogOn
+      } -Compress)
+  }
+  elseif ($ClearAlerts) {
+    Assert-SebElevated -Mode 'ClearAlerts'
+    $config = Read-SebConfig
+    foreach ($p in @($config.PSObject.Properties | Where-Object { $_.Name -like 'Alert*' })) { $config.PSObject.Properties.Remove($p.Name) }
+    Write-SebConfig -Config $config
+    Write-SebAlertSecrets -Secrets @{}
+    $watchdogTaskName = Get-SebWatchdogTaskName -Base $script:SebTaskName
+    if (Get-ScheduledTask -TaskName $watchdogTaskName -ErrorAction SilentlyContinue) {
+      Unregister-ScheduledTask -TaskName $watchdogTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    Write-SebState ([pscustomobject]@{ Alerts = @{} })
+    Write-SebLog 'alerting cleared - settings, sealed secrets and the watchdog task removed'
+    Write-Host (ConvertTo-Json @{ Ok = $true } -Compress)
+  }
+  elseif ($TestAlert) {
+    Assert-SebElevated -Mode 'TestAlert'
+    $config = Read-SebConfig
+    $ac = Get-SebAlertConfig $config
+    $secrets = Read-SebAlertSecrets
+    $now = (Get-Date).ToUniversalTime()
+    $label = Get-SebAlertLabel $config
+    $note = [pscustomobject]@{ Event = 'test'; Key = 'test'; Severity = 'warning'; Message = 'A test of alert delivery - no action needed.'; SinceUtc = $now.ToString('o') }
+    $results = [ordered]@{}
+    $allOk = $true
+    $results['EventLog'] = $(if (Write-SebAlertEvent -Note $note -Label $label) { 'ok' } else { 'failed (the event source needs an elevated first run)' })
+    $try = {
+      param([string]$Name, [bool]$Configured, [scriptblock]$Send)
+      if (-not $Configured) { $results[$Name] = 'not configured'; return }
+      try { & $Send; $results[$Name] = 'ok' }
+      catch { $results[$Name] = 'FAILED: ' + (Protect-SebAlertText $_.Exception.Message); $script:testAlertFailed = $true }
+    }
+    $script:testAlertFailed = $false
+    & $try 'Email' $ac.EmailConfigured {
+      $pw = ''; if ($secrets.ContainsKey('SmtpPassword')) { $pw = $secrets['SmtpPassword'] }
+      Send-SebAlertEmail -AlertConfig $ac -Password $pw -Subject (Get-SebAlertSubject -Notifications @($note) -Label $label) -Body (Get-SebAlertBody -Notifications @($note) -Label $label -NowUtc $now)
+    }
+    & $try 'Webhook' ($ac.WebhookKind -ne '' -and $secrets.ContainsKey('WebhookUrl')) {
+      Send-SebWebhook -Url $secrets['WebhookUrl'] -Json (Get-SebWebhookPayload -Kind $ac.WebhookKind -Notifications @($note) -Label $label -NowUtc $now)
+    }
+    & $try 'Heartbeat' ($secrets.ContainsKey('HeartbeatUrl')) { Send-SebHeartbeat -Url $secrets['HeartbeatUrl'] }
+    foreach ($k in $results.Keys) { Write-Host ('   {0,-10} {1}' -f $k, $results[$k]) }
+    if ($script:testAlertFailed) { $allOk = $false; $exitCode = 1 }
+    $json = [ordered]@{ Ok = $allOk }
+    foreach ($k in $results.Keys) { $json[$k] = $results[$k] }
+    Write-Host (ConvertTo-Json $json -Compress)
+  }
+  elseif ($Watchdog) {
+    Assert-SebElevated -Mode 'Watchdog'
+    $config = Read-SebConfig
+    # A pass running right now is the opposite of a dead one; do not contend with it.
+    $mutex = Get-SebMutex
+    if ($null -eq $mutex) {
+      Write-SebLog 'watchdog: a backup pass is running - nothing to check this hour'
+      exit 0
+    }
+    $conditions = @(Get-SebWatchdogConditions -AlertConfig (Get-SebAlertConfig $config) -Config $config -State (Read-SebState) `
+        -Schedule (Get-SebWatchdogSchedule) -NowUtc ((Get-Date).ToUniversalTime()))
+    Invoke-SebAlertEvaluation -Config $config -Owners @('watchdog') -Conditions $conditions
+    Write-Host (ConvertTo-Json @{ Ok = $true; Mode = 'Watchdog'; Problems = $conditions.Count } -Compress)
   }
   elseif ($BackupLog) {
     # Mirrors -Run/Invoke-SebPass's own setup/teardown: same elevation gate (this reads
@@ -4154,6 +4951,10 @@ try {
       $result = Invoke-SebBackupLogPass -Connection $connection -Root $config.SharePath -HostName $env:COMPUTERNAME `
         -InstanceLabel $config.InstanceName -StagingPath $config.StagingPath -OnlyDatabase $only -NoHash:$noHash -Compress $compress
       Write-SebLog ('log pass finished: {0} succeeded, {1} failed, {2} copy(s) pending' -f $result.Succeeded, $result.Failed, $result.Pending)
+      $logState = Read-SebState
+      $conditions = @(Get-SebLogPassConditions -Failed $result.Failed -FailedDatabases $result.FailedDatabases) +
+        @(Get-SebPendingCondition -Count $result.Pending -SinceUtc $logState.PendingSinceUtc -NowUtc ((Get-Date).ToUniversalTime()) -PendingMinutes (Get-SebAlertConfig $config).PendingMinutes)
+      Invoke-SebAlertEvaluation -Config $config -Owners @('log', 'pending') -Conditions $conditions
 
       # Mirror -Run/Invoke-SebPass's ok/partial/failed -> exit-code mapping (Get-SebLogPassExitCode):
       # nothing succeeded although something was attempted is a total failure (2); a database that
@@ -4187,7 +4988,10 @@ try {
         }
         else {
           try { [void](Invoke-SebPass -Config $config) }
-          catch { Write-SebLog ('pass threw: {0}' -f $_.Exception.Message) 'ERROR' }
+          catch {
+            Write-SebLog ('pass threw: {0}' -f $_.Exception.Message) 'ERROR'
+            Invoke-SebAlertEvaluation -Config $config -Owners @('data') -Conditions @(Get-SebDataPassConditions -Succeeded 0 -Failed 0 -FailureMessage ([string]$_.Exception.Message))
+          }
           finally {
             try { $mutex.ReleaseMutex() } catch { }
             $mutex.Dispose()
@@ -4212,7 +5016,9 @@ catch {
   # guessing which of staging, the share, the config folder or the key file was
   # refused - they are four different problems with four different fixes.
   $failedMode = 'Run'
-  foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest', 'BackupLog')) {
+  foreach ($m in @('Setup', 'FullInstall', 'Install', 'Uninstall', 'Status', 'SelfTest', 'BackupLog', 'Reschedule',
+      'RestoreList', 'RestoreInspect', 'RestoreVerify', 'RestoreRun', 'RestoreToPoint',
+      'ConfigureAlerts', 'ClearAlerts', 'TestAlert', 'Watchdog')) {
     $v = Get-Variable -Name $m -ValueOnly -ErrorAction SilentlyContinue
     if ($v) { $failedMode = $m; break }
   }
@@ -4223,6 +5029,21 @@ catch {
   }
   Write-SebLog ("-$failedMode failed: $detail") 'ERROR'
   $exitCode = 2
+  # A pass that died outright - SQL unreachable, staging full, no databases - is the
+  # failure an operator most needs to hear about, and it never reaches the pass's own
+  # end-of-run alerting. Only the pass modes alert; a failed -Setup has a human watching.
+  if ($failedMode -eq 'Run' -or $failedMode -eq 'BackupLog') {
+    $alertConfig = $null
+    try { $alertConfig = Read-SebConfig } catch { }
+    if ($null -ne $alertConfig) {
+      if ($failedMode -eq 'Run') {
+        Invoke-SebAlertEvaluation -Config $alertConfig -Owners @('data') -Conditions @(Get-SebDataPassConditions -Succeeded 0 -Failed 0 -FailureMessage $detail)
+      }
+      else {
+        Invoke-SebAlertEvaluation -Config $alertConfig -Owners @('log') -Conditions @(Get-SebLogPassConditions -Failed 0 -FailureMessage $detail)
+      }
+    }
+  }
 }
 finally {
   if ($null -ne $mutex) {
