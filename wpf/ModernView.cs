@@ -21,6 +21,8 @@ class ModernView
     LogPane log;
     Border activityArea;
     TextBlock lastRunVal, schedVal, dbCountVal, instVal;
+    Border alertBanner;
+    StackPanel alertLines;
     bool busy;
 
     // schedule-window edit controls (built when the Schedule window is filled)
@@ -71,6 +73,7 @@ class ModernView
         sp.Children.Add(Ui.NavItem("", "Databases", false, ShowDatabases));
         sp.Children.Add(Ui.NavItem("", "Restore", false, openRestore));
         sp.Children.Add(Ui.NavItem("", "Schedule", false, ShowSchedule));
+        sp.Children.Add(Ui.NavItem("", "Alerts", false, OpenAlerts));
         sp.Children.Add(Ui.NavItem("", "Activity", false, ShowFullLog));
 
         b.Child = sp;
@@ -82,6 +85,7 @@ class ModernView
         Grid g = new Grid();
         g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // heading
         g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // tiles
+        g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // open alerts
         g.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // db list
         g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // actions
         g.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // progress
@@ -100,6 +104,18 @@ class ModernView
         tiles.Children.Add(t1); tiles.Children.Add(t2); tiles.Children.Add(t3); tiles.Children.Add(t4);
         Grid.SetRow(tiles, 1); g.Children.Add(tiles);
 
+        // What is wrong right now, from the engine's alerting - hidden when nothing is.
+        alertBanner = new Border();
+        alertBanner.CornerRadius = new CornerRadius(8); alertBanner.BorderThickness = new Thickness(1);
+        alertBanner.Padding = new Thickness(14, 10, 14, 10); alertBanner.Margin = new Thickness(0, 14, 0, 0);
+        alertBanner.Cursor = System.Windows.Input.Cursors.Hand;
+        alertBanner.ToolTip = "Open the Alerts window";
+        alertBanner.MouseLeftButtonUp += delegate { OpenAlerts(); };
+        alertLines = new StackPanel();
+        alertBanner.Child = alertLines;
+        alertBanner.Visibility = Visibility.Collapsed;
+        Grid.SetRow(alertBanner, 2); g.Children.Add(alertBanner);
+
         Border listCard = Ui.Card();
         listCard.Margin = new Thickness(0, 16, 0, 0);
         listCard.Padding = new Thickness(0);
@@ -114,7 +130,7 @@ class ModernView
         dbList = new StackPanel(); dbList.Margin = new Thickness(6, 0, 6, 8);
         sv.Content = dbList; Grid.SetRow(sv, 1); lg.Children.Add(sv);
         listCard.Child = lg;
-        Grid.SetRow(listCard, 2); g.Children.Add(listCard);
+        Grid.SetRow(listCard, 3); g.Children.Add(listCard);
 
         StackPanel actions = new StackPanel();
         actions.Orientation = Orientation.Horizontal;
@@ -129,11 +145,11 @@ class ModernView
         setup.Margin = new Thickness(0, 0, 9, 0);
         Border refresh = Ui.GhostButton("Refresh", delegate { Refresh(); });
         actions.Children.Add(run); actions.Children.Add(self); actions.Children.Add(rest); actions.Children.Add(setup); actions.Children.Add(refresh);
-        Grid.SetRow(actions, 3); g.Children.Add(actions);
+        Grid.SetRow(actions, 4); g.Children.Add(actions);
 
         activityArea = ActivityArea();
         activityArea.Visibility = Visibility.Collapsed;
-        Grid.SetRow(activityArea, 4); g.Children.Add(activityArea);
+        Grid.SetRow(activityArea, 5); g.Children.Add(activityArea);
 
         return g;
     }
@@ -461,6 +477,7 @@ class ModernView
         {
             lastRunVal.Text = "not set up"; lastRunVal.Foreground = Theme.Ink3;
         }
+        FillAlertBanner(st);
 
         // group sets by database
         Dictionary<string, int> byDb = new Dictionary<string, int>();
@@ -553,6 +570,44 @@ class ModernView
                 glow.Finish(ok, ok ? "Backup finished" : "Backup failed (or elevation declined)");
                 busy = false; Refresh();
             });
+    }
+
+    // Open alerts, worst first, straight from the engine's own alert state - the same
+    // conditions that went out by email/webhook, so the dashboard and the inbox agree.
+    void FillAlertBanner(BackupStatus st)
+    {
+        alertLines.Children.Clear();
+        if (st.OpenAlerts.Count == 0) { alertBanner.Visibility = Visibility.Collapsed; return; }
+        bool critical = false;
+        foreach (OpenAlert a in st.OpenAlerts) { if (a.Severity == "critical") { critical = true; } }
+        alertBanner.Background = critical ? Theme.BadBg : Theme.WarnBg;
+        alertBanner.BorderBrush = critical ? Theme.Bad : Theme.Warn;
+        TextBlock head = Ui.Text(st.OpenAlerts.Count == 1 ? "1 open alert" : st.OpenAlerts.Count + " open alerts", 13, critical ? Theme.Bad : Theme.Warn, FontWeights.SemiBold);
+        alertLines.Children.Add(head);
+        List<OpenAlert> ordered = new List<OpenAlert>(st.OpenAlerts);
+        ordered.Sort(delegate(OpenAlert x, OpenAlert y) { return (y.Severity == "critical" ? 1 : 0) - (x.Severity == "critical" ? 1 : 0); });
+        int shown = 0;
+        foreach (OpenAlert a in ordered)
+        {
+            if (shown++ == 3) { alertLines.Children.Add(Ui.Text("… and " + (ordered.Count - 3) + " more", 12, Theme.Ink2)); break; }
+            TextBlock t = Ui.Text((a.Severity == "critical" ? "● " : "○ ") + a.Message + SinceText(a.SinceUtc), 12, Theme.Ink);
+            t.TextWrapping = TextWrapping.Wrap; t.Margin = new Thickness(0, 4, 0, 0);
+            alertLines.Children.Add(t);
+        }
+        alertBanner.Visibility = Visibility.Visible;
+    }
+
+    static string SinceText(string utc)
+    {
+        DateTime d;
+        if (!DateTime.TryParse(utc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out d)) { return ""; }
+        return "  (since " + d.ToLocalTime().ToString("d MMM HH:mm", CultureInfo.CurrentCulture) + ")";
+    }
+
+    void OpenAlerts()
+    {
+        AlertsWindow w = new AlertsWindow();
+        w.Show(Application.Current != null ? Application.Current.MainWindow : null, delegate { Refresh(); });
     }
 
     void OpenSetup()

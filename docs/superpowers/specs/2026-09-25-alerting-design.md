@@ -1,7 +1,7 @@
 # Alerting — Design Spec
 
 - **Date:** 2026-09-25
-- **Status:** Design decisions approved (channels, dead-man detection, noise policy). Increment 1 (engine) implemented and tested; increment 2 (app) next.
+- **Status:** Design decisions approved (channels, dead-man detection, noise policy). Increment 1 (engine) implemented and tested; increment 2 (app: Alerts window, secret hand-off, overview banner) implemented.
 - **Component:** SQL-Express-Tool — `Invoke-SqlExpressBackup.ps1` (engine, increment 1); `wpf/` (increment 2)
 - **Feature:** Roadmap feature 4 — Alerting. Brought forward ahead of automated restore testing: on an unattended SQL Express box the worst failure is the one nobody sees, and alerting is what every later signal (restore tests, chain health, log growth) reports through.
 

@@ -1918,4 +1918,28 @@ finally {
   Remove-Item -LiteralPath $alertRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ---- ALERT-8. the app and the engine agree on the alert flags -----------------------
+# The app builds -ConfigureAlerts from its own string table; a renamed or misspelled flag
+# would fail only at the moment an operator saves, elevated, with a binding error. So every
+# flag the app can emit must be a real engine parameter, and every value it offers for a
+# ValidateSet parameter must be one the engine accepts.
+$appSrc = [IO.File]::ReadAllText((Join-Path $root 'wpf\App.cs'))
+$engineAst = [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$null, [ref]$null)
+$engineParams = @{}
+foreach ($p in $engineAst.ParamBlock.Parameters) { $engineParams[$p.Name.VariablePath.UserPath] = $p }
+$m = [regex]::Match($appSrc, '(?s)static string BuildAlertArgs.*?\n    \}')
+Assert $m.Success 'App.cs has BuildAlertArgs'
+$flags = @([regex]::Matches($m.Value, '"(Alert\w+)"') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+Assert ($flags.Count -ge 10) "the app emits the alert settings ($($flags.Count) flags)"
+foreach ($f in $flags) { Assert ($engineParams.ContainsKey($f)) "the engine has -$f" }
+Assert ($m.Value -match '-AlertSecretsFile' -and $engineParams.ContainsKey('AlertSecretsFile')) 'secrets are handed over by file (-AlertSecretsFile), never as a value'
+foreach ($pair in @(@('AlertWebhookKind', @('None', 'Teams', 'Slack', 'Generic')), @('AlertSmtpTls', @('On', 'Off')))) {
+  $vs = @($engineParams[$pair[0]].Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' })
+  $allowed = @($vs[0].PositionalArguments | ForEach-Object { $_.Value })
+  foreach ($v in $pair[1]) { Assert ($allowed -contains $v) "the engine accepts -$($pair[0]) $v" }
+}
+foreach ($job in @('--configure-alerts', '--test-alert', '--clear-alerts')) {
+  Assert ($appSrc -match [regex]::Escape('"' + $job + '"')) "App.cs handles the $job job"
+}
+
 Write-Host 'ALL PASS'

@@ -163,6 +163,7 @@ $script:SebShowKeys = @(
   'FullEveryHours', 'CompressBackups', 'SqlUser', 'UseWindowsAuth',
   'AlertEmailTo', 'AlertEmailFrom', 'AlertSmtpHost', 'AlertSmtpPort', 'AlertSmtpTls', 'AlertSmtpUser',
   'AlertWebhookKind', 'AlertRemindHours', 'AlertStaleHours', 'AlertPendingMinutes',
+  'AlertHasSmtpPassword', 'AlertHasWebhook', 'AlertHasHeartbeat',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -4839,6 +4840,11 @@ try {
       }
     }
     if ($incoming.Count -gt 0) { $secrets = Merge-SebAlertSecrets -Existing $secrets -Incoming $incoming; Write-SebAlertSecrets -Secrets $secrets }
+    # Whether each secret is stored - yes/no only, never the value - so the app can say
+    # "stored" without being able to read alert.dat (which it deliberately cannot).
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'AlertHasSmtpPassword' -Value ($secrets.ContainsKey('SmtpPassword')) -Force
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'AlertHasWebhook' -Value ($secrets.ContainsKey('WebhookUrl')) -Force
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'AlertHasHeartbeat' -Value ($secrets.ContainsKey('HeartbeatUrl')) -Force
     Write-SebConfig -Config $config
     $ac = Get-SebAlertConfig $config
     $watchdogOn = $false

@@ -200,6 +200,21 @@ credential, so it runs elevated; when the app is not already elevated it runs th
 an elevated job and streams the same glowing progress bar and activity log a scheduled run
 would.
 
+### Alerts
+
+**Alerts** (in the sidebar) sets who hears about a problem:
+
+- **Email:** recipients, sender, SMTP server, port and TLS.
+- **Chat webhook:** Teams, Slack or generic JSON.
+- **Heartbeat:** an optional ping URL for an external monitor such as healthchecks.io or Uptime Kuma.
+- **Timing:** how often to remind, and when backups count as overdue.
+
+**Save** applies the settings in one elevated step. **Send test alert** sends a test through every channel and reports each result. **Turn alerts off** removes the settings, the stored secrets and the watchdog task.
+
+The SMTP password and the two URLs (which carry their own tokens) are **write-only**. The window shows only whether each is stored, and a password box is left blank to keep the stored value. A new value goes to the elevated step in a file encrypted with DPAPI for your user. The engine seals it in `alert.dat` and deletes the file. The app itself can never read the secrets back.
+
+When something is wrong, the overview shows a banner above the database list. It is red for critical and amber for warnings, and lists the same open alerts that went out by email or webhook. Click it to open the Alerts window.
+
 ---
 
 ## Settings and persistence
@@ -229,7 +244,10 @@ Useful for scripted deployment and for testing:
 | `--backup-now` | Run one backup pass now (elevates if needed). Behind **Run backup now**. |
 | `--reschedule <file>` | Apply the interval/retention in a JSON file and re-register the task (elevates). Behind **Change schedule**. |
 | `--apply-setup <file>` | Configure and schedule from a JSON file, Windows auth (elevates). Behind the setup wizard. |
-| `--live <file>` | With the three above: stream the engine's output to `<file>`, ending in `[EXIT] N`, so the launching app can tail it live across the UAC boundary. |
+| `--configure-alerts <file>` | Apply the alert settings in a JSON file; secrets come from the DPAPI file it names (elevates). Behind **Alerts → Save**. |
+| `--test-alert` | Send a test through every configured channel (elevates). Behind **Send test alert**. |
+| `--clear-alerts` | Remove all alert settings, secrets and the watchdog task (elevates). Behind **Turn alerts off**. |
+| `--live <file>` | With any elevated job above: stream the engine's output to `<file>`, ending in `[EXIT] N`, so the launching app can tail it live across the UAC boundary. |
 | `--check <file>` | Construct every view headless and write findings to `<file>`; used by the test suite. No window is shown. |
 
 ---

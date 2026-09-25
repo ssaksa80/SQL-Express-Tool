@@ -30,6 +30,20 @@ class BackupStatus
     public int FullEveryHours = 24;
     public bool CompressBackups = false;
     public bool UseWindowsAuth = true;
+    // Alerting: the settings, whether each secret is stored (never the secret itself -
+    // the app cannot read alert.dat, by design), and what is open right now.
+    public string AlertEmailTo = "", AlertEmailFrom = "", AlertSmtpHost = "", AlertSmtpUser = "", AlertWebhookKind = "";
+    public int AlertSmtpPort = 587, AlertRemindHours = 24, AlertStaleHours = 0, AlertPendingMinutes = 60;
+    public bool AlertSmtpTls = true, AlertHasSmtpPassword = false, AlertHasWebhook = false, AlertHasHeartbeat = false;
+    public List<OpenAlert> OpenAlerts = new List<OpenAlert>();
+}
+
+class OpenAlert
+{
+    public string Key = "";
+    public string Severity = "";
+    public string Message = "";
+    public string SinceUtc = "";
 }
 
 class RestoreSet
@@ -109,6 +123,30 @@ static class Engine
             s.FullEveryHours = Int(d, "FullEveryHours", 24);
             s.CompressBackups = Bool(d, "CompressBackups");
             s.UseWindowsAuth = !d.ContainsKey("UseWindowsAuth") || Bool(d, "UseWindowsAuth");
+            s.AlertEmailTo = Str(d, "AlertEmailTo"); s.AlertEmailFrom = Str(d, "AlertEmailFrom");
+            s.AlertSmtpHost = Str(d, "AlertSmtpHost"); s.AlertSmtpUser = Str(d, "AlertSmtpUser");
+            s.AlertWebhookKind = Str(d, "AlertWebhookKind");
+            s.AlertSmtpPort = Int(d, "AlertSmtpPort", 587); s.AlertRemindHours = Int(d, "AlertRemindHours", 24);
+            s.AlertStaleHours = Int(d, "AlertStaleHours", 0); s.AlertPendingMinutes = Int(d, "AlertPendingMinutes", 60);
+            s.AlertSmtpTls = !d.ContainsKey("AlertSmtpTls") || Bool(d, "AlertSmtpTls");
+            s.AlertHasSmtpPassword = Bool(d, "AlertHasSmtpPassword");
+            s.AlertHasWebhook = Bool(d, "AlertHasWebhook");
+            s.AlertHasHeartbeat = Bool(d, "AlertHasHeartbeat");
+            // PowerShell can write a one-element array as the bare object; take either shape.
+            object rawAlerts = d.ContainsKey("Alerts") ? d["Alerts"] : null;
+            if (rawAlerts is IDictionary<string, object>) { rawAlerts = new object[] { rawAlerts }; }
+            System.Collections.IEnumerable alerts = rawAlerts as System.Collections.IEnumerable;
+            if (alerts != null && !(alerts is string))
+            {
+                foreach (object o in alerts)
+                {
+                    IDictionary<string, object> a = o as IDictionary<string, object>;
+                    if (a == null) { continue; }
+                    OpenAlert oa = new OpenAlert();
+                    oa.Key = DStr(a, "Key"); oa.Severity = DStr(a, "Severity"); oa.Message = DStr(a, "Message"); oa.SinceUtc = DStr(a, "SinceUtc");
+                    s.OpenAlerts.Add(oa);
+                }
+            }
         }
         catch { }
         return s;

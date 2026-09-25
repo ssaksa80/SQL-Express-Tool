@@ -33,6 +33,7 @@ class SebWpf
         // writes a "exit=N\n<output>" result file the non-elevated UI polls.
         bool backupNow = false;
         string rescheduleJson = null, applySetupJson = null, liveFile = null;
+        string alertsJson = null; bool testAlert = false, clearAlerts = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
@@ -46,6 +47,9 @@ class SebWpf
             if (args[i] == "--reschedule" && i + 1 < args.Length) { rescheduleJson = args[++i]; }
             if (args[i] == "--apply-setup" && i + 1 < args.Length) { applySetupJson = args[++i]; }
             if (args[i] == "--live" && i + 1 < args.Length) { liveFile = args[++i]; }
+            if (args[i] == "--configure-alerts" && i + 1 < args.Length) { alertsJson = args[++i]; }
+            if (args[i] == "--test-alert") { testAlert = true; }
+            if (args[i] == "--clear-alerts") { clearAlerts = true; }
         }
 
         // Silent portable setup: extract to a folder and launch it there. Also the path
@@ -109,6 +113,19 @@ class SebWpf
             AppSettings.Mode = Install.DetectMode();
             return WithJobEngine(liveFile, delegate { return ApplySetup(applySetupJson, liveFile); });
         }
+        if (alertsJson != null)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--configure-alerts \"" + alertsJson + "\"" + LiveArg(liveFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless(BuildAlertArgs(alertsJson), liveFile); });
+        }
+        if (testAlert || clearAlerts)
+        {
+            string flag = testAlert ? "--test-alert" : "--clear-alerts";
+            if (!Install.IsElevated()) { Install.Relaunch(flag + LiveArg(liveFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless(testAlert ? "-TestAlert" : "-ClearAlerts", liveFile); });
+        }
 
         AppMode mode = Install.DetectMode();
         AppSettings.Mode = mode;
@@ -138,8 +155,9 @@ class SebWpf
                 FrameworkElement m = new ModernView(null).Build();
                 FrameworkElement d = new DbaView(null).Build();
                 FrameworkElement rw = new RestoreWindow().BuildRoot();
+                FrameworkElement aw = new AlertsWindow().BuildRoot();
                 File.WriteAllText(checkFile, "WPF-CHECK-OK view=" + settings.View + " theme=" + settings.Theme +
-                    " modern=" + (m != null) + " dba=" + (d != null) + " restore=" + (rw != null));
+                    " modern=" + (m != null) + " dba=" + (d != null) + " restore=" + (rw != null) + " alerts=" + (aw != null));
                 return 0;
             }
             catch (Exception ex)
@@ -246,6 +264,40 @@ class SebWpf
             return js.Deserialize<System.Collections.Generic.Dictionary<string, object>>(File.ReadAllText(path));
         }
         catch { return null; }
+    }
+
+    // -ConfigureAlerts from the Alerts window's settings file. Every value is whitelisted
+    // or an integer, or quoted with QuoteArg. Secrets never pass through here: they travel
+    // in a separate DPAPI-CurrentUser file whose PATH is handed over, which the engine
+    // reads and deletes.
+    static string BuildAlertArgs(string jsonPath)
+    {
+        System.Collections.Generic.Dictionary<string, object> d = ReadJson(jsonPath);
+        string a = "-ConfigureAlerts";
+        if (d == null) { return a; }
+        foreach (string k in new string[] { "AlertEmailTo", "AlertEmailFrom", "AlertSmtpHost", "AlertSmtpUser" })
+        {
+            if (d.ContainsKey(k)) { a += " -" + k + " " + Engine.QuoteArg(Str(d[k])); }
+        }
+        foreach (string k in new string[] { "AlertSmtpPort", "AlertRemindHours", "AlertStaleHours", "AlertPendingMinutes" })
+        {
+            if (d.ContainsKey(k)) { a += " -" + k + " " + ToInt(d[k]); }
+        }
+        if (d.ContainsKey("AlertSmtpTls"))
+        {
+            bool tls = true; try { tls = Convert.ToBoolean(d["AlertSmtpTls"]); } catch { }
+            a += " -AlertSmtpTls " + (tls ? "On" : "Off");
+        }
+        if (d.ContainsKey("AlertWebhookKind"))
+        {
+            string kind = Str(d["AlertWebhookKind"]);
+            string[] allowed = new string[] { "None", "Teams", "Slack", "Generic" };
+            string pick = "None";
+            foreach (string s in allowed) { if (string.Equals(s, kind, StringComparison.OrdinalIgnoreCase)) { pick = s; } }
+            a += " -AlertWebhookKind " + pick;
+        }
+        if (d.ContainsKey("SecretsFile") && Str(d["SecretsFile"]).Length > 0) { a += " -AlertSecretsFile " + Engine.QuoteArg(Str(d["SecretsFile"])); }
+        return a;
     }
 
     static string BuildRescheduleArgs(string jsonPath)
