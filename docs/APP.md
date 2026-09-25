@@ -200,6 +200,30 @@ credential, so it runs elevated; when the app is not already elevated it runs th
 an elevated job and streams the same glowing progress bar and activity log a scheduled run
 would.
 
+### Offsite (immutable copy)
+
+**Offsite** (in the sidebar, or click the **offsite** tile) copies every backup to S3-compatible storage with Object Lock. The storage then refuses to delete a copy until its lock date, even for someone holding this server's credentials.
+
+- **Settings:**
+  - endpoint (https only), region, and a bucket created *with* Object Lock;
+  - folder prefix;
+  - lock mode: Compliance by default, or Governance, which the window warns about;
+  - lock days, 30 by default;
+  - an access key that can put objects and set retention but cannot delete.
+- **Save & test** first uploads a small locked test object and reads its lock back. Nothing is switched on unless that works.
+- **Sync now** runs one sync, which otherwise happens every 30 minutes. **Turn off** stops new copies; copies already offsite stay locked.
+- **Credentials** are write-only, like the alert secrets: the window only says whether they are stored.
+
+The overview's **offsite** tile shows one of:
+
+| State | Meaning |
+|---|---|
+| **locked** | backups are offsite and locked; the tile shows how many, and for how long |
+| **behind** | a backup has waited more than a day to go offsite |
+| **problem** | the last sync failed |
+| **pending** | before the first sync |
+| **off** | the offsite copy is not switched on |
+
 ### Encryption
 
 **Encryption** (in the sidebar) shows whether new backups are encrypted, and with which key. Each action is one elevated step:
@@ -269,6 +293,8 @@ Useful for scripted deployment and for testing:
 | `--test-alert` | Send a test through every configured channel (elevates). Behind **Send test alert**. |
 | `--setup-encryption <file> [--rotate]` | Set up (or rotate) the encryption key; the passphrase comes from the DPAPI file named (elevates). Behind **Encryption**. |
 | `--import-encryption-key <file>` | Import a key from the share's escrow with the passphrase or recovery key in the DPAPI file named (elevates). |
+| `--configure-offsite <file>` | Configure the offsite copy from a JSON file, access keys from the DPAPI file it names; proves a locked upload first (elevates). Behind **Offsite → Save & test**. |
+| `--sync-offsite` / `--disable-offsite` | One offsite sync now / stop the offsite copy (elevates). |
 | `--test-restore` | Run one restore test now (elevates). Behind **Test a restore**. |
 | `--clear-alerts` | Remove all alert settings, secrets and the watchdog task (elevates). Behind **Turn alerts off**. |
 | `--live <file>` | With any elevated job above: stream the engine's output to `<file>`, ending in `[EXIT] N`, so the launching app can tail it live across the UAC boundary. |

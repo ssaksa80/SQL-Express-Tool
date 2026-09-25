@@ -35,6 +35,7 @@ class SebWpf
         string rescheduleJson = null, applySetupJson = null, liveFile = null;
         string alertsJson = null; bool testAlert = false, clearAlerts = false, testRestore = false;
         string setupEncryptionFile = null, importKeyFile = null; bool rotateKey = false;
+        string offsiteJson = null; bool syncOffsite = false, disableOffsite = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--check" && i + 1 < args.Length) { checkFile = args[++i]; }
@@ -55,6 +56,9 @@ class SebWpf
             if (args[i] == "--setup-encryption" && i + 1 < args.Length) { setupEncryptionFile = args[++i]; }
             if (args[i] == "--rotate") { rotateKey = true; }
             if (args[i] == "--import-encryption-key" && i + 1 < args.Length) { importKeyFile = args[++i]; }
+            if (args[i] == "--configure-offsite" && i + 1 < args.Length) { offsiteJson = args[++i]; }
+            if (args[i] == "--sync-offsite") { syncOffsite = true; }
+            if (args[i] == "--disable-offsite") { disableOffsite = true; }
         }
 
         // Silent portable setup: extract to a folder and launch it there. Also the path
@@ -139,6 +143,19 @@ class SebWpf
             AppSettings.Mode = Install.DetectMode();
             return WithJobEngine(liveFile, delegate { return RunEngineHeadless("-ImportEncryptionKey -EncryptionSecretsFile " + Engine.QuoteArg(importKeyFile), liveFile); });
         }
+        if (offsiteJson != null)
+        {
+            if (!Install.IsElevated()) { Install.Relaunch("--configure-offsite \"" + offsiteJson + "\"" + LiveArg(liveFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless(BuildOffsiteArgs(offsiteJson), liveFile); });
+        }
+        if (syncOffsite || disableOffsite)
+        {
+            string flag = syncOffsite ? "--sync-offsite" : "--disable-offsite";
+            if (!Install.IsElevated()) { Install.Relaunch(flag + LiveArg(liveFile), true); return 0; }
+            AppSettings.Mode = Install.DetectMode();
+            return WithJobEngine(liveFile, delegate { return RunEngineHeadless(syncOffsite ? "-SyncOffsite" : "-DisableOffsite", liveFile); });
+        }
         if (testRestore)
         {
             if (!Install.IsElevated()) { Install.Relaunch("--test-restore" + LiveArg(liveFile), true); return 0; }
@@ -183,9 +200,10 @@ class SebWpf
                 FrameworkElement rw = new RestoreWindow().BuildRoot();
                 FrameworkElement aw = new AlertsWindow().BuildRoot();
                 FrameworkElement ew = new EncryptionWindow().BuildRoot();
+                FrameworkElement ow = new OffsiteWindow().BuildRoot();
                 File.WriteAllText(checkFile, "WPF-CHECK-OK view=" + settings.View + " theme=" + settings.Theme +
                     " modern=" + (m != null) + " dba=" + (d != null) + " restore=" + (rw != null) + " alerts=" + (aw != null) +
-                    " encryption=" + (ew != null));
+                    " encryption=" + (ew != null) + " offsite=" + (ow != null));
                 return 0;
             }
             catch (Exception ex)
@@ -325,6 +343,24 @@ class SebWpf
             a += " -AlertWebhookKind " + pick;
         }
         if (d.ContainsKey("SecretsFile") && Str(d["SecretsFile"]).Length > 0) { a += " -AlertSecretsFile " + Engine.QuoteArg(Str(d["SecretsFile"])); }
+        return a;
+    }
+
+    // -ConfigureOffsite from the Offsite window's settings file. Strings are quoted with
+    // QuoteArg, the lock mode is whitelisted, days are an integer; the access keys travel in
+    // the separate DPAPI-CurrentUser file whose path is handed over, never as values.
+    static string BuildOffsiteArgs(string jsonPath)
+    {
+        System.Collections.Generic.Dictionary<string, object> d = ReadJson(jsonPath);
+        string a = "-ConfigureOffsite";
+        if (d == null) { return a; }
+        foreach (string k in new string[] { "OffsiteEndpoint", "OffsiteRegion", "OffsiteBucket", "OffsitePrefix" })
+        {
+            if (d.ContainsKey(k) && Str(d[k]).Length > 0) { a += " -" + k + " " + Engine.QuoteArg(Str(d[k])); }
+        }
+        if (d.ContainsKey("OffsiteLockDays")) { a += " -OffsiteLockDays " + ToInt(d["OffsiteLockDays"]); }
+        if (d.ContainsKey("OffsiteLockMode")) { a += " -OffsiteLockMode " + (string.Equals(Str(d["OffsiteLockMode"]), "Governance", StringComparison.OrdinalIgnoreCase) ? "Governance" : "Compliance"); }
+        if (d.ContainsKey("SecretsFile") && Str(d["SecretsFile"]).Length > 0) { a += " -OffsiteSecretsFile " + Engine.QuoteArg(Str(d["SecretsFile"])); }
         return a;
     }
 

@@ -43,6 +43,14 @@ class BackupStatus
     // Encryption: on for new backups, and the key they use (an id, never key material).
     public bool EncryptBackups = false;
     public string ActiveKeyId = "";
+    // Immutable offsite copy: the settings, whether credentials are stored (yes/no only),
+    // and the last sync's summary.
+    public bool OffsiteEnabled = false, OffsiteHasCredentials = false;
+    public string OffsiteEndpoint = "", OffsiteRegion = "us-east-1", OffsiteBucket = "", OffsitePrefix = "sqlexpress-backup", OffsiteLockMode = "Compliance";
+    public int OffsiteLockDays = 30;
+    public bool OffsiteSynced = false;
+    public string OffsiteLastRunUtc = "", OffsiteLastResult = "", OffsiteLastError = "", OffsiteOldestPendingUtc = "";
+    public int OffsiteBacklog = 0, OffsiteObjects = 0;
 }
 
 class RestoreTestResult
@@ -151,6 +159,21 @@ static class Engine
             s.AlertHasHeartbeat = Bool(d, "AlertHasHeartbeat");
             s.EncryptBackups = Bool(d, "EncryptBackups");
             s.ActiveKeyId = Str(d, "ActiveKeyId");
+            s.OffsiteEnabled = Bool(d, "OffsiteEnabled");
+            s.OffsiteHasCredentials = Bool(d, "OffsiteHasCredentials");
+            s.OffsiteEndpoint = Str(d, "OffsiteEndpoint"); s.OffsiteBucket = Str(d, "OffsiteBucket");
+            if (Str(d, "OffsiteRegion").Length > 0) { s.OffsiteRegion = Str(d, "OffsiteRegion"); }
+            if (Str(d, "OffsitePrefix").Length > 0) { s.OffsitePrefix = Str(d, "OffsitePrefix"); }
+            if (Str(d, "OffsiteLockMode").Length > 0) { s.OffsiteLockMode = Str(d, "OffsiteLockMode"); }
+            s.OffsiteLockDays = Int(d, "OffsiteLockDays", 30);
+            foreach (IDictionary<string, object> o in Rows(d, "Offsite"))
+            {
+                s.OffsiteSynced = true;
+                s.OffsiteLastRunUtc = DStr(o, "LastRunUtc"); s.OffsiteLastResult = DStr(o, "LastResult"); s.OffsiteLastError = DStr(o, "LastError");
+                s.OffsiteOldestPendingUtc = DStr(o, "OldestPendingUtc");
+                try { s.OffsiteBacklog = Convert.ToInt32(o["Backlog"]); } catch { }
+                try { s.OffsiteObjects = Convert.ToInt32(o["Objects"]); } catch { }
+            }
             s.RestoreTesting = Bool(d, "RestoreTesting");
             string rtt = Str(d, "RestoreTestTime");
             if (rtt.Length == 5) { s.RestoreTestTime = rtt; }

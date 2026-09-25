@@ -2303,7 +2303,17 @@ foreach ($f in @('SetupEncryption', 'RotateKey', 'ImportEncryptionKey', 'Encrypt
 $ebSet = @(@($engineParams['EncryptBackups'].Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' })[0].PositionalArguments | ForEach-Object { $_.Value })
 Assert (($ebSet -contains 'On') -and ($ebSet -contains 'Off')) 'the engine accepts -EncryptBackups On and Off, which is what the app sends'
 Assert ($appSrc -notmatch '-Passphrase\b' -and $appSrc -notmatch '-RecoveryKey\b') 'the app never passes a passphrase or recovery key as a command-line value'
-foreach ($job in @('--configure-alerts', '--test-alert', '--clear-alerts', '--test-restore', '--setup-encryption', '--import-encryption-key')) {
+# Offsite: the flags BuildOffsiteArgs emits exist; the lock mode it offers is accepted; the
+# access keys only ever travel as a secrets FILE.
+$om = [regex]::Match($appSrc, '(?s)static string BuildOffsiteArgs.*?\n    \}')
+Assert $om.Success 'App.cs has BuildOffsiteArgs'
+foreach ($f in @(@([regex]::Matches($om.Value, '"(Offsite\w+)"') | ForEach-Object { $_.Groups[1].Value }) + @('ConfigureOffsite', 'SyncOffsite', 'DisableOffsite') | Sort-Object -Unique)) {
+  Assert ($engineParams.ContainsKey($f)) "the engine has -$f"
+}
+$lmSet = @(@($engineParams['OffsiteLockMode'].Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' })[0].PositionalArguments | ForEach-Object { $_.Value })
+Assert (($lmSet -contains 'Compliance') -and ($lmSet -contains 'Governance')) 'the engine accepts both lock modes the app offers'
+Assert ($appSrc -notmatch '-SecretAccessKey\b' -and $appSrc -notmatch '-AccessKeyId\b') 'the app never passes an access key as a command-line value'
+foreach ($job in @('--configure-alerts', '--test-alert', '--clear-alerts', '--test-restore', '--setup-encryption', '--import-encryption-key', '--configure-offsite', '--sync-offsite', '--disable-offsite')) {
   Assert ($appSrc -match [regex]::Escape('"' + $job + '"')) "App.cs handles the $job job"
 }
 

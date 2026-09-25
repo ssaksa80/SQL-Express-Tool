@@ -20,7 +20,7 @@ class ModernView
     GlowBar glow;
     LogPane log;
     Border activityArea;
-    TextBlock lastRunVal, schedVal, dbCountVal, instVal, restoreTestVal, restoreTestLabel;
+    TextBlock lastRunVal, schedVal, dbCountVal, instVal, restoreTestVal, restoreTestLabel, offsiteVal, offsiteLabel;
     Border alertBanner;
     StackPanel alertLines;
     bool busy;
@@ -75,6 +75,7 @@ class ModernView
         sp.Children.Add(Ui.NavItem("", "Schedule", false, ShowSchedule));
         sp.Children.Add(Ui.NavItem("", "Alerts", false, OpenAlerts));
         sp.Children.Add(Ui.NavItem("", "Encryption", false, OpenEncryption));
+        sp.Children.Add(Ui.NavItem("", "Offsite", false, OpenOffsite));
         sp.Children.Add(Ui.NavItem("", "Activity", false, ShowFullLog));
 
         b.Child = sp;
@@ -96,7 +97,7 @@ class ModernView
         g.Children.Add(h);
 
         UniformGrid tiles = new UniformGrid();
-        tiles.Columns = 5; tiles.Margin = new Thickness(0, 14, 0, 0);
+        tiles.Columns = 6; tiles.Margin = new Thickness(0, 14, 0, 0);
         Border t1 = Ui.Tile("—", "last run", Theme.Ink); lastRunVal = TileValue(t1);
         Border t2 = Ui.Tile("—", "schedule", Theme.Ink); schedVal = TileValue(t2);
         Border t3 = Ui.Tile("—", "databases", Theme.Ink); dbCountVal = TileValue(t3);
@@ -104,8 +105,12 @@ class ModernView
         // The most recent restore test - "backed up" is a claim until one has come back.
         Border t5 = Ui.Tile("—", "restore test", Theme.Ink); restoreTestVal = TileValue(t5); restoreTestLabel = TileLabel(t5);
         t5.ToolTip = "The last automated restore test: a backup restored to a scratch copy and checked with DBCC CHECKDB";
-        foreach (Border t in new Border[] { t1, t2, t3, t4, t5 }) { t.Margin = new Thickness(0, 0, 10, 0); }
-        tiles.Children.Add(t1); tiles.Children.Add(t2); tiles.Children.Add(t3); tiles.Children.Add(t4); tiles.Children.Add(t5);
+        // The immutable offsite copy - what is left if the server and the share are both lost.
+        Border t6 = Ui.Tile("—", "offsite", Theme.Ink); offsiteVal = TileValue(t6); offsiteLabel = TileLabel(t6);
+        t6.ToolTip = "The immutable offsite copy (Object Lock) - click to open"; t6.Cursor = System.Windows.Input.Cursors.Hand;
+        t6.MouseLeftButtonUp += delegate { OpenOffsite(); };
+        foreach (Border t in new Border[] { t1, t2, t3, t4, t5, t6 }) { t.Margin = new Thickness(0, 0, 10, 0); }
+        tiles.Children.Add(t1); tiles.Children.Add(t2); tiles.Children.Add(t3); tiles.Children.Add(t4); tiles.Children.Add(t5); tiles.Children.Add(t6);
         Grid.SetRow(tiles, 1); g.Children.Add(tiles);
 
         // What is wrong right now, from the engine's alerting - hidden when nothing is.
@@ -491,6 +496,7 @@ class ModernView
         }
         FillAlertBanner(st);
         FillRestoreTestTile(st);
+        FillOffsiteTile(st);
 
         // group sets by database
         Dictionary<string, int> byDb = new Dictionary<string, int>();
@@ -610,6 +616,23 @@ class ModernView
         alertBanner.Visibility = Visibility.Visible;
     }
 
+    void FillOffsiteTile(BackupStatus st)
+    {
+        string label = "offsite";
+        if (!st.OffsiteEnabled) { offsiteVal.Text = "off"; offsiteVal.Foreground = Theme.Warn; label = "offsite · share only"; }
+        else if (!st.OffsiteSynced) { offsiteVal.Text = "pending"; offsiteVal.Foreground = Theme.Ink3; label = "offsite · first sync due"; }
+        else
+        {
+            double oldest = 0;
+            DateTime d;
+            if (st.OffsiteBacklog > 0 && DateTime.TryParse(st.OffsiteOldestPendingUtc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out d)) { oldest = (DateTime.UtcNow - d.ToUniversalTime()).TotalHours; }
+            if (oldest >= 24) { offsiteVal.Text = "behind"; offsiteVal.Foreground = Theme.Bad; label = "offsite · " + st.OffsiteBacklog + " waiting"; }
+            else if (st.OffsiteLastResult == "failed") { offsiteVal.Text = "problem"; offsiteVal.Foreground = Theme.Warn; label = "offsite · last sync failed"; }
+            else { offsiteVal.Text = "locked"; offsiteVal.Foreground = Theme.Ok; label = "offsite · " + st.OffsiteObjects + " copies, " + st.OffsiteLockDays + "d"; }
+        }
+        if (offsiteLabel != null) { offsiteLabel.Text = label; }
+    }
+
     void FillRestoreTestTile(BackupStatus st)
     {
         RestoreTestResult last = null;
@@ -669,6 +692,12 @@ class ModernView
         DateTime d;
         if (!DateTime.TryParse(utc, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out d)) { return ""; }
         return "  (since " + d.ToLocalTime().ToString("d MMM HH:mm", CultureInfo.CurrentCulture) + ")";
+    }
+
+    void OpenOffsite()
+    {
+        OffsiteWindow w = new OffsiteWindow();
+        w.Show(Application.Current != null ? Application.Current.MainWindow : null, delegate { Refresh(); });
     }
 
     void OpenEncryption()

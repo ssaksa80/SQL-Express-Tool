@@ -199,6 +199,7 @@ $script:SebShowKeys = @(
   'AlertHasSmtpPassword', 'AlertHasWebhook', 'AlertHasHeartbeat', 'RestoreTesting', 'RestoreTestTime',
   'EncryptBackups', 'ActiveKeyId',
   'OffsiteEnabled', 'OffsiteEndpoint', 'OffsiteRegion', 'OffsiteBucket', 'OffsitePrefix', 'OffsiteLockDays', 'OffsiteLockMode',
+  'OffsiteHasCredentials',
   'NoHashVerify', 'CreatedUtc', 'Version'
 )
 
@@ -6132,6 +6133,8 @@ try {
     finally { Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue }
     Write-SebOffsiteSecrets -Secrets $secrets
     Add-Member -InputObject $config -MemberType NoteProperty -Name 'OffsiteEnabled' -Value $true -Force
+    # Yes/no only, for the app, which cannot read offsite.dat (by design).
+    Add-Member -InputObject $config -MemberType NoteProperty -Name 'OffsiteHasCredentials' -Value $true -Force
     Write-SebConfig -Config $config
     $taskOn = $false
     $schedule = Get-SebScheduleState

@@ -1,7 +1,7 @@
 # Immutable Offsite Copy (WORM) — Design Spec
 
 - **Date:** 2026-09-25
-- **Status:** Design decisions approved (model, retention). Increment 1 (engine) implemented; tested against AWS's SigV4 examples and a loopback fake S3. The live MinIO test was not run: MinIO no longer publishes public images, and the operator chose to skip it. `-ConfigureOffsite` proves a locked upload against the real bucket. Increment 2 (app) next.
+- **Status:** Design decisions approved (model, retention). Increment 1 (engine) implemented; tested against AWS's SigV4 examples and a loopback fake S3. The live MinIO test was not run: MinIO no longer publishes public images, and the operator chose to skip it. `-ConfigureOffsite` proves a locked upload against the real bucket. Increment 2 (app: Offsite window, overview tile) implemented.
 - **Component:** SQL-Express-Tool — `Invoke-SqlExpressBackup.ps1` (engine, increment 1); `wpf/` (increment 2)
 - **Feature:** Roadmap feature 2 ("Protect the backups"), **increment 3 of 3** — IMMUTABILITY. It also delivers the offsite copy the README lists as missing.
 
