@@ -3637,7 +3637,7 @@ GROUP BY database_id
         $dbName = [string](Get-SebValue $row.name)
         if ($dbName) { $logWaitByDb[$dbName] = [string](Get-SebValue $row.log_reuse_wait_desc) }
       }
-      $logSpaceRows = @(Invoke-SebSqlTable -Connection $connection -Sql 'DBCC SQLPERF(LOGSPACE)')
+      $logSpaceRows = Invoke-SebSqlTable -Connection $connection -Sql 'DBCC SQLPERF(LOGSPACE)'
     }
     try {
       $modelRows = @(Invoke-SebSqlTable -Connection $connection -Sql 'SELECT name, recovery_model_desc FROM sys.databases')
@@ -5669,7 +5669,7 @@ FROM sys.databases
         $modelByDb[$dbName] = [string](Get-SebValue $row.recovery_model_desc)
         $waitByDb[$dbName] = [string](Get-SebValue $row.log_reuse_wait_desc)
       }
-      $logSpaceRows = @(Invoke-SebSqlTable -Connection $statusConnection -Sql 'DBCC SQLPERF(LOGSPACE)')
+      $logSpaceRows = Invoke-SebSqlTable -Connection $statusConnection -Sql 'DBCC SQLPERF(LOGSPACE)'
       $fullDatabases = @($eligible | Where-Object { $modelByDb.ContainsKey($_) -and $modelByDb[$_] -eq 'FULL' })
 
       if ($fullDatabases.Count -eq 0) {
