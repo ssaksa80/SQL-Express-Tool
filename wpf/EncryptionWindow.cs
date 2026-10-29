@@ -200,12 +200,15 @@ class EncryptionWindow
     void Import()
     {
         if (busy) { return; }
-        string typed = importBox.Password.Trim();
-        if (typed.Length == 0) { Flash("Enter the passphrase or the recovery key."); return; }
+        string raw = importBox.Password;   // not trimmed: whitespace can be part of the passphrase, and setup never trims it
+        if (raw.Trim().Length == 0) { Flash("Enter the passphrase or the recovery key."); return; }
         Dictionary<string, string> secrets = new Dictionary<string, string>();
-        // A recovery key has a shape a passphrase almost never has.
-        if (Regex.IsMatch(typed.Replace("-", "").Replace(" ", ""), "^[0-9A-Fa-f]{64}$")) { secrets["RecoveryKey"] = typed; }
-        else { secrets["Passphrase"] = typed; }
+        // A recovery key has a shape a passphrase almost never has; .Trim() here only tests that
+        // shape. The stored value stays raw either way - the recovery-key reader ignores dashes and
+        // spaces, and a passphrase must reach the engine exactly as it was first set. A 64-hex input
+        // could be either, so it goes over as the recovery key and the engine falls back to the passphrase.
+        if (Regex.IsMatch(raw.Trim().Replace("-", "").Replace(" ", ""), "^[0-9A-Fa-f]{64}$")) { secrets["RecoveryKey"] = raw; }
+        else { secrets["Passphrase"] = raw; }
         string file;
         try { file = AlertsWindow.WriteSecretsFile(secrets); }
         catch (Exception ex) { Flash("Could not prepare the key for hand-off: " + ex.Message); return; }

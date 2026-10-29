@@ -970,6 +970,24 @@ function Open-SebEscrow {
   finally { [System.Array]::Clear($kek, 0, $kek.Length) }
 }
 
+# Import may be handed one credential that could be either kind: a passphrase that happens
+# to be 64 hex characters is indistinguishable from a recovery key, and either might carry
+# whitespace that is part of it. Try the recovery key first, then the passphrase, before
+# giving up - so an ambiguous or edge-whitespace credential still opens a rebuilt server's
+# backups rather than being rejected with no second chance.
+function Open-SebEscrowEither {
+  param($Escrow, [string]$Passphrase = '', [string]$RecoveryKey = '')
+  if ($RecoveryKey -ne '') {
+    try { $k = [byte[]](Open-SebEscrow -Escrow $Escrow -RecoveryKey $RecoveryKey); return , $k } catch { }
+    # The recovery-key shape also fits a 64-hex passphrase; try it as one before failing.
+    if ($Passphrase -eq '') {
+      try { $k = [byte[]](Open-SebEscrow -Escrow $Escrow -Passphrase $RecoveryKey); return , $k } catch { }
+    }
+  }
+  if ($Passphrase -ne '') { $k = [byte[]](Open-SebEscrow -Escrow $Escrow -Passphrase $Passphrase); return , $k }
+  throw 'that passphrase or recovery key does not open this key'
+}
+
 function Get-SebKeyringPath { return (Join-Path $script:SebConfigDir 'keyring.dat') }
 # One escrow per key, so a rotated-away key stays recoverable for the backups it wrote.
 function Get-SebEscrowName { param([string]$KeyId) return ('encryption-key-{0}.json' -f $KeyId) }
@@ -6273,7 +6291,7 @@ try {
     foreach ($f in $files) {
       $escrow = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json
       try {
-        $key = Open-SebEscrow -Escrow $escrow -Passphrase $passphrase -RecoveryKey $recoveryText
+        $key = Open-SebEscrowEither -Escrow $escrow -Passphrase $passphrase -RecoveryKey $recoveryText
         $ring[[string]$escrow.KeyId] = $key
         $imported += [string]$escrow.KeyId
         # Keep the escrow locally too, so this server re-publishes it like one it made.
