@@ -1308,6 +1308,29 @@ Assert ((Get-SebLogSpaceUsedPct -Rows @([pscustomobject]@{ 'Database Name' = 'X'
 Assert (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct (Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'APPDB') -ThresholdPct 70) 'APPDB (85% on a LOG_BACKUP wait) warns'
 Assert (-not (Get-SebLogGrowthWarning -Wait 'LOG_BACKUP' -UsedPct (Get-SebLogSpaceUsedPct -Rows $lsRows -Database 'Other') -ThresholdPct 70)) 'Other (10%) does not warn'
 
+# ---- D3b-2b. the per-pass log-space lookup must take Invoke-SebSqlTable's result
+# DIRECTLY. Invoke-SebSqlTable returns its rows AS ONE object (unary comma, "return , @"),
+# so wrapping the call in @() double-wraps it into a 1-element array holding the whole
+# row list; Get-SebLogSpaceUsedPct then iterates that single element, cannot match the
+# per-database row, and reads 0 - so on any instance with MORE THAN ONE database the
+# "log is N% full, waiting on a log backup" WARN went silently dead. Shadow the engine
+# with its real comma-return (the same seam the restore-header guard above uses) and
+# drive the lookup both ways over a multi-row result. Restore the real function after.
+$realInvoke = ${function:Invoke-SebSqlTable}
+try {
+  function Invoke-SebSqlTable { param($Connection, [string]$Sql, [int]$TimeoutSec = 60) return , @($script:SebFakeRows) }
+  $script:SebFakeRows = @(
+    [pscustomobject]@{ 'Database Name' = 'APPDB'; 'Log Size (MB)' = 100.0; 'Log Space Used (%)' = 83.0; 'Status' = 0 },
+    [pscustomobject]@{ 'Database Name' = 'Other'; 'Log Size (MB)' = 50.0;  'Log Space Used (%)' = 5.0;  'Status' = 0 }
+  )
+  $directRows = Invoke-SebSqlTable -Connection 'x' -Sql 'DBCC SQLPERF(LOGSPACE)'
+  Assert ((Get-SebLogSpaceUsedPct -Rows $directRows -Database 'APPDB') -eq 83.0) 'direct assignment (as the call sites now do) reads the named db true used% (83) on a multi-db result'
+  Assert ((Get-SebLogSpaceUsedPct -Rows $directRows -Database 'Nope') -eq 0) 'positive control: a db absent from those same real-engine rows reads 0 - the probe DOES distinguish a found row from a missing one'
+  $wrappedRows = @(Invoke-SebSqlTable -Connection 'x' -Sql 'DBCC SQLPERF(LOGSPACE)')
+  Assert ((Get-SebLogSpaceUsedPct -Rows $wrappedRows -Database 'APPDB') -eq 0) 'the @()-wrap double-wraps the comma-return so APPDB cannot be found and reads 0 (dead WARN) - this is the regression the direct assignment prevents'
+}
+finally { ${function:Invoke-SebSqlTable} = $realInvoke; $script:SebFakeRows = $null }
+
 # ---- D3b-3. chain summary from folder facts -----------------------------------------
 function New-CS([datetime]$t) { return [pscustomobject]@{ Timestamp = $t } }
 $nowCS = [datetime]'2026-09-05 12:00:00'
@@ -1576,6 +1599,29 @@ Assert ($w.Count -eq 2) "Simple mode warns for each FULL database it backs up (g
 Assert ((@($w) -join ' ') -notmatch 'NotOurs') 'a database outside the backup set is not warned about'
 $w = @(Get-SebUnmanagedFullLogWarnings -Rows $mRows -Databases @('master', 'AppDb', 'Plain') -FullMode $true -ReadOnlyMap @{})
 Assert ($w.Count -eq 1 -and $w[0] -like 'master *') 'Full mode warns only for the full-only ones (master), not for AppDb whose log it backs up'
+
+# REVIEW-2b. the per-pass model-row lookup that feeds this warning must take
+# Invoke-SebSqlTable's result DIRECTLY - the @() wrap double-wraps the unary-comma return
+# into a 1-element array, so Get-SebUnmanagedFullLogWarnings iterates that single element,
+# matches no database name, and emits nothing: the "FULL recovery, no log backups, log
+# will grow" warning went silently dead on any instance with more than one database.
+# Shadow the engine with its real comma-return and drive the warning both ways.
+$realInvoke = ${function:Invoke-SebSqlTable}
+try {
+  function Invoke-SebSqlTable { param($Connection, [string]$Sql, [int]$TimeoutSec = 60) return , @($script:SebFakeRows) }
+  $script:SebFakeRows = @(
+    [pscustomobject]@{ name = 'master';  recovery_model_desc = 'FULL' },
+    [pscustomobject]@{ name = 'AppDb';   recovery_model_desc = 'FULL' },
+    [pscustomobject]@{ name = 'Plain';   recovery_model_desc = 'SIMPLE' },
+    [pscustomobject]@{ name = 'NotOurs'; recovery_model_desc = 'FULL' }
+  )
+  $directRows = Invoke-SebSqlTable -Connection 'x' -Sql 'SELECT name, recovery_model_desc FROM sys.databases'
+  $wd = @(Get-SebUnmanagedFullLogWarnings -Rows $directRows -Databases @('master', 'AppDb', 'Plain') -FullMode $false -ReadOnlyMap @{})
+  Assert ($wd.Count -eq 2 -and ($wd -join ' ') -notmatch 'NotOurs') 'direct assignment (as the call site now does) warns for each FULL db in the set (master, AppDb) and not one outside it - positive control: it distinguishes a warned db from a non-warned one'
+  $wrappedRows = @(Invoke-SebSqlTable -Connection 'x' -Sql 'SELECT name, recovery_model_desc FROM sys.databases')
+  Assert (@(Get-SebUnmanagedFullLogWarnings -Rows $wrappedRows -Databases @('master', 'AppDb', 'Plain') -FullMode $false -ReadOnlyMap @{}).Count -eq 0) 'the @()-wrap double-wraps the comma-return so no database name matches and no warning fires (dead WARN) - the regression the direct assignment prevents'
+}
+finally { ${function:Invoke-SebSqlTable} = $realInvoke; $script:SebFakeRows = $null }
 
 # ---- REVIEW-3. a staged log backup with no pending entry is adopted, not swept -------
 $tmpO = Join-Path $env:TEMP ('seb-orph-' + [Guid]::NewGuid().ToString('N'))
