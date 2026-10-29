@@ -1600,6 +1600,29 @@ Assert ((@($w) -join ' ') -notmatch 'NotOurs') 'a database outside the backup se
 $w = @(Get-SebUnmanagedFullLogWarnings -Rows $mRows -Databases @('master', 'AppDb', 'Plain') -FullMode $true -ReadOnlyMap @{})
 Assert ($w.Count -eq 1 -and $w[0] -like 'master *') 'Full mode warns only for the full-only ones (master), not for AppDb whose log it backs up'
 
+# REVIEW-2b. the per-pass model-row lookup that feeds this warning must take
+# Invoke-SebSqlTable's result DIRECTLY - the @() wrap double-wraps the unary-comma return
+# into a 1-element array, so Get-SebUnmanagedFullLogWarnings iterates that single element,
+# matches no database name, and emits nothing: the "FULL recovery, no log backups, log
+# will grow" warning went silently dead on any instance with more than one database.
+# Shadow the engine with its real comma-return and drive the warning both ways.
+$realInvoke = ${function:Invoke-SebSqlTable}
+try {
+  function Invoke-SebSqlTable { param($Connection, [string]$Sql, [int]$TimeoutSec = 60) return , @($script:SebFakeRows) }
+  $script:SebFakeRows = @(
+    [pscustomobject]@{ name = 'master';  recovery_model_desc = 'FULL' },
+    [pscustomobject]@{ name = 'AppDb';   recovery_model_desc = 'FULL' },
+    [pscustomobject]@{ name = 'Plain';   recovery_model_desc = 'SIMPLE' },
+    [pscustomobject]@{ name = 'NotOurs'; recovery_model_desc = 'FULL' }
+  )
+  $directRows = Invoke-SebSqlTable -Connection 'x' -Sql 'SELECT name, recovery_model_desc FROM sys.databases'
+  $wd = @(Get-SebUnmanagedFullLogWarnings -Rows $directRows -Databases @('master', 'AppDb', 'Plain') -FullMode $false -ReadOnlyMap @{})
+  Assert ($wd.Count -eq 2 -and ($wd -join ' ') -notmatch 'NotOurs') 'direct assignment (as the call site now does) warns for each FULL db in the set (master, AppDb) and not one outside it - positive control: it distinguishes a warned db from a non-warned one'
+  $wrappedRows = @(Invoke-SebSqlTable -Connection 'x' -Sql 'SELECT name, recovery_model_desc FROM sys.databases')
+  Assert (@(Get-SebUnmanagedFullLogWarnings -Rows $wrappedRows -Databases @('master', 'AppDb', 'Plain') -FullMode $false -ReadOnlyMap @{}).Count -eq 0) 'the @()-wrap double-wraps the comma-return so no database name matches and no warning fires (dead WARN) - the regression the direct assignment prevents'
+}
+finally { ${function:Invoke-SebSqlTable} = $realInvoke; $script:SebFakeRows = $null }
+
 # ---- REVIEW-3. a staged log backup with no pending entry is adopted, not swept -------
 $tmpO = Join-Path $env:TEMP ('seb-orph-' + [Guid]::NewGuid().ToString('N'))
 [void](New-Item -ItemType Directory -Path $tmpO -Force)

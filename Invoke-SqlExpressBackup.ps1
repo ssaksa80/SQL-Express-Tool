@@ -3640,7 +3640,7 @@ GROUP BY database_id
       $logSpaceRows = Invoke-SebSqlTable -Connection $connection -Sql 'DBCC SQLPERF(LOGSPACE)'
     }
     try {
-      $modelRows = @(Invoke-SebSqlTable -Connection $connection -Sql 'SELECT name, recovery_model_desc FROM sys.databases')
+      $modelRows = Invoke-SebSqlTable -Connection $connection -Sql 'SELECT name, recovery_model_desc FROM sys.databases'
       foreach ($w in @(Get-SebUnmanagedFullLogWarnings -Rows $modelRows -Databases $databases -FullMode $isFullMode -ReadOnlyMap $readOnly)) {
         Write-SebLog $w 'WARN'
         $wDb = ($w -split ' is in FULL recovery', 2)[0]
