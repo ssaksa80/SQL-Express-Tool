@@ -2218,6 +2218,17 @@ function Get-SebLogPassConditions {
   return @()
 }
 
+# Encryption is on and a non-.enc log backup is stranded in staging because its encrypted
+# publish failed. It is held - never shipped as plaintext - so point-in-time recovery has a
+# gap until an operator clears it. Critical: the alternative this replaced was a readable
+# backup on the share and, with offsite on, in the immutable Object-Lock bucket.
+function Get-SebHeldPlaintextCondition {
+  param([int]$Count)
+  if ($Count -le 0) { return @() }
+  return @(New-SebAlertCondition -Key 'held-plaintext' -Severity 'critical' -Owner 'encryption' -Message (
+      '{0} transaction-log backup(s) could not be encrypted and are held in staging - they will NOT be shipped as plaintext. Point-in-time recovery has a gap until this is resolved: check the encryption key and the staging disk.' -f $Count))
+}
+
 # The dead-man checks, pure. Schedule: { ServicePresent; MainTaskState; LogTaskState } where
 # a task state is 'absent', 'Disabled' or anything else (Ready/Running/Queued). CreatedUtc is
 # the baseline for a host that has not completed a pass yet, so a fresh install is not stale.
@@ -3196,7 +3207,8 @@ function Get-SebPublishSet {
 # lone .trn.zip is complete (the plain file is only removed after zipping) and travels
 # with its sidecar.
 function Get-SebOrphanLogEntries {
-  param([string]$StagingPath, [string[]]$KeepPaths = @(), [string]$Root, [string]$HostName, [string]$InstanceLabel)
+  param([string]$StagingPath, [string[]]$KeepPaths = @(), [string]$Root, [string]$HostName, [string]$InstanceLabel,
+        [bool]$Encrypt = $false)
   $out = New-Object System.Collections.ArrayList
   $files = @(Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction SilentlyContinue)
   $plainNames = @($files | Where-Object { $_.Name -match '\.trn$' } | ForEach-Object { $_.Name })
@@ -3206,6 +3218,10 @@ function Get-SebOrphanLogEntries {
     $safeDb = $Matches[1]
     $suffix = $Matches[2]
     $isProcessed = ($suffix -ne '')
+    # Encryption on: only ciphertext may leave staging. A non-.enc orphan (a plain .trn, or a
+    # .trn.zip - a zip is not encryption) is tagged Hold so the pass keeps it and alerts, never
+    # letting the drain Copy-SebVerified it to the share (and on to the immutable offsite copy).
+    $hold = ($Encrypt -and ($suffix -notlike '*.enc'))
     if (@($KeepPaths) -contains $f.FullName) { continue }
     # a processed copy of it is already pending: shipping the plain file too would put the backup on the share twice
     if (-not $isProcessed -and @(@('.zip', '.enc', '.zip.enc') | Where-Object { @($KeepPaths) -contains ($f.FullName + $_) }).Count -gt 0) { continue }
@@ -3214,11 +3230,11 @@ function Get-SebOrphanLogEntries {
     # an intermediate .zip whose .zip.enc exists was only a step on the way
     if ($suffix -eq '.zip' -and (Test-Path -LiteralPath ($f.FullName + '.enc'))) { continue }
     $logDir = Get-SebBackupPath -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Database $safeDb -Kind 'log'
-    [void]$out.Add([pscustomobject]@{ Staged = $f.FullName; Dest = (Join-Path $logDir $f.Name); Database = $safeDb; Kind = 'log' })
+    [void]$out.Add([pscustomobject]@{ Staged = $f.FullName; Dest = (Join-Path $logDir $f.Name); Database = $safeDb; Kind = 'log'; Hold = $hold })
     if ($isProcessed) {
       $meta = Get-SebSidecarName $f.FullName
       if ((Test-Path -LiteralPath $meta) -and @($KeepPaths) -notcontains $meta) {
-        [void]$out.Add([pscustomobject]@{ Staged = $meta; Dest = (Join-Path $logDir (Get-SebSidecarName $f.Name)); Database = $safeDb; Kind = 'log' })
+        [void]$out.Add([pscustomobject]@{ Staged = $meta; Dest = (Join-Path $logDir (Get-SebSidecarName $f.Name)); Database = $safeDb; Kind = 'log'; Hold = $hold })
       }
     }
   }
@@ -3381,10 +3397,18 @@ function Invoke-SebBackupLogPass {
   $state = Read-SebState
   $pending = @($state.Pending)
   $orphans = @(Get-SebOrphanLogEntries -StagingPath $StagingPath -KeepPaths @($pending | ForEach-Object { if ($null -ne $_) { [string]$_.Staged } }) `
-      -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel)
+      -Root $Root -HostName $HostName -InstanceLabel $InstanceLabel -Encrypt $Encrypt)
+  # Encryption on: an orphan that is not already .enc (a plain .trn, or a .trn.zip - a zip is
+  # not encryption) must never be drained as plaintext. Hold it in staging (keepPaths below
+  # spares it from the sweep) and alert; only ciphertext orphans are adopted for the drain.
+  $heldOrphans = @($orphans | Where-Object { $_.Hold })
+  $orphans = @($orphans | Where-Object { -not $_.Hold })
   if ($orphans.Count -gt 0) {
     Write-SebLog ('{0} staged log backup file(s) were never recorded for copy - adopting them so the chain reaches the share' -f $orphans.Count) 'WARN'
     $pending = @($pending) + $orphans
+  }
+  if ($heldOrphans.Count -gt 0) {
+    Write-SebLog ('{0} staged plaintext log backup file(s) cannot be shipped encrypted and are held in staging, NOT copied to the share' -f $heldOrphans.Count) 'ERROR'
   }
   $pendingList = New-Object System.Collections.ArrayList
   if ($pending.Count -gt 0) {
@@ -3395,7 +3419,7 @@ function Invoke-SebBackupLogPass {
     # A staged file no surviving pending entry points at has reached the share and is done
     # with. This sweep runs BEFORE anything is staged this pass, so a database that fails
     # below still leaves its own staged file in place - the loud evidence D1a keeps.
-    $keepPaths = @($pendingList.ToArray() | ForEach-Object { [string]$_.Staged })
+    $keepPaths = @($pendingList.ToArray() | ForEach-Object { [string]$_.Staged }) + @($heldOrphans | ForEach-Object { [string]$_.Staged })
     Clear-SebStagedExcept -StagingPath $StagingPath -KeepPaths $keepPaths
   }
 
@@ -3476,7 +3500,7 @@ FROM sys.databases AS d
   # "nothing was in FULL recovery this cycle", which is the pass doing its job.
   if ($failed -eq 0) { Add-Member -InputObject $newState -MemberType NoteProperty -Name 'LastLogSuccessUtc' -Value $nowUtc.ToString('o') }
   Write-SebState $newState
-  return [pscustomobject]@{ Succeeded = $succeeded; Failed = $failed; Pending = $pendingList.Count; FailedDatabases = @($failedNames.ToArray()) }
+  return [pscustomobject]@{ Succeeded = $succeeded; Failed = $failed; Pending = $pendingList.Count; FailedDatabases = @($failedNames.ToArray()); HeldPlaintext = $heldOrphans.Count }
 }
 
 function Invoke-SebPass {
@@ -3497,18 +3521,25 @@ function Invoke-SebPass {
 
   $state = Read-SebState
   $pending = @($state.Pending)
+  # Encryption on means every new backup is encrypted or the pass fails - never a quiet
+  # fallback to plaintext on the share because the key went missing. The same bar applies to
+  # the orphan adoption below: a non-.enc .trn left stranded by a failed encrypted publish is
+  # held in staging and alerted on, never drained to the share as readable plaintext.
+  $encrypt = ($Config.PSObject.Properties['EncryptBackups'] -and [bool]$Config.EncryptBackups)
   $orphans = @(Get-SebOrphanLogEntries -StagingPath $staging -KeepPaths @($pending | ForEach-Object { if ($null -ne $_) { [string]$_.Staged } }) `
-      -Root ([string]$Config.SharePath) -HostName $env:COMPUTERNAME -InstanceLabel ([string]$Config.InstanceName))
+      -Root ([string]$Config.SharePath) -HostName $env:COMPUTERNAME -InstanceLabel ([string]$Config.InstanceName) -Encrypt $encrypt)
+  $heldOrphans = @($orphans | Where-Object { $_.Hold })
+  $orphans = @($orphans | Where-Object { -not $_.Hold })
   if ($orphans.Count -gt 0) {
     Write-SebLog ('{0} staged log backup file(s) were never recorded for copy - adopting them so the chain reaches the share' -f $orphans.Count) 'WARN'
     $pending = @($pending) + $orphans
   }
+  if ($heldOrphans.Count -gt 0) {
+    Write-SebLog ('{0} staged plaintext log backup file(s) cannot be shipped encrypted and are held in staging, NOT copied to the share' -f $heldOrphans.Count) 'ERROR'
+  }
   $noHash = [bool]$Config.NoHashVerify
   $compress = $false
   if ($Config.PSObject.Properties['CompressBackups']) { $compress = [bool]$Config.CompressBackups }
-  # Encryption on means every new backup is encrypted or the pass fails - never a quiet
-  # fallback to plaintext on the share because the key went missing.
-  $encrypt = ($Config.PSObject.Properties['EncryptBackups'] -and [bool]$Config.EncryptBackups)
   $encryptKey = $null
   $escrowOnShare = $true
   if ($encrypt) {
@@ -3539,8 +3570,9 @@ function Invoke-SebPass {
       }
     }
     $pending = @($stillPending.ToArray())
-    # Staged files with no pending entry left are done with.
-    $keepPaths = @($pending | ForEach-Object { $_.Staged })
+    # Staged files with no pending entry left are done with - except a held plaintext orphan,
+    # which is kept so it is never swept away (it must not be shipped, but its bytes are evidence).
+    $keepPaths = @($pending | ForEach-Object { $_.Staged }) + @($heldOrphans | ForEach-Object { [string]$_.Staged })
     Clear-SebStagedExcept -StagingPath $staging -KeepPaths $keepPaths
   }
 
@@ -3833,8 +3865,9 @@ GROUP BY database_id
     $ac = Get-SebAlertConfig $Config
     $conditions = @(Get-SebDataPassConditions -Succeeded $succeeded -Failed $failed -FailedDatabases @($failedNames.ToArray())) +
       @($healthConditions.ToArray()) +
+      @(Get-SebHeldPlaintextCondition -Count $heldOrphans.Count) +
       @(Get-SebPendingCondition -Count $pendingList.Count -SinceUtc $newState.PendingSinceUtc -NowUtc $nowUtc -PendingMinutes $ac.PendingMinutes)
-    Invoke-SebAlertEvaluation -Config $Config -Owners @('data', 'data-health', 'pending') -Conditions $conditions
+    Invoke-SebAlertEvaluation -Config $Config -Owners @('data', 'data-health', 'pending', 'encryption') -Conditions $conditions
     # "Backups are being taken" for an external dead-man monitor. Not on a pass where a
     # database failed - that is exactly the run the monitor should not hear from.
     if ($succeeded -gt 0 -and $failed -eq 0) { Invoke-SebHeartbeat }
@@ -6486,8 +6519,9 @@ try {
       Write-SebLog ('log pass finished: {0} succeeded, {1} failed, {2} copy(s) pending' -f $result.Succeeded, $result.Failed, $result.Pending)
       $logState = Read-SebState
       $conditions = @(Get-SebLogPassConditions -Failed $result.Failed -FailedDatabases $result.FailedDatabases) +
+        @(Get-SebHeldPlaintextCondition -Count $result.HeldPlaintext) +
         @(Get-SebPendingCondition -Count $result.Pending -SinceUtc $logState.PendingSinceUtc -NowUtc ((Get-Date).ToUniversalTime()) -PendingMinutes (Get-SebAlertConfig $config).PendingMinutes)
-      Invoke-SebAlertEvaluation -Config $config -Owners @('log', 'pending') -Conditions $conditions
+      Invoke-SebAlertEvaluation -Config $config -Owners @('log', 'pending', 'encryption') -Conditions $conditions
 
       # Mirror -Run/Invoke-SebPass's ok/partial/failed -> exit-code mapping (Get-SebLogPassExitCode):
       # nothing succeeded although something was attempted is a total failure (2); a database that

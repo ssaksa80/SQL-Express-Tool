@@ -2200,6 +2200,65 @@ try {
 finally { Remove-Item -LiteralPath $encRoot -Recurse -Force -ErrorAction SilentlyContinue }
 
 # ======================================================================================
+# CONFIDENTIALITY: a plaintext log orphan is never shipped when encryption is on
+# ======================================================================================
+# The leak this guards: if the encrypted publish throws AFTER BACKUP LOG has run, the plain
+# .trn is deliberately left staged as loud evidence. A later pass's Get-SebOrphanLogEntries
+# used to adopt it and the drain copied it STRAIGHT to the share with Copy-SebVerified (and
+# from there to the Object-Lock offsite bucket, undeletable for the lock period) - a readable
+# plaintext backup, the exact opposite of the invariant the pass states: "encryption on means
+# every new backup is encrypted or the pass fails - never a quiet fallback to plaintext." With
+# encryption on, a non-.enc orphan is now HELD (kept in staging, never drained) and raises a
+# critical alert; an already-encrypted orphan still drains so the ciphertext chain is intact.
+$confRoot = Join-Path $env:TEMP ('seb-conf-' + [Guid]::NewGuid().ToString('N'))
+try {
+  $confStage = Join-Path $confRoot 'staging'
+  $confShare = Join-Path $confRoot 'share'
+  [void](New-Item -ItemType Directory -Force -Path $confStage)
+  [void](New-Item -ItemType Directory -Force -Path $confShare)
+  foreach ($n in @(
+      'App_20260925-031500.trn',                  # plain log stranded by a failed encrypted publish
+      'Zip_20260925-031500.trn.zip',              # compressed but NOT encrypted: a zip is not encryption
+      'Enc_20260925-031500.trn.enc',              # a properly encrypted orphan
+      'Enc_20260925-031500.trn.enc.meta.json')) { # ...with its catalogue sidecar
+    Set-Content -LiteralPath (Join-Path $confStage $n) -Value 'x' -Encoding ASCII
+  }
+
+  $orph = @(Get-SebOrphanLogEntries -StagingPath $confStage -Encrypt $true -Root $confShare -HostName 'H' -InstanceLabel 'I')
+  $byLeaf = @{}; foreach ($e in $orph) { $byLeaf[(Split-Path -Leaf $e.Staged)] = $e }
+
+  Assert ($byLeaf['App_20260925-031500.trn'].Hold -eq $true) 'encryption on: a plain .trn orphan is marked Hold, never handed to the drain'
+  Assert ($byLeaf['Zip_20260925-031500.trn.zip'].Hold -eq $true) 'a compressed-but-unencrypted .trn.zip orphan is held too (a zip is not encryption)'
+  Assert ($byLeaf['Enc_20260925-031500.trn.enc'].Hold -eq $false) 'an already-encrypted .trn.enc orphan is still drainable'
+  Assert ($byLeaf['Enc_20260925-031500.trn.enc.meta.json'].Hold -eq $false) 'and its sidecar drains with it'
+
+  $drain = @($orph | Where-Object { -not $_.Hold })
+  $held = @($orph | Where-Object { $_.Hold })
+  Assert ($held.Count -ge 2) 'the plaintext orphans are held, not dropped - the pass keeps their bytes in staging as evidence'
+  foreach ($h in $held) { Assert (Test-Path -LiteralPath $h.Staged) 'a held orphan still exists in staging (retained locally, just not shipped)' }
+
+  # Drain only the drainable set, exactly as a pass does, and prove the share stays clean.
+  $stillConf = @(Sync-SebPending -Pending $drain -StagingPath $confStage -SharePath $confShare)
+  Assert ($stillConf.Count -eq 0) 'the encrypted orphan drains with nothing left pending'
+  $onShare = @(Get-ChildItem -LiteralPath $confShare -Recurse -File -ErrorAction SilentlyContinue)
+  $leak = @($onShare | Where-Object { $_.Name -match '\.(bak|dif|trn)(\.zip)?$' })
+  Assert ($leak.Count -eq 0) 'NO plaintext (non-.enc) backup ever reaches the share when encryption is on'
+  Assert (@($onShare | Where-Object { $_.Name -eq 'Enc_20260925-031500.trn.enc' }).Count -eq 1) 'the encrypted orphan itself did reach the share - the ciphertext chain is not broken'
+  Assert (Test-Path -LiteralPath (Join-Path $confStage 'App_20260925-031500.trn')) 'the stranded plaintext .trn is still in staging, never copied out'
+
+  # Encryption OFF (the default) is unchanged: the plain .trn is adopted for the drain as before.
+  $orphOff = @(Get-SebOrphanLogEntries -StagingPath $confStage -Root $confShare -HostName 'H' -InstanceLabel 'I')
+  $offPlain = @($orphOff | Where-Object { (Split-Path -Leaf $_.Staged) -eq 'App_20260925-031500.trn' })[0]
+  Assert ($offPlain -and -not $offPlain.Hold) 'encryption off: a plain .trn orphan is still adopted for the drain (unchanged behaviour)'
+
+  # The held plaintext raises a critical alert operators actually see.
+  $hc = @(Get-SebHeldPlaintextCondition -Count $held.Count)
+  Assert ($hc.Count -eq 1 -and $hc[0].Severity -eq 'critical' -and $hc[0].Key -eq 'held-plaintext') 'held plaintext is its own critical alert condition'
+  Assert ((@(Get-SebHeldPlaintextCondition -Count 0)).Count -eq 0) 'and no held plaintext means no alert'
+}
+finally { Remove-Item -LiteralPath $confRoot -Recurse -Force -ErrorAction SilentlyContinue }
+
+# ======================================================================================
 # RESTORE TESTING
 # ======================================================================================
 function New-CatEntry($kind, $file, $first, $last, $dbLsn, $ckpt, $finish) {
