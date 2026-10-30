@@ -2158,6 +2158,23 @@ try {
   $big = New-SebEscrow -DataKey $dek -Passphrase 'a long enough passphrase' -RecoveryKey $rk
   Assert ($big.Iterations -eq 600000) 'the default is 600,000 PBKDF2 rounds'
 
+  # ---- ENC-2b. import opens a whitespace-bearing or ambiguous credential ---------------
+  # The escrow is wrapped with the passphrase exactly as set - setup never trims it - so
+  # import must hand over the raw passphrase, and a credential that is 64 hex characters is
+  # indistinguishable from a recovery key. Open-SebEscrowEither tries the recovery key
+  # first, then the passphrase, so neither mistake loses the backups on a rebuilt server.
+  $wsPass = '  pass with edge spaces  '
+  $wsEsc = (New-SebEscrow -DataKey $dek -Passphrase $wsPass -RecoveryKey $rk -Iterations 2000 | ConvertTo-Json) | ConvertFrom-Json
+  Assert ((Get-SebKeyId (Open-SebEscrowEither -Escrow $wsEsc -Passphrase $wsPass)) -eq (Get-SebKeyId $dek)) 'an edge-whitespace passphrase opens with the raw value it was set with'
+  $msg = ''; try { [void](Open-SebEscrowEither -Escrow $wsEsc -Passphrase $wsPass.Trim()) } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like '*does not open*') 'and the trimmed form does NOT open it - why import must never .Trim the passphrase'
+  $hexPass = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'   # 64 hex, but it is the PASSPHRASE
+  $hexEsc = (New-SebEscrow -DataKey $dek -Passphrase $hexPass -RecoveryKey $rk -Iterations 2000 | ConvertTo-Json) | ConvertFrom-Json
+  Assert ((Get-SebKeyId (Open-SebEscrowEither -Escrow $hexEsc -RecoveryKey $hexPass)) -eq (Get-SebKeyId $dek)) 'a 64-hex passphrase, handed over as a recovery key, still opens via the passphrase fallback'
+  Assert ((Get-SebKeyId (Open-SebEscrowEither -Escrow $escJson -RecoveryKey $rkText -Passphrase 'the wrong passphrase')) -eq (Get-SebKeyId $dek)) 'the recovery key is tried first, so it opens even beside a wrong passphrase'
+  $msg = ''; try { [void](Open-SebEscrowEither -Escrow $escJson -RecoveryKey (Format-SebRecoveryKey (New-SebRandomBytes 32)) -Passphrase 'the wrong passphrase') } catch { $msg = $_.Exception.Message }
+  Assert ($msg -like '*does not open*') 'a wrong recovery key and a wrong passphrase together are still refused'
+
   # ---- ENC-3. the pipeline: publish names, and back through restore ------------------
   $facts = [pscustomobject]@{ Kind = 'full'; FirstLSN = [decimal]1; LastLSN = [decimal]2; DatabaseBackupLSN = [decimal]0; CheckpointLSN = [decimal]1; Finish = [datetime]'2026-09-25 01:00' }
   $reader = { param($c, $f, $k) $facts }
