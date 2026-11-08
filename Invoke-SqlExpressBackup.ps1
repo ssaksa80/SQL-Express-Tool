@@ -3036,6 +3036,24 @@ function Get-SebFolderFacts {
   return @($facts)
 }
 
+# The data pass reads the share's folders to plan retention and pick full-vs-diff, BEFORE it
+# copies. $ErrorActionPreference is Stop, so an unreadable share (the scheduled task runs
+# as SYSTEM, whose machine account is often not granted the share) made Test-Path throw,
+# and that landed in the per-database catch: the database was counted FAILED, its staged
+# backup deleted and nothing queued - a share problem silently discarded every backup.
+# Here an unreadable folder is just "no facts": the pass carries on, the copy then fails
+# where it is meant to (WARN, kept in staging, queued as pending) and the run reports
+# partial. Empty facts are the safe answer for retention - it deletes nothing it cannot
+# see - and for the kind decision, where no known full means a full is taken.
+function Get-SebFolderFactsOrEmpty {
+  param([string]$Directory)
+  try { return @(Get-SebFolderFacts -Directory $Directory) }
+  catch {
+    Write-SebLog ('cannot read {0}: {1} - treating it as empty; the copy will be retried from staging' -f $Directory, $_.Exception.Message) 'WARN'
+    return @()
+  }
+}
+
 # A staged .bak must not be deleted while a pending copy still points at it - that
 # is the only source for a copy the share has not accepted yet. This can bite when
 # two passes land in the same second (a manual -Run right after a scheduled one):
@@ -3658,7 +3676,7 @@ GROUP BY database_id
         if ($isFullMode -and (Test-SebPitrEligible -Name $database -ReadOnly $readOnly[$database])) {
           $justSwitched = Set-SebRecoveryFull -Connection $connection -Database $database
           $fullDir = Get-SebBackupPath -Root $Config.SharePath -HostName $hostName -InstanceLabel $instanceLabel -Database $database -Kind 'hourly'
-          $hoursSinceFull = Get-SebHoursSinceNewestFull -Facts @(Get-SebFolderFacts -Directory $fullDir) -Now $stamp
+          $hoursSinceFull = Get-SebHoursSinceNewestFull -Facts @(Get-SebFolderFactsOrEmpty -Directory $fullDir) -Now $stamp
           $kind = Get-SebBackupKindDue -HoursSinceFull $hoursSinceFull -FullEveryHours $fullEveryHours
           # A database only just switched to FULL has no base for a differential yet - anchor with a full.
           if ($justSwitched) { $kind = 'full' }
@@ -3755,9 +3773,9 @@ GROUP BY database_id
 
           $currentName = $fileName
           if ($compress) { $currentName = Get-SebCompressedName $fileName }
-          $hourlyFacts = @(Get-SebFolderFacts -Directory $hourlyDir)
+          $hourlyFacts = @(Get-SebFolderFactsOrEmpty -Directory $hourlyDir)
           $hourlyFacts += [pscustomobject]@{ Name = $currentName; FullName = (Join-Path $hourlyDir $currentName); Timestamp = $stamp }
-          $dailyFacts = @(Get-SebFolderFacts -Directory $dailyDir)
+          $dailyFacts = @(Get-SebFolderFactsOrEmpty -Directory $dailyDir)
           $plan = Get-SebRetentionPlan -HourlyFiles $hourlyFacts -DailyFiles $dailyFacts -Now $stamp `
             -HourlyKeep ([int]$Config.HourlyKeep) -DailyKeepDays ([int]$Config.DailyKeepDays)
 
@@ -3803,7 +3821,7 @@ GROUP BY database_id
       catch {
         $failed++
         [void]$failedNames.Add($database)
-        Write-SebLog ('{0} FAILED: {1}' -f $database, $_.Exception.Message) 'ERROR'
+        Write-SebLog ('{0} FAILED: {1} (at line {2}: {3})' -f $database, $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber, $_.InvocationInfo.MyCommand) 'ERROR'
         if ($staged) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
       }
     }
