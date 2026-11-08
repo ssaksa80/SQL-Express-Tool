@@ -299,6 +299,27 @@ try {
 }
 finally { Remove-Item -LiteralPath $factDir -Recurse -Force -ErrorAction SilentlyContinue }
 
+
+# ---- 8c. an unreadable share must not fail the database ----------------------------
+# The scheduled task runs as SYSTEM, which may not be granted the share. Test-Path then
+# THROWS (ErrorActionPreference is Stop), the throw reached the per-database catch, and
+# every database was counted FAILED with its staged backup deleted and nothing queued.
+# The pass-side reader must turn that into 'no facts' so the copy fails where it is
+# meant to (WARN + pending).
+function Test-Path { throw [System.UnauthorizedAccessException]'Access is denied' }
+try {
+  $threw = $false
+  try { [void](Get-SebFolderFacts -Directory 'denied-share/x') } catch { $threw = $true }
+  Assert $threw 'precondition: the strict reader throws on an unreadable folder (so the guard below is meaningful)'
+  $safe = $null
+  $safeThrew = $false
+  try { $safe = @(Get-SebFolderFactsOrEmpty -Directory 'denied-share/x') } catch { $safeThrew = $true }
+  Assert (-not $safeThrew) 'the pass-side reader does not throw on an unreadable folder'
+  Assert ($safe.Count -eq 0) 'and yields no facts, so retention deletes nothing and a full is due'
+}
+finally { Remove-Item -LiteralPath Function:Test-Path -ErrorAction SilentlyContinue }
+Assert (-not (Test-Path -LiteralPath 'Function:Test-Path')) 'the Test-Path stub is gone and the real cmdlet is back'
+
 # Format-SebConfigFacts has the same shape, and piping it emitted ONE object - so
 # -Status printed the whole config joined onto a single line.
 $piped = @([pscustomobject]@{ A = 1; B = 2; C = 3 } | ForEach-Object { Format-SebConfigFacts -Config $_ } | ForEach-Object { $_ })
